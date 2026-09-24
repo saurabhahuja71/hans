@@ -1,0 +1,17 @@
+[project]
+name = "hans"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "openai-agents>=0.22.3",
+]
+
+[project.scripts]
+hans = "bolt_next.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
