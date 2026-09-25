@@ -98,37 +98,15 @@ python -m pip install -U pytest
 `pip install -e .` installs the `hans` console script and the `openai-agents` dependency
 (`openai-agents>=0.22.3`).
 
-## Upgrade from an older install
+## Upgrade
 
-An existing install does not pick up new tools by pulling source alone. The `hans` command on
-`PATH` still points at whatever copy was installed before 0.2.0, which only had `read_file`.
-
-From the checkout that is already installed, upgrade in place:
+Quit HANS with Ctrl-Q, then run the installer again:
 
 ```bash
-cd /home/sauahuja/bolt-next
-git pull
-# Activate the same environment used for the old install.
-# If you used this repository's venv:
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -e .
-hash -r
-hans
+curl -LsSf https://raw.githubusercontent.com/saurabhahuja71/hans/main/install.sh | bash
 ```
 
-That reinstall rewrites the `hans` console script and the package in the active environment.
-Confirm the upgrade with:
-
-```bash
-python -c "import bolt_next.workspace as w; print(w.make_write_file_tool, w.make_run_command_tool)"
-pip show hans | sed -n '1,4p'
-```
-
-`pip show` should report version `0.2.0` and the location of this checkout. If `hans` was installed
-into a different environment, activate that environment and run `python -m pip install -e .` from
-this checkout again. A non-editable `pip install .` from an old tree must be repeated after
-`git pull`; otherwise `site-packages` keeps the old package.
+Open a new terminal and run `hans`. The same command installs or upgrades.
 
 ## Run
 
