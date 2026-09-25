@@ -72,6 +72,16 @@ export HTTPS_PROXY="$https_proxy"
 
 Unset those variables only when the endpoint is reachable directly and the proxy is what blocks it.
 
+## Install
+
+Python 3.12 or newer is required. This installs `hans` into `~/.local/bin`:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/saurabhahuja71/hans/main/install.sh | bash
+```
+
+If `~/.local/bin` is not on `PATH`, the script prints the one `export` to add. Behind the corporate proxy, export `https_proxy` before running the command. The model URL and API key are still set in the shell; the installer does not embed them.
+
 ## Fresh installation
 
 HANS requires Python 3.12. From a new checkout:
