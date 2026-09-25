@@ -5,8 +5,10 @@ import os
 from urllib.parse import urlparse
 
 from agents import Runner, SQLiteSession
+from agents.run_config import RunConfig
 
 from bolt_next.agent import create_agent
+from bolt_next.context_budget import fit_model_input
 
 
 def _print_stream_event(event) -> None:
@@ -44,8 +46,22 @@ def read_user_message(read_line) -> str | None:
         lines.append(line)
 
 
+def turn_error_message(exc: BaseException) -> str:
+    text = str(exc)
+    if "context" in text.lower() or "exceed_context" in text:
+        return (
+            "\nThe model request exceeded the context budget. "
+            "The session is still open. Request a smaller file range.\n"
+        )
+    return f"\nError: {exc}\n"
+
+
+def run_config() -> RunConfig:
+    return RunConfig(call_model_input_filter=fit_model_input)
+
+
 async def _run_turn(agent, session: SQLiteSession, prompt: str) -> None:
-    result = Runner.run_streamed(agent, prompt, session=session)
+    result = Runner.run_streamed(agent, prompt, session=session, run_config=run_config())
     try:
         async for event in result.stream_events():
             _print_stream_event(event)
@@ -91,7 +107,7 @@ async def _run_tui() -> None:
             except KeyboardInterrupt:
                 print("\nInterrupted.\n", flush=True)
             except Exception as exc:
-                print(f"\nError: {exc}\n", flush=True)
+                print(turn_error_message(exc), flush=True)
     finally:
         session.close()
 

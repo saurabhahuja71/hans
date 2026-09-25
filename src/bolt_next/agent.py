@@ -36,6 +36,8 @@ def create_agent(workspace: str | Path | None = None) -> Agent:
             "Answer the user's request clearly and concisely. "
             "Use read_file to inspect files, write_file to create or replace files, "
             "and run_command to run a command in the workspace. "
+            "When read_file reports remaining_ranges, request the next start_line "
+            "instead of assuming the rest of the file. "
             "Base verification on the command's actual output."
         ),
         model=model,
