@@ -26,6 +26,24 @@ def _print_stream_event(event) -> None:
         print(f"\n[tool_output]\n{event.item.output}", flush=True)
 
 
+def read_user_message(read_line) -> str | None:
+    """Read one prompt. Enter inserts a line; Ctrl-D submits the whole buffer.
+
+    EOF before any line means the user is done. Embedded newlines are preserved.
+    A pasted or piped block is one message because submission happens only at EOF,
+    not at each newline.
+    """
+    lines: list[str] = []
+    while True:
+        try:
+            line = read_line("\n> " if not lines else "… ")
+        except EOFError:
+            if not lines:
+                return None
+            return "\n".join(lines)
+        lines.append(line)
+
+
 async def _run_turn(agent, session: SQLiteSession, prompt: str) -> None:
     result = Runner.run_streamed(agent, prompt, session=session)
     try:
@@ -49,21 +67,27 @@ async def _run_tui() -> None:
         f"endpoint={base.scheme}://{base.hostname}{base.path}",
         flush=True,
     )
+    print("Enter inserts a newline. Ctrl-D submits the whole prompt as one message.", flush=True)
+    print("Ctrl-D on an empty prompt exits. exit or quit as the whole prompt also exits.", flush=True)
     agent = create_agent(os.environ.get("BOLT_WORKSPACE"))
     session = SQLiteSession("hans-tui")
     try:
         while True:
             try:
-                prompt = input("\n> ")
-            except (EOFError, KeyboardInterrupt):
+                prompt = read_user_message(input)
+            except KeyboardInterrupt:
+                print()
+                return
+            if prompt is None:
                 print()
                 return
             if prompt.strip().lower() in {"exit", "quit"}:
                 return
             if not prompt.strip():
                 continue
+            print("[user_turn]", flush=True)
             try:
-                await _run_turn(agent, session, prompt.strip())
+                await _run_turn(agent, session, prompt)
             except KeyboardInterrupt:
                 print("\nInterrupted.\n", flush=True)
             except Exception as exc:

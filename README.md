@@ -134,6 +134,8 @@ The banner is followed by one line of the form:
 model=qwen3.6-27b endpoint=https://<tunnel-host>/v1
 ```
 
+Enter inserts a newline. It does not send the prompt. Ctrl-D submits the whole buffer as one user message and one Agents SDK run, with embedded newlines preserved. A paste, including a multiline paste, is therefore one turn. Ctrl-D on an empty prompt exits. A prompt whose entire text is `exit` or `quit` also exits. Piped input is read until EOF and submitted as that same single message.
+
 Example prompts:
 
 ```text
@@ -157,12 +159,25 @@ outside the workspace are rejected. Missing, unreadable, and non-UTF-8 reads are
 errors rather than raised out of the SDK loop.
 
 `write_file` creates parent directories that stay inside the workspace and replaces the target
-file. `run_command` does not use a shell: the command string is split with `shlex` and executed
-with the workspace as the working directory, a 120 second timeout, and captured stdout and stderr.
-The returned text includes `exit_code`, `stdout`, and `stderr`. The model can request any command
-the process user can run; HANS does not add an approval prompt in this version.
+file. `run_command` does not use a shell and will not grow one silently. The command string is
+rejected if it contains shell metacharacters, including pipes, redirects, `&` (`&&` / `||`),
+`;`, substitution (`$`, backticks), globs, or a newline. A shell program (`sh`, `bash`, and the
+other common shells) is also rejected. Otherwise the string is split with `shlex` into argv and
+executed directly.
 
-No search, SSH, or separate edit tool is included. File changes go through `write_file`.
+The working directory is the workspace. Arguments that are absolute paths outside the workspace,
+or that contain a `..` segment, are rejected before the process starts. Arguments that begin with
+`-` are treated as flags and are not path-checked. The command receives a reduced environment:
+`PATH` and the Go, locale, proxy, and CA variables copied from the parent, plus `HOME`, `TMPDIR`,
+and `PWD` set inside the workspace. API keys and the rest of the process environment are not
+copied and are not printed.
+
+This is not a complete sandbox. The process still runs as the same user. A tool such as `go` can
+read its own `GOROOT` or module cache outside the workspace. There is no seccomp profile, mount
+namespace, or approval prompt. The boundary is argv checking plus a reduced environment.
+
+No search, SSH, or separate edit tool is included. File changes go through `write_file`. There is
+no `run_shell`.
 
 ## Development
 

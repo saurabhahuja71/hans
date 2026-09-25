@@ -59,6 +59,48 @@ def test_run_command_returns_stdout(tmp_path: Path) -> None:
     assert "HELLO_HANS" in result
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "go test ./... 2>&1",
+        "go test ./... && gofmt",
+        "cat a | head",
+        "echo $(pwd)",
+        "ls *.go",
+    ],
+)
+def test_run_command_rejects_shell_syntax(tmp_path: Path, command: str) -> None:
+    tool = make_run_command_tool(tmp_path)
+    result = invoke(tool, json.dumps({"command": command}))
+    assert "not a shell" in result
+    assert "exit_code" not in result
+
+
+def test_run_command_rejects_parent_path(tmp_path: Path) -> None:
+    tool = make_run_command_tool(tmp_path)
+    result = invoke(tool, '{"command":"ls .."}')
+    assert "escapes the workspace" in result
+    assert "exit_code" not in result
+
+
+def test_run_command_rejects_absolute_path_outside_workspace(tmp_path: Path) -> None:
+    tool = make_run_command_tool(tmp_path)
+    result = invoke(tool, '{"command":"cat /etc/passwd"}')
+    assert "outside the workspace" in result
+    assert "root:" not in result
+
+
+def test_run_command_hides_process_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOLT_MODEL_API_KEY", "super-secret-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    tool = make_run_command_tool(tmp_path)
+    result = invoke(tool, '{"command":"env"}')
+    assert "exit_code=0" in result
+    assert "super-secret-key" not in result
+    assert "openai-secret" not in result
+    assert f"HOME={tmp_path}" in result
+
+
 def test_symlink_outside_workspace_rejected(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside.txt"
     outside.write_text("secret", encoding="utf-8")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -71,27 +72,112 @@ def make_write_file_tool(workspace: Path):
     return write_file
 
 
+# Characters that only have meaning in a shell. run_command never invokes one.
+_SHELL_META = set("|;&<>$`(){}[]*?~!#\\")
+_SHELL_PROGRAMS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
+# Developer tools still need a few variables. Secrets and the rest of the process
+# environment are not copied into the command.
+_COMMAND_ENV_KEYS = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "GO111MODULE",
+    "GOROOT",
+    "GOPATH",
+    "GOPROXY",
+    "GOSUMDB",
+    "GOPRIVATE",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOTOOLCHAIN",
+    "GOFLAGS",
+    "CGO_ENABLED",
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+)
+
+
+def command_environment(workspace: Path) -> dict[str, str]:
+    """Environment passed to run_command. HOME and TMPDIR stay inside the workspace."""
+    env = {key: os.environ[key] for key in _COMMAND_ENV_KEYS if os.environ.get(key)}
+    tmp = workspace / ".hans-tmp"
+    tmp.mkdir(exist_ok=True)
+    env["HOME"] = str(workspace)
+    env["TMPDIR"] = str(tmp)
+    env["PWD"] = str(workspace)
+    return env
+
+
+def reject_shell_syntax(command: str) -> str | None:
+    if any(char in _SHELL_META or char in "\n\r" for char in command):
+        return (
+            "Error: run_command executes a direct argv command, not a shell. "
+            "Pipes, redirects, &&, ||, globs, and other shell syntax are not supported."
+        )
+    return None
+
+
+def reject_workspace_escape(workspace: Path, args: list[str]) -> str | None:
+    program = Path(args[0]).name
+    if program in _SHELL_PROGRAMS:
+        return "Error: run_command does not run a shell. Pass the program and its arguments directly."
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        path = Path(arg)
+        if ".." in path.parts:
+            return f"Error: command argument escapes the workspace: {arg}"
+        if path.is_absolute():
+            try:
+                path.resolve().relative_to(workspace)
+            except ValueError:
+                return f"Error: command argument is outside the workspace: {arg}"
+    return None
+
+
 def make_run_command_tool(workspace: Path):
     @function_tool
     async def run_command(command: str) -> str:
-        """Run a command in the workspace and return its exit code and output.
+        """Run one direct command in the workspace and return its exit code and output.
+
+        The command is split into argv and executed without a shell. Pipes, redirects,
+        &&, ||, globs, and substitution are rejected. The working directory is the
+        workspace. The command does not receive API keys or the rest of the process
+        environment.
 
         Args:
-            command: Command and arguments, for example `go run main.go`.
+            command: Program and arguments, for example `go test ./...`.
         """
         if not command or not command.strip() or "\x00" in command:
             return "Error: command must be a non-empty string"
+        shell_error = reject_shell_syntax(command)
+        if shell_error:
+            return shell_error
         try:
             args = shlex.split(command)
         except ValueError as exc:
             return f"Error: could not parse command: {exc}"
         if not args:
             return "Error: command must be a non-empty string"
+        escape_error = reject_workspace_escape(workspace, args)
+        if escape_error:
+            return escape_error
 
         def execute() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 args,
                 cwd=workspace,
+                env=command_environment(workspace),
                 capture_output=True,
                 text=True,
                 timeout=120,
