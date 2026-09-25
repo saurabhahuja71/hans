@@ -8,7 +8,7 @@ import json
 
 def invoke(tool, arguments: str):
     # The SDK invokes this wrapped function after parsing the structured JSON arguments.
-    return tool.__wrapped__(**json.loads(arguments))
+    return __import__("asyncio").run(tool.__wrapped__(**json.loads(arguments)))
 
 
 def test_workspace_path_validation(tmp_path: Path) -> None:

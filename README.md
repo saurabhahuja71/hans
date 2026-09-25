@@ -44,12 +44,46 @@ export BOLT_WORKSPACE="$PWD"              # optional; defaults to the current di
 
 Credentials are read from the environment and are not embedded in source code.
 
-## Run
+## Installation
 
-Install the project in the Python 3.12 environment containing the Agents SDK, then run:
+HANS requires Python 3.12 and the OpenAI Agents SDK. From a fresh checkout:
 
 ```bash
-pip install -e .
+cd /home/sauahuja/bolt-next
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
+python -m pip install -U pytest
+```
+
+If Python 3.12 and the SDK are already installed in an existing environment, activate that
+environment and run only:
+
+```bash
+python -m pip install -e .
+```
+
+For a remote HTTPS tunnel, configure the endpoint in the shell without committing credentials.
+The local ignored `.env.local` file can be loaded with:
+
+```bash
+set -a
+source .env.local
+set +a
+```
+
+If the endpoint must bypass an unavailable corporate proxy, unset proxy variables before launch:
+
+```bash
+unset http_proxy https_proxy ALL_PROXY HTTP_PROXY HTTPS_PROXY
+```
+
+## Run
+
+With the environment activated and model variables configured, run:
+
+```bash
 hans
 ```
 

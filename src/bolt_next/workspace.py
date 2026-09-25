@@ -29,7 +29,7 @@ def resolve_workspace_path(workspace: Path, path: str) -> Path:
 
 def make_read_file_tool(workspace: Path):
     @function_tool
-    def read_file(path: str) -> str:
+    async def read_file(path: str) -> str:
         """Read a UTF-8 text file inside the workspace.
 
         Args:
