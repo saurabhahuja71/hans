@@ -108,7 +108,7 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
 
 
 class Editor:
-    """Multiline prompt. Enter inserts a line. Ctrl-D submits or exits."""
+    """Prompt editor. Enter and Ctrl-D submit. Ctrl-Q exits."""
 
     def __init__(self) -> None:
         self.lines = [""]
@@ -121,15 +121,15 @@ class Editor:
         if key == "ctrl-c":
             self.clear()
             return None
-        if key == "ctrl-d":
+        if key == "ctrl-q":
+            self.clear()
+            return ""
+        if key in {"ctrl-d", "enter"}:
             text = "\n".join(self.lines)
             self.clear()
             if not text.strip():
                 return ""
             return text
-        if key == "enter":
-            self.lines.append("")
-            return None
         if key == "backspace":
             if self.lines[-1]:
                 self.lines[-1] = self.lines[-1][:-1]

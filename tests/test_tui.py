@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 
 from bolt_next.tui import (
+    FOOTER,
     format_header,
     format_tool_call,
     format_tool_result,
@@ -76,6 +77,10 @@ def test_lines_are_not_separate_messages() -> None:
             break
         messages.append(message)
     assert messages == ["one\ntwo"]
+
+
+def test_footer_lists_the_real_controls() -> None:
+    assert FOOTER == "Enter send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
@@ -158,16 +163,17 @@ def test_streaming_does_not_add_a_newline_per_chunk() -> None:
     assert transcript.render(80) == ["Hello there"]
 
 
-def test_editor_submits_one_multiline_message_and_empty_ctrl_d_exits() -> None:
+def test_enter_submits_like_ctrl_d_and_ctrl_q_exits() -> None:
     editor = Editor()
-    assert editor.on_key("char:line one") is None
-    assert editor.on_key("enter") is None
-    assert editor.on_key("char:line two") is None
-    assert editor.display_lines()[0] == "> line one"
-    assert editor.display_lines()[1] == "  line two"
-    submitted = editor.on_key("ctrl-d")
-    assert submitted == "line one\nline two"
-    assert editor.on_key("ctrl-d") == ""
+    editor.on_key("char:hi")
+    assert editor.on_key("enter") == "hi"
+    assert editor.on_key("enter") == ""
+    editor.on_key("char:keep")
+    assert editor.on_key("ctrl-q") == ""
+    assert editor.lines == [""]
+    editor.on_key("char:line one")
+    editor.lines.append("line two")
+    assert editor.on_key("ctrl-d") == "line one\nline two"
 
 
 def test_exit_and_quit_are_not_model_prompts() -> None:

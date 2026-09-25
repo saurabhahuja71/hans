@@ -144,7 +144,7 @@ The banner is followed by one line of the form:
 model=qwen3.6-27b endpoint=https://<tunnel-host>/v1
 ```
 
-Enter inserts a newline. It does not send the prompt. Ctrl-D submits the whole buffer as one user message and one Agents SDK run, with embedded newlines preserved. A paste, including a multiline paste, is therefore one turn. Ctrl-D on an empty prompt exits. A prompt whose entire text is `exit` or `quit` also exits. Piped input is read until EOF and submitted as that same single message.
+Enter submits the prompt as one user message. Enter on an empty prompt exits. Ctrl-Q exits immediately, even if the prompt is not empty. Ctrl-C cancels the current input or request and stays in HANS. A prompt whose entire text is `exit` or `quit` also exits without calling the model. Piped input is still read until EOF and submitted as one message.
 
 Example prompts:
 

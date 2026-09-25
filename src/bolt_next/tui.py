@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import termios
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,6 +15,9 @@ from agents.run_config import RunConfig
 from bolt_next.agent import create_agent
 from bolt_next.context_budget import fit_model_input
 from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
+
+
+FOOTER = "Enter send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def debug_enabled() -> bool:
@@ -244,7 +248,7 @@ async def _run_tui() -> None:
     connected = bool(urlparse(os.environ.get("BOLT_MODEL_BASE_URL", "")).hostname)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print(format_header(_model_name(), _workspace(), connected), flush=True)
-        print("Ctrl-D send · Ctrl-C cancel · Ctrl-D empty exits", flush=True)
+        print(FOOTER, flush=True)
         agent = create_agent(os.environ.get("BOLT_WORKSPACE"))
         session = SQLiteSession("hans-tui")
 
@@ -292,7 +296,7 @@ async def _run_curses(connected: bool) -> None:
             stdscr.addnstr(3 + offset, 0, line, width - 1)
         footer_at = 3 + conversation
         stdscr.hline(footer_at, 0, curses.ACS_HLINE, width - 1)
-        stdscr.addnstr(footer_at + 1, 0, "Ctrl-D send · Ctrl-C cancel · Ctrl-D empty exits", width - 1)
+        stdscr.addnstr(footer_at + 1, 0, FOOTER, width - 1)
         for offset, line in enumerate(editor.display_lines()):
             row = footer_at + 2 + offset
             if row < height:
@@ -349,6 +353,9 @@ async def _run_curses(connected: bool) -> None:
             if state["task"] is not None:
                 if key in {3, "\x03"}:
                     request_cancel()
+                elif key in {17, "\x11"}:
+                    request_cancel()
+                    return
                 continue
             name = _key_name(key)
             if name is None:
@@ -365,9 +372,14 @@ async def _run_curses(connected: bool) -> None:
     stdscr = curses.initscr()
     curses.noecho()
     curses.cbreak()
+    tty_attr = termios.tcgetattr(sys.stdin)
+    raw_attr = termios.tcgetattr(sys.stdin)
+    raw_attr[0] = raw_attr[0] & ~(termios.IXON | termios.IXOFF)
+    termios.tcsetattr(sys.stdin, termios.TCSANOW, raw_attr)
     try:
         await loop(stdscr)
     finally:
+        termios.tcsetattr(sys.stdin, termios.TCSANOW, tty_attr)
         curses.nocbreak()
         curses.echo()
         curses.endwin()
@@ -381,6 +393,8 @@ def _key_name(key) -> str | None:
         return "ctrl-c"
     if key in {4, "\x04"}:
         return "ctrl-d"
+    if key in {17, "\x11"}:
+        return "ctrl-q"
     if key in {"\n", "\r", 10}:
         return "enter"
     if key in {"\x7f", "\b", 127, 263}:
