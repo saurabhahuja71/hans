@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from bolt_next.workspace import WorkspaceError, make_read_file_tool, resolve_workspace_path
+from bolt_next.workspace import (
+    WorkspaceError,
+    make_read_file_tool,
+    make_run_command_tool,
+    make_write_file_tool,
+    resolve_workspace_path,
+)
 import json
 
 
@@ -30,6 +36,27 @@ def test_read_file_missing_file(tmp_path: Path) -> None:
 def test_path_traversal_rejected(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceError):
         resolve_workspace_path(tmp_path, "../secret.txt")
+
+
+def test_write_file_creates_file(tmp_path: Path) -> None:
+    tool = make_write_file_tool(tmp_path)
+    result = invoke(tool, '{"path":"main.go","content":"package main\\n"}')
+    assert "Wrote main.go" in result
+    assert (tmp_path / "main.go").read_text(encoding="utf-8") == "package main\n"
+
+
+def test_write_file_rejects_traversal(tmp_path: Path) -> None:
+    tool = make_write_file_tool(tmp_path)
+    result = invoke(tool, '{"path":"../secret.txt","content":"nope"}')
+    assert "outside the workspace" in result
+    assert not (tmp_path.parent / "secret.txt").exists()
+
+
+def test_run_command_returns_stdout(tmp_path: Path) -> None:
+    tool = make_run_command_tool(tmp_path)
+    result = invoke(tool, '{"command":"printf HELLO_HANS"}')
+    assert "exit_code=0" in result
+    assert "HELLO_HANS" in result
 
 
 def test_symlink_outside_workspace_rejected(tmp_path: Path) -> None:

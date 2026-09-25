@@ -4,7 +4,12 @@ from pathlib import Path
 from agents import Agent, OpenAIChatCompletionsModel
 from openai import AsyncOpenAI
 
-from bolt_next.workspace import make_read_file_tool, resolve_workspace
+from bolt_next.workspace import (
+    make_read_file_tool,
+    make_run_command_tool,
+    make_write_file_tool,
+    resolve_workspace,
+)
 
 
 def create_agent(workspace: str | Path | None = None) -> Agent:
@@ -28,8 +33,15 @@ def create_agent(workspace: str | Path | None = None) -> Agent:
         name="Hans",
         instructions=(
             "You are Hans, a coding assistant. "
-            "Answer the user's request clearly and concisely. Use read_file when you need to inspect files."
+            "Answer the user's request clearly and concisely. "
+            "Use read_file to inspect files, write_file to create or replace files, "
+            "and run_command to run a command in the workspace. "
+            "Base verification on the command's actual output."
         ),
         model=model,
-        tools=[make_read_file_tool(root)],
+        tools=[
+            make_read_file_tool(root),
+            make_write_file_tool(root),
+            make_run_command_tool(root),
+        ],
     )

@@ -7,7 +7,7 @@ import pytest
 from agents import Agent, Runner, SQLiteSession
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
 
-from bolt_next.workspace import make_read_file_tool
+from bolt_next.workspace import make_read_file_tool, make_run_command_tool, make_write_file_tool
 
 
 @pytest.fixture(autouse=True)
@@ -33,7 +33,11 @@ def make_agent(model: ScriptedModel, workspace: Path) -> Agent:
         name="HANS test agent",
         instructions="Use read_file when asked to inspect a file.",
         model=model,
-        tools=[make_read_file_tool(workspace)],
+        tools=[
+            make_read_file_tool(workspace),
+            make_write_file_tool(workspace),
+            make_run_command_tool(workspace),
+        ],
     )
 
 
@@ -53,6 +57,29 @@ def test_structured_read_file_call_executes_and_reaches_next_model_turn(tmp_path
     assert "HANS_KAGGLE_READ_TEST_123" in result.final_output
     assert len(model.calls) == 2
     assert "HANS_KAGGLE_READ_TEST_123" in repr(model.calls[1].input)
+    session.close()
+
+
+def test_write_then_run_command_reaches_next_model_turn(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("write_file", {"path": "main.go", "content": "package main\n"}, call_id="write-1")]),
+            ModelStep(output=[function_call("run_command", {"command": "printf HELLO_HANS"}, call_id="run-1")]),
+            ModelStep(output=[assistant_message("Verified output HELLO_HANS.")]),
+        ]
+    )
+    agent = make_agent(model, tmp_path)
+    session = SQLiteSession("sdk-write-run-test")
+
+    result = run(
+        Runner.run(agent, "Create a program that prints HELLO_HANS, run it, and verify.", session=session)
+    )
+
+    assert (tmp_path / "main.go").read_text(encoding="utf-8") == "package main\n"
+    assert result.final_output == "Verified output HELLO_HANS."
+    assert len(model.calls) == 3
+    assert "HELLO_HANS" in repr(model.calls[2].input)
+    assert "exit_code=0" in repr(model.calls[2].input)
     session.close()
 
 
