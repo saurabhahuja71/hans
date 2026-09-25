@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from agents import Agent, Runner, SQLiteSession
+from agents import Agent, Runner, SQLiteSession, set_tracing_disabled
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
 
 from bolt_next.workspace import make_read_file_tool, make_run_command_tool, make_write_file_tool
@@ -22,6 +22,7 @@ def avoid_broken_executor_shutdown(monkeypatch):
         return func(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", inline_to_thread)
+    set_tracing_disabled(True)
 
 
 def run(coro):
