@@ -10,6 +10,7 @@ from bolt_next.tui import (
     serve,
     turn_error_message,
 )
+from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
 
 
 class _Lines:
@@ -80,12 +81,14 @@ def test_lines_are_not_separate_messages() -> None:
 def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     workspace = tmp_path / "covered_call_bot"
-    text = format_header("qwen3.6-27b", workspace, "ranger-girls-gel-gain.trycloudflare.com")
+    text = format_header("qwen3.6-27b", workspace, True)
     assert text.startswith("HANS")
     assert "qwen3.6-27b" in text
-    assert "~/covered_call_bot" in text
+    assert "workspace: ~/covered_call_bot" in text
+    assert "● connected" in text
     assert "https://" not in text
-    assert "/v1" not in text
+    assert "trycloudflare" not in text
+    assert "○ disconnected" in format_header("qwen3.6-27b", workspace, False)
 
 
 def test_normal_tool_activity_is_concise() -> None:
@@ -131,3 +134,114 @@ def test_ctrl_c_during_prompt_and_turn_stays_in_session() -> None:
 
     asyncio.run(serve(read_line, run_turn))
     assert seen == ["hi"]
+
+
+def test_user_and_assistant_are_separate_lines() -> None:
+    transcript = Transcript()
+    transcript.user("hi")
+    transcript.thinking()
+    transcript.stream("Hi!")
+    transcript.stream(" How can I help?")
+    transcript.finish()
+    lines = transcript.render(80)
+    user_at = lines.index("> hi")
+    assistant_at = lines.index("Hi! How can I help?")
+    assert assistant_at > user_at
+    assert not any(line.startswith("> hiHi") for line in lines)
+    assert lines.count("Hi! How can I help?") == 1
+
+
+def test_streaming_does_not_add_a_newline_per_chunk() -> None:
+    transcript = Transcript()
+    transcript.stream("Hello")
+    transcript.stream(" there")
+    assert transcript.render(80) == ["Hello there"]
+
+
+def test_editor_submits_one_multiline_message_and_empty_ctrl_d_exits() -> None:
+    editor = Editor()
+    assert editor.on_key("char:line one") is None
+    assert editor.on_key("enter") is None
+    assert editor.on_key("char:line two") is None
+    assert editor.display_lines()[0] == "> line one"
+    assert editor.display_lines()[1] == "  line two"
+    submitted = editor.on_key("ctrl-d")
+    assert submitted == "line one\nline two"
+    assert editor.on_key("ctrl-d") == ""
+
+
+def test_exit_and_quit_are_not_model_prompts() -> None:
+    assert is_exit_command("exit")
+    assert is_exit_command(" quit ")
+    assert not is_exit_command("exit the file")
+
+
+def test_exit_command_does_not_call_the_sdk() -> None:
+    def read_line(_prompt: str) -> str:
+        raise EOFError
+
+    seen: list[str] = []
+
+    async def run_turn(prompt: str) -> None:
+        seen.append(prompt)
+
+    class _Once:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def __call__(self, _prompt: str) -> str:
+            if not self.sent:
+                self.sent = True
+                return "exit"
+            raise EOFError
+
+    asyncio.run(serve(_Once(), run_turn))
+    assert seen == []
+
+
+def test_ctrl_c_clears_the_editor_without_submitting() -> None:
+    editor = Editor()
+    editor.on_key("char:partial")
+    assert editor.on_key("ctrl-c") is None
+    assert editor.lines == [""]
+
+
+def test_tool_activity_is_separate_from_the_reply() -> None:
+    transcript = Transcript()
+    transcript.tool_started("read_file  invoice/money.go")
+    transcript.tool_finished("go test ./...", ok=True)
+    transcript.stream("The tax used the wrong base.")
+    lines = transcript.render(80)
+    assert "  ◇ read_file  invoice/money.go" in lines
+    assert "  ✓ go test ./..." in lines
+    assert lines[-1] == "The tax used the wrong base."
+
+
+def test_errors_stay_in_the_transcript() -> None:
+    transcript = Transcript()
+    transcript.error("model request failed", "connection refused")
+    rendered = "\n".join(transcript.render(80))
+    assert "✗ model request failed" in rendered
+    assert "connection refused" in rendered
+    assert "Traceback" not in rendered
+
+
+def test_debug_text_is_optional() -> None:
+    transcript = Transcript()
+    transcript.debug("[tool_output]\nsecret body")
+    assert "[tool_output]" in "\n".join(transcript.render(80))
+
+
+def test_resize_reflows_without_duplicating_the_message() -> None:
+    transcript = Transcript()
+    transcript.user("Investigate the failing test")
+    transcript.stream("The discount is applied before tax, which changes the total.")
+    wide = transcript.render(80)
+    narrow = transcript.render(24)
+    assert sum(line.startswith("> ") for line in wide) == 1
+    assert sum(line.startswith("> ") for line in narrow) == 1
+    assert "Investigate" in " ".join(narrow)
+    assert len(visible_transcript(narrow, 3)) == 3
+    conversation, editor_height = layout_rows(24, 2)
+    assert conversation >= 1
+    assert editor_height == 3
