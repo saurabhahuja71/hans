@@ -36,7 +36,7 @@ info "Installing into ${INSTALL_ROOT}"
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 "$PY" -m venv "$INSTALL_ROOT/venv"
 "$INSTALL_ROOT/venv/bin/python" -m pip install -U pip
-"$INSTALL_ROOT/venv/bin/python" -m pip install "$source_dir"
+"$INSTALL_ROOT/venv/bin/python" -m pip install --upgrade "$source_dir"
 ln -sfn "$INSTALL_ROOT/venv/bin/hans" "$BIN_DIR/hans"
 
 info "Installed ${BIN_DIR}/hans"
@@ -49,3 +49,5 @@ case ":$PATH:" in
 esac
 printf '\nStart HANS after exporting BOLT_MODEL_BASE_URL and BOLT_MODEL_API_KEY:\n'
 printf '  hans\n'
+printf '\nUpgrade later with:\n'
+printf '  hans upgrade\n'

@@ -27,7 +27,7 @@ from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
 
 
-FOOTER = "Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
+FOOTER = "Enter send · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def debug_enabled() -> bool:
@@ -191,7 +191,7 @@ class _Display:
 
 
 def read_user_message(read_line) -> str | None:
-    """Read one prompt. Enter inserts a line; Ctrl-D submits the whole buffer.
+    """Read one non-interactive prompt buffer until EOF.
 
     EOF before any line means the user is done. Embedded newlines are preserved.
     A pasted or piped block is one message because submission happens only at EOF,

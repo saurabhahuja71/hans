@@ -58,7 +58,7 @@ def test_one_pasted_block_is_one_message_and_then_stop() -> None:
 
 
 def test_footer_lists_the_real_controls() -> None:
-    assert FOOTER == "Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
+    assert FOOTER == "Enter send · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
@@ -140,13 +140,13 @@ def test_streaming_does_not_add_a_newline_per_chunk() -> None:
     assert transcript.render(80) == ["Hello there"]
 
 
-def test_enter_inserts_a_line_ctrl_d_submits_and_ctrl_q_exits() -> None:
+def test_enter_submits_ctrl_d_remains_compatible_and_ctrl_q_exits() -> None:
     editor = Editor()
     editor.on_key("char:line one")
-    assert editor.on_key("enter") is None
-    editor.on_key("char:line two")
+    assert editor.on_key("enter") == "line one"
+    assert editor.on_key("enter") == ""
+    editor.lines = ["line one", "line two"]
     assert editor.on_key("ctrl-d") == "line one\nline two"
-    assert editor.on_key("ctrl-d") == ""
     editor.on_key("char:keep")
     assert editor.on_key("ctrl-q") == ""
     assert editor.lines == [""]

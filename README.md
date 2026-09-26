@@ -19,9 +19,9 @@ calling, tool results, streaming, and conversation history. HANS owns the termin
 configuration, workspace policy, the tool implementations, and how SDK events are displayed.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.2.0**.
+branding are HANS. Current release: **0.2.1**.
 
-## What 0.2.0 provides
+## What 0.2.1 provides
 
 - Interactive prompt with `exit`, `quit`, EOF, and Ctrl-C handling
 - Streaming assistant text through `Runner.run_streamed()` and `result.stream_events()`
@@ -100,13 +100,17 @@ python -m pip install -U pytest
 
 ## Upgrade
 
-Quit HANS with Ctrl-Q, then run the installer again:
+Quit HANS with Ctrl-Q, then run:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/saurabhahuja71/hans/main/install.sh | bash
+hans upgrade
 ```
 
-Open a new terminal and run `hans`. The same command installs or upgrades.
+`hans update` is an equivalent alias. The command downloads the canonical installer over HTTPS and runs it, so the same installation location and PATH guidance apply.
+
+For a trusted HTTPS mirror or controlled test, set `HANS_INSTALLER_URL` to the installer URL before running the command. Non-HTTPS override URLs are rejected.
+
+Versions released before `hans upgrade` existed do not contain this command. Those installations must run the install command above once to acquire it; subsequent upgrades can use `hans upgrade`.
 
 ## Run
 
@@ -122,7 +126,7 @@ The banner is followed by one line of the form:
 model=qwen3.6-27b endpoint=https://<tunnel-host>/v1
 ```
 
-Enter inserts a newline. Ctrl-D submits the whole prompt; Ctrl-D with an empty prompt exits. Ctrl-Q exits immediately, even if the prompt is not empty. Ctrl-C cancels the current input or request and stays in HANS. A prompt whose entire text is `exit` or `quit` also exits without calling the model. Piped input is still read until EOF and submitted as one message.
+Enter submits the prompt. Ctrl-D also submits; either key exits when the prompt is empty. Ctrl-Q exits immediately, even if the prompt is not empty. Ctrl-C cancels the current input or request and stays in HANS. A prompt whose entire text is `exit` or `quit` also exits without calling the model. Piped input is still read until EOF and submitted as one message.
 
 Example prompts:
 

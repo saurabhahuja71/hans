@@ -122,7 +122,7 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
 
 
 class Editor:
-    """Prompt editor. Enter inserts a line, Ctrl-D submits, and Ctrl-Q exits."""
+    """Prompt editor. Enter and Ctrl-D submit. Ctrl-Q exits."""
 
     def __init__(self) -> None:
         self.lines = [""]
@@ -138,10 +138,7 @@ class Editor:
         if key == "ctrl-q":
             self.clear()
             return ""
-        if key == "enter":
-            self.lines.append("")
-            return None
-        if key == "ctrl-d":
+        if key in {"ctrl-d", "enter"}:
             text = "\n".join(self.lines)
             self.clear()
             if not text.strip():
