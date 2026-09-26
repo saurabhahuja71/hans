@@ -122,7 +122,7 @@ The banner is followed by one line of the form:
 model=qwen3.6-27b endpoint=https://<tunnel-host>/v1
 ```
 
-Enter submits the prompt as one user message. Enter on an empty prompt exits. Ctrl-Q exits immediately, even if the prompt is not empty. Ctrl-C cancels the current input or request and stays in HANS. A prompt whose entire text is `exit` or `quit` also exits without calling the model. Piped input is still read until EOF and submitted as one message.
+Enter inserts a newline. Ctrl-D submits the whole prompt; Ctrl-D with an empty prompt exits. Ctrl-Q exits immediately, even if the prompt is not empty. Ctrl-C cancels the current input or request and stays in HANS. A prompt whose entire text is `exit` or `quit` also exits without calling the model. Piped input is still read until EOF and submitted as one message.
 
 Example prompts:
 

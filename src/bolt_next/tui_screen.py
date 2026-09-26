@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from bolt_next.events import VerificationEvidence
+
 
 @dataclass
 class Piece:
@@ -24,8 +26,11 @@ class Transcript:
         self.pieces.append(Piece("user", text.rstrip("\n")))
 
     def thinking(self) -> None:
+        self.stage("thinking…")
+
+    def stage(self, text: str) -> None:
         self._drop_status()
-        self.pieces.append(Piece("status", "thinking…"))
+        self.pieces.append(Piece("status", text))
 
     def stream(self, delta: str) -> None:
         self._drop_status()
@@ -37,6 +42,15 @@ class Transcript:
     def finish(self) -> None:
         self._drop_status()
         self.pieces.append(Piece("status", "completed"))
+
+    def completed(self, evidence: VerificationEvidence | None) -> None:
+        self._drop_status()
+        if evidence is None:
+            self.pieces.append(Piece("status", "completed (verification not established)"))
+        elif evidence.success:
+            self.pieces.append(Piece("status", "completed"))
+        else:
+            self.pieces.append(Piece("status", "completed (verification failed)"))
 
     def cancelled(self) -> None:
         self._drop_status()
@@ -57,7 +71,7 @@ class Transcript:
         self.pieces.append(Piece("debug", text))
 
     def _drop_status(self) -> None:
-        if self.pieces and self.pieces[-1].kind == "status" and self.pieces[-1].text == "thinking…":
+        if self.pieces and self.pieces[-1].kind == "status":
             self.pieces.pop()
 
     def render(self, width: int) -> list[str]:
@@ -95,7 +109,7 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
         mark = {"run": "◇", "ok": "✓", "fail": "✗"}.get(piece.detail, "◇")
         return _wrap(f"{mark} {piece.text}", width, "  ")
     if piece.kind == "status":
-        mark = "✓" if piece.text == "completed" else "◌"
+        mark = "✓" if piece.text.startswith("completed") else "◌"
         return [f"  {mark} {piece.text}"]
     if piece.kind == "error":
         lines = [f"  ✗ {piece.text}"]
@@ -108,7 +122,7 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
 
 
 class Editor:
-    """Prompt editor. Enter and Ctrl-D submit. Ctrl-Q exits."""
+    """Prompt editor. Enter inserts a line, Ctrl-D submits, and Ctrl-Q exits."""
 
     def __init__(self) -> None:
         self.lines = [""]
@@ -124,7 +138,10 @@ class Editor:
         if key == "ctrl-q":
             self.clear()
             return ""
-        if key in {"ctrl-d", "enter"}:
+        if key == "enter":
+            self.lines.append("")
+            return None
+        if key == "ctrl-d":
             text = "\n".join(self.lines)
             self.clear()
             if not text.strip():

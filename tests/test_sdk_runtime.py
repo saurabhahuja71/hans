@@ -84,6 +84,29 @@ def test_write_then_run_command_reaches_next_model_turn(tmp_path: Path) -> None:
     session.close()
 
 
+def test_failed_verification_reaches_a_second_repair_and_verification(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("write_file", {"path": "main.txt", "content": "first"}, call_id="write-1")]),
+            ModelStep(output=[function_call("run_command", {"command": "false"}, call_id="verify-1")]),
+            ModelStep(output=[function_call("write_file", {"path": "main.txt", "content": "fixed"}, call_id="write-2")]),
+            ModelStep(output=[function_call("run_command", {"command": "printf VERIFIED"}, call_id="verify-2")]),
+            ModelStep(output=[assistant_message("The repair is verified.")]),
+        ]
+    )
+    agent = make_agent(model, tmp_path)
+    session = SQLiteSession("sdk-verification-recovery-test")
+
+    result = run(Runner.run(agent, "Repair the project and verify it.", session=session))
+
+    assert (tmp_path / "main.txt").read_text(encoding="utf-8") == "fixed"
+    assert result.final_output == "The repair is verified."
+    assert len(model.calls) == 5
+    assert "exit_code=1" in repr(model.calls[2].input)
+    assert "exit_code=0" in repr(model.calls[4].input)
+    session.close()
+
+
 def test_streaming_run_reaches_sdk_completion(tmp_path: Path) -> None:
     model = ScriptedModel([ModelStep(output=[assistant_message("streamed answer")])])
     agent = make_agent(model, tmp_path)

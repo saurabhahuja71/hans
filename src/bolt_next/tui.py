@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import sys
 import termios
 from pathlib import Path
-from urllib.parse import urlparse
 
-from agents import Runner, SQLiteSession, set_tracing_disabled
-from agents.run_config import RunConfig
-
-from bolt_next.agent import create_agent
-from bolt_next.context_budget import fit_model_input
+from bolt_next.events import (
+    AssistantMessageComplete,
+    AssistantMessageDelta,
+    ConnectionChanged,
+    RequestCancelled,
+    RequestCompleted,
+    RequestFailed,
+    RequestStarted,
+    ToolCompleted,
+    ToolOutput,
+    ToolStarted,
+    UserMessageSubmitted,
+    VerificationFailed,
+    VerificationPassed,
+    VerificationStarted,
+)
+from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
 
 
-FOOTER = "Enter send · Ctrl-C cancel · Ctrl-Q exit"
+FOOTER = "Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def debug_enabled() -> bool:
@@ -31,7 +41,7 @@ def workspace_label(workspace: Path) -> str:
         return str(workspace)
 
 
-def format_header(model: str, workspace: Path, connected: bool = True) -> str:
+def format_header(model: str, workspace: Path, connected: bool = False) -> str:
     state = "● connected" if connected else "○ disconnected"
     shown = workspace_label(workspace)
     return "\n".join(
@@ -42,117 +52,131 @@ def format_header(model: str, workspace: Path, connected: bool = True) -> str:
     )
 
 
-def tool_detail(name: str | None, arguments) -> str:
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {}
-    if not isinstance(arguments, dict):
-        arguments = {}
-    if name == "read_file":
-        detail = str(arguments.get("path") or "")
-        start = arguments.get("start_line") or 0
-        end = arguments.get("end_line") or 0
-        if start and end:
-            detail = f"{detail}:{start}-{end}"
-        elif start and int(start) > 1:
-            detail = f"{detail}:{start}"
-        return detail
-    if name == "write_file":
-        return str(arguments.get("path") or "")
-    if name == "run_command":
-        return str(arguments.get("command") or "")
-    return ""
-
-
-def format_tool_call(name: str | None, arguments) -> str:
-    detail = tool_detail(name, arguments)
+def format_tool_call(name: str, detail: str) -> str:
     return f"  ◇ {name}  {detail}".rstrip()
 
 
-def format_tool_result(name: str | None, output: str) -> str:
-    code = None
-    failed = output.startswith("Error:")
-    for line in output.splitlines():
-        if line.startswith("exit_code="):
-            code = line.split("=", 1)[1].strip()
-            failed = code != "0"
-    mark = "✗" if failed else "✓"
-    if code is not None:
-        return f"  {mark} {name}  exit {code}"
-    if failed:
-        first = output.splitlines()[0][:120]
-        return f"  {mark} {name}  {first}"
+def format_tool_result(name: str, success: bool, exit_code: int | None = None) -> str:
+    mark = "✓" if success else "✗"
+    if exit_code is not None:
+        return f"  {mark} {name}  exit {exit_code}"
     return f"  {mark} {name}"
 
 
-def turn_error_message(exc: BaseException, *, debug: bool | None = None) -> str:
-    text = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
-    if "context" in text.lower() or "exceed_context" in text:
-        message = "context budget exceeded; the session is still open. Request a smaller file range."
-    elif "connection" in text.lower() or "tunnel" in text.lower():
-        message = f"connection failed: {text}"
+def turn_error_message(
+    category: str | BaseException, message: str | None = None, *, debug: bool | None = None
+) -> str:
+    if isinstance(category, BaseException):
+        message = str(category).strip().splitlines()[0] if str(category).strip() else "request failed"
+        lowered = message.lower()
+        category = "context" if "context" in lowered or "exceed_context" in lowered else "runtime"
+    message = message or "request failed"
+    if category == "context":
+        rendered = "\n✗ context budget exceeded; the session is still open. Request a smaller file range.\n"
+    elif category == "connection":
+        rendered = f"\n✗ connection failed: {message}\n"
     else:
-        message = text
-    rendered = f"\n✗ {message}\n"
+        rendered = f"\n✗ {message}\n"
     if debug if debug is not None else debug_enabled():
-        rendered += f"{exc.__class__.__name__}: {exc}\n"
+        rendered += f"[{category}] {message}\n"
     return rendered
 
 
-def run_config() -> RunConfig:
-    return RunConfig(call_model_input_filter=fit_model_input, tracing_disabled=True)
-
-
 class _Display:
-    """Renders one SDK stream into either the transcript or, for pipes, stdout."""
+    """Renders HANS semantic events into a transcript or plain stdout."""
 
-    def __init__(self, transcript: Transcript | None = None) -> None:
+    def __init__(self, transcript: Transcript | None = None, on_connection=None) -> None:
         self.debug = debug_enabled()
         self.transcript = transcript
-        self._last_name: str | None = None
-        self._last_detail = ""
+        self.on_connection = on_connection
         self._started = False
+        self._verification_failed = False
+
+    def _tool_stage(self, name: str) -> str:
+        if name == "read_file":
+            return "investigating"
+        if name == "write_file":
+            return "correcting" if self._verification_failed else "acting"
+        if name == "run_command":
+            return "verifying"
+        return "acting"
 
     def event(self, event) -> None:
-        if event.type == "raw_response_event":
-            data = event.data
-            if getattr(data, "type", None) in {"response.output_text.delta", "output_text.delta"}:
-                self._text(getattr(data, "delta", "") or "")
-            return
-        if event.type != "run_item_stream_event":
-            return
-        if event.name == "tool_called":
-            item = event.item
-            raw = getattr(item, "raw_item", None)
-            arguments = raw.get("arguments") if isinstance(raw, dict) else getattr(raw, "arguments", None)
-            self._last_name = getattr(item, "tool_name", None)
-            self._last_detail = tool_detail(self._last_name, arguments)
-            label = f"{self._last_name}  {self._last_detail}".rstrip()
+        if isinstance(event, UserMessageSubmitted):
+            if self.transcript is not None:
+                self.transcript.user(event.message)
+            else:
+                print(_plain_user(event.message), flush=True)
+        elif isinstance(event, RequestStarted):
+            if self.transcript is not None:
+                self.transcript.thinking()
+        elif isinstance(event, AssistantMessageDelta):
+            self._text(event.delta)
+        elif isinstance(event, ToolStarted):
+            label = f"{event.name}  {event.detail}".rstrip()
             if self.transcript is not None:
                 self.transcript.tool_started(label)
+                self.transcript.stage(self._tool_stage(event.name))
                 if self.debug:
-                    self.transcript.debug(f"[tool_called] name={self._last_name} arguments={arguments}")
+                    self.transcript.debug(
+                        f"[tool_started] call_id={event.call_id} name={event.name} detail={event.detail}"
+                    )
             elif self.debug:
-                print(f"\n[tool_called] name={self._last_name} arguments={arguments}", flush=True)
+                print(
+                    f"\n[tool_started] call_id={event.call_id} name={event.name} detail={event.detail}",
+                    flush=True,
+                )
             else:
-                print("\n" + format_tool_call(self._last_name, arguments), flush=True)
-        elif event.name == "tool_output":
-            output = str(event.item.output)
-            failed = output.startswith("Error:")
-            for line in output.splitlines():
-                if line.startswith("exit_code="):
-                    failed = line.split("=", 1)[1].strip() != "0"
-            label = self._last_detail or self._last_name or "tool"
+                print("\n" + format_tool_call(event.name, event.detail), flush=True)
+        elif isinstance(event, ToolOutput):
+            if self.debug:
+                if self.transcript is not None:
+                    self.transcript.debug(f"[tool_output] call_id={event.call_id}\n{event.output}")
+                else:
+                    print(f"\n[tool_output] call_id={event.call_id}\n{event.output}", flush=True)
+        elif isinstance(event, ToolCompleted):
+            label = event.detail or event.name
             if self.transcript is not None:
-                self.transcript.tool_finished(label, ok=not failed)
-                if self.debug:
-                    self.transcript.debug(f"[tool_output]\n{output}")
-            elif self.debug:
-                print(f"\n[tool_output]\n{output}", flush=True)
+                self.transcript.stage(self._tool_stage(event.name))
+                self.transcript.tool_finished(label, ok=event.success)
+            elif not self.debug:
+                print(format_tool_result(event.name, event.success, event.exit_code), flush=True)
+        elif isinstance(event, VerificationStarted):
+            if self.transcript is not None:
+                self.transcript.stage("verifying")
+        elif isinstance(event, VerificationPassed):
+            self._verification_failed = False
+            if self.transcript is not None:
+                self.transcript.stage("verification passed")
+        elif isinstance(event, VerificationFailed):
+            self._verification_failed = True
+            if self.transcript is not None:
+                self.transcript.stage("verification failed")
+        elif isinstance(event, RequestCompleted):
+            if self.transcript is not None:
+                self.transcript.completed(event.evidence)
+            elif self._started:
+                print(flush=True)
+        elif isinstance(event, RequestCancelled):
+            if self.transcript is not None:
+                self.transcript.cancelled()
             else:
-                print(format_tool_result(self._last_name, output), flush=True)
+                print("\ninterrupted", flush=True)
+        elif isinstance(event, RequestFailed):
+            if self.transcript is not None:
+                title = "model request failed"
+                if event.category == "context":
+                    self.transcript.error("context limit exceeded", event.message)
+                else:
+                    self.transcript.error(title, event.message[:160])
+                if self.debug:
+                    self.transcript.debug(f"[{event.category}] {event.message}")
+            else:
+                print(turn_error_message(event.category, event.message), flush=True)
+        elif isinstance(event, ConnectionChanged) and self.on_connection is not None:
+            self.on_connection(event.connected)
+        elif isinstance(event, AssistantMessageComplete):
+            return
 
     def _text(self, delta: str) -> None:
         if not delta:
@@ -184,24 +208,10 @@ def read_user_message(read_line) -> str | None:
         lines.append(line)
 
 
-async def _run_turn(agent, session: SQLiteSession, prompt: str, display: _Display | None = None) -> None:
-    result = Runner.run_streamed(agent, prompt, session=session, run_config=run_config())
+async def _run_turn(runtime: HansRuntime, prompt: str, display: _Display | None = None) -> None:
     shown = display or _Display()
-    try:
-        async for event in result.stream_events():
-            shown.event(event)
-        if display is None:
-            print(flush=True)
-        elif display.transcript is not None:
-            display.transcript.finish()
-    except asyncio.CancelledError:
-        result.cancel()
-        if display is not None and display.transcript is not None:
-            display.transcript.cancelled()
-        raise
-    except KeyboardInterrupt:
-        result.cancel()
-        raise
+    async for event in runtime.submit(prompt):
+        shown.event(event)
 
 
 async def serve(read_line, run_turn) -> None:
@@ -212,22 +222,17 @@ async def serve(read_line, run_turn) -> None:
         except KeyboardInterrupt:
             print(flush=True)
             continue
-        if prompt is None:
+        if prompt is None or is_exit_command(prompt):
             print(flush=True)
-            return
-        if is_exit_command(prompt):
             return
         if not prompt.strip():
             continue
         if debug_enabled():
             print("[user_turn]", flush=True)
-        print(_plain_user(prompt), flush=True)
         try:
             await run_turn(prompt)
         except KeyboardInterrupt:
             print("\ninterrupted\n", flush=True)
-        except Exception as exc:
-            print(turn_error_message(exc), flush=True)
 
 
 def _plain_user(text: str) -> str:
@@ -244,39 +249,32 @@ def _workspace() -> Path:
 
 
 async def _run_tui() -> None:
-    set_tracing_disabled(True)
-    connected = bool(urlparse(os.environ.get("BOLT_MODEL_BASE_URL", "")).hostname)
+    runtime = HansRuntime(os.environ.get("BOLT_WORKSPACE"))
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print(format_header(_model_name(), _workspace(), connected), flush=True)
+        print(format_header(_model_name(), _workspace(), False), flush=True)
         print(FOOTER, flush=True)
-        agent = create_agent(os.environ.get("BOLT_WORKSPACE"))
-        session = SQLiteSession("hans-tui")
 
         async def run_turn(prompt: str) -> None:
-            await _run_turn(agent, session, prompt)
+            await _run_turn(runtime, prompt)
 
         try:
             await serve(input, run_turn)
         finally:
-            session.close()
+            runtime.close()
         return
-    await _run_curses(connected)
+    await _run_curses(runtime)
 
 
-async def _run_curses(connected: bool) -> None:
+async def _run_curses(runtime: HansRuntime) -> None:
     import curses
 
-    agent = create_agent(os.environ.get("BOLT_WORKSPACE"))
-    session = SQLiteSession("hans-tui")
     transcript = Transcript()
     editor = Editor()
-    state = {"connected": connected, "task": None, "cancel": False}
+    state = {"connected": False, "task": None, "cancel": False}
 
     def request_cancel(*_args) -> None:
         state["cancel"] = True
-        task = state["task"]
-        if task is not None and not task.done():
-            task.cancel()
+        runtime.cancel_active()
 
     previous_int = signal.signal(signal.SIGINT, request_cancel)
     previous_stop = signal.signal(signal.SIGTSTP, signal.SIG_IGN)
@@ -290,7 +288,7 @@ async def _run_curses(connected: bool) -> None:
         for row, line in enumerate(header[:2]):
             stdscr.addnstr(row, 0, line, width - 1)
         stdscr.hline(2, 0, curses.ACS_HLINE, width - 1)
-        conversation, editor_height = layout_rows(height, len(editor.lines))
+        conversation, _editor_height = layout_rows(height, len(editor.lines))
         body = visible_transcript(transcript.render(width - 1), conversation)
         for offset, line in enumerate(body):
             stdscr.addnstr(3 + offset, 0, line, width - 1)
@@ -304,26 +302,12 @@ async def _run_curses(connected: bool) -> None:
         stdscr.refresh()
 
     async def run_prompt(prompt: str) -> None:
-        transcript.user(prompt)
-        transcript.thinking()
-        display = _Display(transcript)
+        display = _Display(transcript, lambda connected: state.__setitem__("connected", connected))
         try:
-            await _run_turn(agent, session, prompt, display)
-            state["connected"] = True
+            await _run_turn(runtime, prompt, display)
         except asyncio.CancelledError:
-            state["cancel"] = False
-        except Exception as exc:
-            text = str(exc)
-            if "context" in text.lower():
-                transcript.error("context limit exceeded", "request was prevented by HANS context budget")
-            elif "connection" in text.lower() or "tunnel" in text.lower():
-                state["connected"] = False
-                transcript.error("model request failed", text.splitlines()[0][:160])
-            else:
-                detail = text.splitlines()[0][:160]
-                transcript.error("model request failed", detail)
-            if debug_enabled():
-                transcript.debug(f"{exc.__class__.__name__}: {exc}")
+            runtime.cancel_active()
+            raise
 
     async def loop(stdscr) -> None:
         curses.curs_set(1)
@@ -363,9 +347,7 @@ async def _run_curses(connected: bool) -> None:
             submitted = editor.on_key(name)
             if submitted is None:
                 continue
-            if submitted == "":
-                return
-            if is_exit_command(submitted):
+            if submitted == "" or is_exit_command(submitted):
                 return
             state["task"] = asyncio.create_task(run_prompt(submitted))
 
@@ -385,7 +367,7 @@ async def _run_curses(connected: bool) -> None:
         curses.endwin()
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTSTP, previous_stop)
-        session.close()
+        runtime.close()
 
 
 def _key_name(key) -> str | None:

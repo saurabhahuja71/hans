@@ -1,13 +1,24 @@
 import asyncio
 from pathlib import Path
 
+from bolt_next.events import (
+    AssistantMessageDelta,
+    RequestCompleted,
+    ToolCompleted,
+    ToolOutput,
+    ToolStarted,
+    VerificationEvidence,
+    VerificationFailed,
+    VerificationStarted,
+)
+from bolt_next.runtime import run_config
 from bolt_next.tui import (
     FOOTER,
+    _Display,
     format_header,
     format_tool_call,
     format_tool_result,
     read_user_message,
-    run_config,
     serve,
     turn_error_message,
 )
@@ -30,16 +41,7 @@ class _Lines:
 
 
 def test_multiline_text_is_one_message() -> None:
-    message = read_user_message(
-        _Lines(
-            [
-                "Inspect this repository.",
-                "",
-                "Run the tests.",
-                None,
-            ]
-        )
-    )
+    message = read_user_message(_Lines(["Inspect this repository.", "", "Run the tests.", None]))
     assert message == "Inspect this repository.\n\nRun the tests."
 
 
@@ -50,37 +52,13 @@ def test_embedded_newlines_are_preserved() -> None:
 
 
 def test_one_pasted_block_is_one_message_and_then_stop() -> None:
-    read_line = _Lines(
-        [
-            "Inspect this repository.",
-            "Find the relevant Go implementation and tests.",
-            "Diagnose the problem.",
-            None,
-        ]
-    )
-    first = read_user_message(read_line)
-    second = read_user_message(read_line)
-    assert first == (
-        "Inspect this repository.\n"
-        "Find the relevant Go implementation and tests.\n"
-        "Diagnose the problem."
-    )
-    assert second is None
-
-
-def test_lines_are_not_separate_messages() -> None:
-    read_line = _Lines(["one", "two", None])
-    messages = []
-    while True:
-        message = read_user_message(read_line)
-        if message is None:
-            break
-        messages.append(message)
-    assert messages == ["one\ntwo"]
+    read_line = _Lines(["Inspect this repository.", "Find the relevant Go implementation.", None])
+    assert read_user_message(read_line) == "Inspect this repository.\nFind the relevant Go implementation."
+    assert read_user_message(read_line) is None
 
 
 def test_footer_lists_the_real_controls() -> None:
-    assert FOOTER == "Enter send · Ctrl-C cancel · Ctrl-Q exit"
+    assert FOOTER == "Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
@@ -97,23 +75,22 @@ def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_normal_tool_activity_is_concise() -> None:
-    call = format_tool_call("read_file", {"path": "invoice/money.go"})
-    done = format_tool_result("run_command", "exit_code=0\nstdout:\nok\n")
-    failed = format_tool_result("run_command", "exit_code=1\nstdout:\nFAIL\n")
+    call = format_tool_call("read_file", "invoice/money.go")
+    done = format_tool_result("run_command", True, 0)
+    failed = format_tool_result("run_command", False, 1)
     assert call == "  ◇ read_file  invoice/money.go"
-    assert "[tool_called]" not in call
-    assert "ok" not in done
+    assert "[tool_started]" not in call
     assert done == "  ✓ run_command  exit 0"
     assert failed == "  ✗ run_command  exit 1"
 
 
 def test_debug_marker_is_not_in_normal_error() -> None:
-    message = turn_error_message(RuntimeError("Connection error."), debug=False)
+    message = turn_error_message("connection", "Connection error.", debug=False)
     assert message.startswith("\n✗ ")
     assert "Traceback" not in message
-    assert "RuntimeError" not in message
-    debug = turn_error_message(RuntimeError("Connection error."), debug=True)
-    assert "RuntimeError" in debug
+    assert "[connection]" not in message
+    debug = turn_error_message("connection", "Connection error.", debug=True)
+    assert "[connection]" in debug
 
 
 def test_tracing_is_disabled_without_openai_key() -> None:
@@ -163,17 +140,16 @@ def test_streaming_does_not_add_a_newline_per_chunk() -> None:
     assert transcript.render(80) == ["Hello there"]
 
 
-def test_enter_submits_like_ctrl_d_and_ctrl_q_exits() -> None:
+def test_enter_inserts_a_line_ctrl_d_submits_and_ctrl_q_exits() -> None:
     editor = Editor()
-    editor.on_key("char:hi")
-    assert editor.on_key("enter") == "hi"
-    assert editor.on_key("enter") == ""
+    editor.on_key("char:line one")
+    assert editor.on_key("enter") is None
+    editor.on_key("char:line two")
+    assert editor.on_key("ctrl-d") == "line one\nline two"
+    assert editor.on_key("ctrl-d") == ""
     editor.on_key("char:keep")
     assert editor.on_key("ctrl-q") == ""
     assert editor.lines == [""]
-    editor.on_key("char:line one")
-    editor.lines.append("line two")
-    assert editor.on_key("ctrl-d") == "line one\nline two"
 
 
 def test_exit_and_quit_are_not_model_prompts() -> None:
@@ -182,10 +158,7 @@ def test_exit_and_quit_are_not_model_prompts() -> None:
     assert not is_exit_command("exit the file")
 
 
-def test_exit_command_does_not_call_the_sdk() -> None:
-    def read_line(_prompt: str) -> str:
-        raise EOFError
-
+def test_exit_command_does_not_call_the_runtime() -> None:
     seen: list[str] = []
 
     async def run_turn(prompt: str) -> None:
@@ -212,15 +185,46 @@ def test_ctrl_c_clears_the_editor_without_submitting() -> None:
     assert editor.lines == [""]
 
 
-def test_tool_activity_is_separate_from_the_reply() -> None:
+def test_display_consumes_semantic_tool_and_verification_events() -> None:
     transcript = Transcript()
-    transcript.tool_started("read_file  invoice/money.go")
-    transcript.tool_finished("go test ./...", ok=True)
-    transcript.stream("The tax used the wrong base.")
-    lines = transcript.render(80)
-    assert "  ◇ read_file  invoice/money.go" in lines
-    assert "  ✓ go test ./..." in lines
-    assert lines[-1] == "The tax used the wrong base."
+    display = _Display(transcript)
+    command = "pytest -q"
+    evidence = VerificationEvidence(command, 1, True, True, False, "2026-09-26T00:00:00+00:00")
+
+    display.event(ToolStarted("verify-1", "run_command", command))
+    display.event(VerificationStarted("verify-1", command))
+    display.event(ToolOutput("verify-1", "authoritative tool output"))
+    display.event(ToolCompleted("verify-1", "run_command", command, False, 1))
+    display.event(VerificationFailed("verify-1", evidence))
+
+    assert transcript.pieces[-1].text == "verification failed"
+    display.event(ToolStarted("write-1", "write_file", "main.py"))
+    assert transcript.pieces[-1].text == "correcting"
+    display.event(ToolOutput("write-1", "Wrote main.py (5 bytes)"))
+    display.event(ToolCompleted("write-1", "write_file", "main.py", True))
+    display.event(AssistantMessageDelta("Fixed it."))
+    display.event(RequestCompleted(None))
+    assert transcript.pieces[-1].text == "completed (verification not established)"
+
+
+def test_verification_status_and_completion_require_tool_evidence() -> None:
+    failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-26T00:00:00+00:00")
+    passed = VerificationEvidence("pytest -q", 0, True, True, True, "2026-09-26T00:00:01+00:00")
+    transcript = Transcript()
+    transcript.tool_started("run_command  pytest -q")
+    transcript.stage("verifying")
+    transcript.tool_finished("pytest -q", ok=False)
+    transcript.stage("verification failed")
+    transcript.completed(failed)
+    failed_lines = transcript.render(80)
+    assert "  ✗ pytest -q" in failed_lines
+    assert "  ✓ completed (verification failed)" in failed_lines
+    unverified = Transcript()
+    unverified.completed(None)
+    assert unverified.render(80) == ["  ✓ completed (verification not established)"]
+    verified = Transcript()
+    verified.completed(passed)
+    assert verified.render(80) == ["  ✓ completed"]
 
 
 def test_errors_stay_in_the_transcript() -> None:
@@ -230,12 +234,6 @@ def test_errors_stay_in_the_transcript() -> None:
     assert "✗ model request failed" in rendered
     assert "connection refused" in rendered
     assert "Traceback" not in rendered
-
-
-def test_debug_text_is_optional() -> None:
-    transcript = Transcript()
-    transcript.debug("[tool_output]\nsecret body")
-    assert "[tool_output]" in "\n".join(transcript.render(80))
 
 
 def test_resize_reflows_without_duplicating_the_message() -> None:
