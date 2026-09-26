@@ -4,6 +4,7 @@ from pathlib import Path
 from bolt_next.events import (
     AssistantMessageDelta,
     RequestCompleted,
+    RequestFailed,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -85,12 +86,29 @@ def test_normal_tool_activity_is_concise() -> None:
 
 
 def test_debug_marker_is_not_in_normal_error() -> None:
-    message = turn_error_message("connection", "Connection error.", debug=False)
+    message = turn_error_message(
+        "connection", "Connection error.", debug=False, debug_detail="raw provider response"
+    )
     assert message.startswith("\n✗ ")
     assert "Traceback" not in message
     assert "[connection]" not in message
-    debug = turn_error_message("connection", "Connection error.", debug=True)
-    assert "[connection]" in debug
+    assert "raw provider response" not in message
+    debug = turn_error_message(
+        "connection", "Connection error.", debug=True, debug_detail="raw provider response"
+    )
+    assert "[connection] raw provider response" in debug
+
+
+def test_display_exposes_raw_failure_detail_only_in_debug_mode(monkeypatch) -> None:
+    raw_detail = "OCI response 400: unsupported parameter"
+    normal = Transcript()
+    _Display(normal).event(RequestFailed("runtime", "model request failed", raw_detail))
+    assert raw_detail not in "\n".join(normal.render(120))
+
+    monkeypatch.setenv("HANS_DEBUG", "1")
+    debug = Transcript()
+    _Display(debug).event(RequestFailed("runtime", "model request failed", raw_detail))
+    assert raw_detail in "\n".join(debug.render(120))
 
 
 def test_tracing_is_disabled_without_openai_key() -> None:

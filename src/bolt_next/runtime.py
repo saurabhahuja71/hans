@@ -95,14 +95,18 @@ def _verification_evidence(command: str, output: str) -> VerificationEvidence:
     )
 
 
-def _failure_details(exc: BaseException) -> tuple[str, str]:
+def _failure_details(exc: BaseException) -> tuple[str, str, str]:
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else "request failed"
     lowered = text.lower()
     if "context" in lowered or "exceed_context" in lowered:
-        return "context", "context budget exceeded; the session is still open. Request a smaller file range."
+        return (
+            "context",
+            "context budget exceeded; the session is still open. Request a smaller file range.",
+            text,
+        )
     if "connection" in lowered or "tunnel" in lowered:
-        return "connection", "connection to the configured model endpoint failed"
-    return "runtime", "model request failed"
+        return "connection", "connection to the configured model endpoint failed", text
+    return "runtime", "model request failed", text
 
 
 class HansRuntime:
@@ -170,8 +174,8 @@ class HansRuntime:
             if self._cancel_requested:
                 yield RequestCancelled()
             else:
-                category, detail = _failure_details(exc)
-                yield RequestFailed(category, detail)
+                category, detail, debug_message = _failure_details(exc)
+                yield RequestFailed(category, detail, debug_message)
                 yield ConnectionChanged(False)
         finally:
             self._active_result = None

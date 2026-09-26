@@ -130,6 +130,7 @@ def test_model_failure_becomes_generic_failure_and_disconnection(tmp_path: Path)
     failure = next(event for event in events if isinstance(event, RequestFailed))
     assert failure.category == "connection"
     assert failure.message == "connection to the configured model endpoint failed"
+    assert failure.debug_message == "connection refused by test"
     assert events[-1] == ConnectionChanged(False)
     runtime.close()
 

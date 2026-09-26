@@ -64,10 +64,15 @@ def format_tool_result(name: str, success: bool, exit_code: int | None = None) -
 
 
 def turn_error_message(
-    category: str | BaseException, message: str | None = None, *, debug: bool | None = None
+    category: str | BaseException,
+    message: str | None = None,
+    *,
+    debug: bool | None = None,
+    debug_detail: str | None = None,
 ) -> str:
     if isinstance(category, BaseException):
         message = str(category).strip().splitlines()[0] if str(category).strip() else "request failed"
+        debug_detail = debug_detail or message
         lowered = message.lower()
         category = "context" if "context" in lowered or "exceed_context" in lowered else "runtime"
     message = message or "request failed"
@@ -78,7 +83,7 @@ def turn_error_message(
     else:
         rendered = f"\n✗ {message}\n"
     if debug if debug is not None else debug_enabled():
-        rendered += f"[{category}] {message}\n"
+        rendered += f"[{category}] {debug_detail or message}\n"
     return rendered
 
 
@@ -170,9 +175,14 @@ class _Display:
                 else:
                     self.transcript.error(title, event.message[:160])
                 if self.debug:
-                    self.transcript.debug(f"[{event.category}] {event.message}")
+                    self.transcript.debug(f"[{event.category}] {event.debug_message or event.message}")
             else:
-                print(turn_error_message(event.category, event.message), flush=True)
+                print(
+                    turn_error_message(
+                        event.category, event.message, debug_detail=event.debug_message
+                    ),
+                    flush=True,
+                )
         elif isinstance(event, ConnectionChanged) and self.on_connection is not None:
             self.on_connection(event.connected)
         elif isinstance(event, AssistantMessageComplete):

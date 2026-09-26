@@ -66,6 +66,7 @@ class RequestCompleted:
 class RequestFailed:
     category: str
     message: str
+    debug_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

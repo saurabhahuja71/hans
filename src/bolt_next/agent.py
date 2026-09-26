@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
 
-from agents import Agent, OpenAIChatCompletionsModel
+from agents import Agent, ModelSettings, OpenAIChatCompletionsModel
+from agents.model_settings import Reasoning
 from openai import AsyncOpenAI
 
 from bolt_next.workspace import (
@@ -32,15 +33,24 @@ STAGE_4_INSTRUCTIONS = (
 )
 
 
+def _model_settings() -> ModelSettings:
+    reasoning_effort = os.environ.get("BOLT_MODEL_REASONING_EFFORT", "").strip()
+    if not reasoning_effort:
+        return ModelSettings()
+    return ModelSettings(reasoning=Reasoning(effort=reasoning_effort))
+
+
 def create_agent(workspace: str | Path | None = None) -> Agent:
     """Build the Hans agent using the configured OpenAI-compatible endpoint."""
     base_url = os.environ.get("BOLT_MODEL_BASE_URL")
     api_key = os.environ.get("BOLT_MODEL_API_KEY")
+    project = os.environ.get("BOLT_MODEL_OPENAI_PROJECT")
     if not base_url or not api_key:
         raise RuntimeError("Set BOLT_MODEL_BASE_URL and BOLT_MODEL_API_KEY before starting Hans")
     client = AsyncOpenAI(
         base_url=base_url,
         api_key=api_key,
+        project=project or None,
     )
 
     model = OpenAIChatCompletionsModel(
@@ -53,6 +63,7 @@ def create_agent(workspace: str | Path | None = None) -> Agent:
         name="Hans",
         instructions=STAGE_4_INSTRUCTIONS,
         model=model,
+        model_settings=_model_settings(),
         tools=[
             make_read_file_tool(root),
             make_write_file_tool(root),

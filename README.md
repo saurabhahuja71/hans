@@ -47,6 +47,13 @@ export BOLT_MODEL="qwen3.6-27b"
 export BOLT_WORKSPACE="$PWD"              # optional; defaults to the current directory
 ```
 
+Leave reasoning configuration unset unless the configured endpoint explicitly supports and
+requires it. For example, an endpoint that requires tool calls without reasoning can use:
+
+```bash
+export BOLT_MODEL_REASONING_EFFORT=none
+```
+
 Credentials are read from the environment and are not embedded in source code. A local ignored
 `.env.local` file can be loaded with:
 
