@@ -212,16 +212,23 @@ def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:
 
 
 def test_tui_modules_do_not_depend_on_sdk_or_raw_wire_names() -> None:
-    for relative_path in ("src/bolt_next/tui.py", "src/bolt_next/tui_screen.py"):
+    for relative_path in (
+        "src/bolt_next/tui.py",
+        "src/bolt_next/tui_screen.py",
+        "src/bolt_next/textual_tui.py",
+    ):
         tree = ast.parse(Path(relative_path).read_text(encoding="utf-8"), filename=relative_path)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                assert all(not alias.name.startswith(("agents", "openai")) for alias in node.names)
+                assert all(
+                    not alias.name.startswith(("agents", "openai", "anthropic", "litellm"))
+                    for alias in node.names
+                )
             if isinstance(node, ast.ImportFrom):
-                assert not (node.module or "").startswith(("agents", "openai"))
+                assert not (node.module or "").startswith(("agents", "openai", "anthropic", "litellm"))
             if isinstance(node, ast.Name):
-                assert node.id != "raw_item"
+                assert node.id not in {"raw_item", "Runner", "SQLiteSession"}
             if isinstance(node, ast.Attribute):
-                assert node.attr != "raw_item"
+                assert node.attr not in {"raw_item", "Runner", "SQLiteSession"}
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 assert node.value not in {"exit_code=", "stdout:", "stderr:"}

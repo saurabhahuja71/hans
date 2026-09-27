@@ -272,7 +272,12 @@ async def _run_tui() -> None:
         finally:
             runtime.close()
         return
-    await _run_curses(runtime)
+    if os.environ.get("HANS_TUI", "").strip().lower() == "curses":
+        await _run_curses(runtime)
+        return
+    from bolt_next.textual_tui import run_textual_tui
+
+    await run_textual_tui(runtime, _model_name(), _workspace())
 
 
 async def _run_curses(runtime: HansRuntime) -> None:
