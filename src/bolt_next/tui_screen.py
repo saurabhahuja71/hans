@@ -122,7 +122,7 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
 
 
 class Editor:
-    """Prompt editor. Enter and Ctrl-D submit. Ctrl-Q exits."""
+    """Prompt editor. Enter submits; Shift+Enter inserts a newline."""
 
     def __init__(self) -> None:
         self.lines = [""]
@@ -144,6 +144,9 @@ class Editor:
             if not text.strip():
                 return ""
             return text
+        if key == "shift-enter":
+            self.lines.append("")
+            return None
         if key == "backspace":
             if self.lines[-1]:
                 self.lines[-1] = self.lines[-1][:-1]
@@ -151,8 +154,13 @@ class Editor:
                 self.lines.pop()
             return None
         if key.startswith("char:"):
-            self.lines[-1] += key[5:]
+            self._insert(key[5:])
         return None
+
+    def _insert(self, text: str) -> None:
+        rows = text.split("\n")
+        self.lines[-1] += rows[0]
+        self.lines.extend(rows[1:])
 
     def display_lines(self) -> list[str]:
         shown = []

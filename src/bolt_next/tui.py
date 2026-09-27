@@ -27,7 +27,7 @@ from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
 
 
-FOOTER = "Enter send · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
+FOOTER = "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def debug_enabled() -> bool:
@@ -323,6 +323,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
         curses.curs_set(1)
         stdscr.keypad(True)
         stdscr.nodelay(True)
+        decoder = _InputDecoder()
         while True:
             try:
                 draw(stdscr)
@@ -344,22 +345,20 @@ async def _run_curses(runtime: HansRuntime) -> None:
                 continue
             if key == curses.KEY_RESIZE:
                 continue
-            if state["task"] is not None:
-                if key in {3, "\x03"}:
-                    request_cancel()
-                elif key in {17, "\x11"}:
-                    request_cancel()
+            for name in decoder.feed(key):
+                if state["task"] is not None:
+                    if name == "ctrl-c":
+                        request_cancel()
+                    elif name == "ctrl-q":
+                        request_cancel()
+                        return
+                    continue
+                submitted = editor.on_key(name)
+                if submitted is None:
+                    continue
+                if submitted == "" or is_exit_command(submitted):
                     return
-                continue
-            name = _key_name(key)
-            if name is None:
-                continue
-            submitted = editor.on_key(name)
-            if submitted is None:
-                continue
-            if submitted == "" or is_exit_command(submitted):
-                return
-            state["task"] = asyncio.create_task(run_prompt(submitted))
+                state["task"] = asyncio.create_task(run_prompt(submitted))
 
     stdscr = curses.initscr()
     curses.noecho()
@@ -368,9 +367,11 @@ async def _run_curses(runtime: HansRuntime) -> None:
     raw_attr = termios.tcgetattr(sys.stdin)
     raw_attr[0] = raw_attr[0] & ~(termios.IXON | termios.IXOFF)
     termios.tcsetattr(sys.stdin, termios.TCSANOW, raw_attr)
+    _set_enhanced_input(True)
     try:
         await loop(stdscr)
     finally:
+        _set_enhanced_input(False)
         termios.tcsetattr(sys.stdin, termios.TCSANOW, tty_attr)
         curses.nocbreak()
         curses.echo()
@@ -378,6 +379,65 @@ async def _run_curses(runtime: HansRuntime) -> None:
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTSTP, previous_stop)
         runtime.close()
+
+
+class _InputDecoder:
+    _PASTE_START = "\x1b[200~"
+    _PASTE_END = "\x1b[201~"
+    _SHIFT_ENTER = ("\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r")
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._pasting = False
+
+    def feed(self, key) -> list[str]:
+        if not isinstance(key, str):
+            name = _key_name(key)
+            return [] if name is None else [name]
+        self._pending += key
+        events: list[str] = []
+        while self._pending:
+            if self._pasting:
+                end = self._pending.find(self._PASTE_END)
+                if end < 0:
+                    keep = len(self._PASTE_END) - 1
+                    if len(self._pending) <= keep:
+                        break
+                    events.append("char:" + self._pending[:-keep])
+                    self._pending = self._pending[-keep:]
+                    break
+                if end:
+                    events.append("char:" + self._pending[:end])
+                self._pending = self._pending[end + len(self._PASTE_END) :]
+                self._pasting = False
+                continue
+            if self._pending.startswith(self._PASTE_START):
+                self._pending = self._pending[len(self._PASTE_START) :]
+                self._pasting = True
+                continue
+            shift = next((value for value in self._SHIFT_ENTER if self._pending.startswith(value)), None)
+            if shift is not None:
+                self._pending = self._pending[len(shift) :]
+                events.append("shift-enter")
+                continue
+            protocols = (self._PASTE_START, *self._SHIFT_ENTER)
+            if any(value.startswith(self._pending) for value in protocols):
+                break
+            if self._pending.startswith("\x1b["):
+                if "@" <= self._pending[-1] <= "~":
+                    self._pending = ""
+                    continue
+                break
+            name = _key_name(self._pending[0])
+            self._pending = self._pending[1:]
+            if name is not None:
+                events.append(name)
+        return events
+
+
+def _set_enhanced_input(enabled: bool) -> None:
+    sequence = "\x1b[?2004h\x1b[>1u\x1b[>4;2m" if enabled else "\x1b[?2004l\x1b[<u\x1b[>4;0m"
+    os.write(sys.stdout.fileno(), sequence.encode())
 
 
 def _key_name(key) -> str | None:

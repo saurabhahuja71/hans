@@ -8,6 +8,7 @@ from bolt_next.events import (
     ToolCompleted,
     ToolOutput,
     ToolStarted,
+    UserMessageSubmitted,
     VerificationEvidence,
     VerificationFailed,
     VerificationStarted,
@@ -16,6 +17,7 @@ from bolt_next.runtime import run_config
 from bolt_next.tui import (
     FOOTER,
     _Display,
+    _InputDecoder,
     format_header,
     format_tool_call,
     format_tool_result,
@@ -59,7 +61,7 @@ def test_one_pasted_block_is_one_message_and_then_stop() -> None:
 
 
 def test_footer_lists_the_real_controls() -> None:
-    assert FOOTER == "Enter send · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
+    assert FOOTER == "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
 
 
 def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
@@ -158,16 +160,69 @@ def test_streaming_does_not_add_a_newline_per_chunk() -> None:
     assert transcript.render(80) == ["Hello there"]
 
 
-def test_enter_submits_ctrl_d_remains_compatible_and_ctrl_q_exits() -> None:
+def test_enter_submits_without_inserting_a_newline() -> None:
     editor = Editor()
-    editor.on_key("char:line one")
+    assert editor.on_key("char:line one") is None
     assert editor.on_key("enter") == "line one"
-    assert editor.on_key("enter") == ""
+    assert editor.lines == [""]
+
+
+def test_shift_enter_inserts_multiline_prompt_without_submitting() -> None:
+    editor = Editor()
+    assert editor.on_key("char:line one") is None
+    assert editor.on_key("shift-enter") is None
+    assert editor.on_key("char:line two") is None
+    assert editor.on_key("shift-enter") is None
+    assert editor.on_key("char:line three") is None
+    assert editor.lines == ["line one", "line two", "line three"]
+    assert editor.on_key("enter") == "line one\nline two\nline three"
+
+
+def test_ctrl_d_submits_and_empty_ctrl_d_exits() -> None:
+    editor = Editor()
     editor.lines = ["line one", "line two"]
     assert editor.on_key("ctrl-d") == "line one\nline two"
+    assert editor.on_key("ctrl-d") == ""
+
+
+def test_ctrl_q_exits_and_clears_the_editor() -> None:
+    editor = Editor()
     editor.on_key("char:keep")
     assert editor.on_key("ctrl-q") == ""
     assert editor.lines == [""]
+
+
+def test_terminal_key_decoder_maps_submit_newline_and_cancellation_controls() -> None:
+    decoder = _InputDecoder()
+    assert decoder.feed("\n") == ["enter"]
+    assert decoder.feed("\x1b[13;2u") == ["shift-enter"]
+    assert decoder.feed("\x03") == ["ctrl-c"]
+    assert decoder.feed("\x04") == ["ctrl-d"]
+    assert decoder.feed("\x11") == ["ctrl-q"]
+
+
+def test_bracketed_multiline_paste_submits_one_semantic_user_message() -> None:
+    message = "line one\nline two\nline three"
+    editor = Editor()
+    decoder = _InputDecoder()
+    events = [
+        event
+        for key in "\x1b[200~" + message + "\x1b[201~"
+        for event in decoder.feed(key)
+    ]
+    assert "".join(event[5:] for event in events) == message
+    assert all(editor.on_key(event) is None for event in events)
+    submitted = editor.on_key("enter")
+    assert submitted == message
+    assert editor.lines == [""]
+
+    async def fake_submit(prompt: str):
+        yield UserMessageSubmitted(prompt)
+
+    async def collect_events() -> list[UserMessageSubmitted]:
+        return [event async for event in fake_submit(submitted)]
+
+    assert asyncio.run(collect_events()) == [UserMessageSubmitted(message)]
 
 
 def test_exit_and_quit_are_not_model_prompts() -> None:
@@ -176,23 +231,25 @@ def test_exit_and_quit_are_not_model_prompts() -> None:
     assert not is_exit_command("exit the file")
 
 
-def test_exit_command_does_not_call_the_runtime() -> None:
+def test_exit_and_quit_do_not_call_the_runtime() -> None:
     seen: list[str] = []
 
     async def run_turn(prompt: str) -> None:
         seen.append(prompt)
 
     class _Once:
-        def __init__(self) -> None:
+        def __init__(self, command: str) -> None:
+            self.command = command
             self.sent = False
 
         def __call__(self, _prompt: str) -> str:
             if not self.sent:
                 self.sent = True
-                return "exit"
+                return self.command
             raise EOFError
 
-    asyncio.run(serve(_Once(), run_turn))
+    for command in ("exit", "quit"):
+        asyncio.run(serve(_Once(command), run_turn))
     assert seen == []
 
 
