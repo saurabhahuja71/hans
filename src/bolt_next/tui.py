@@ -28,11 +28,19 @@ from bolt_next.events import (
     VerificationStarted,
 )
 from bolt_next.runtime import HansRuntime
-from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
+from bolt_next.tui_screen import (
+    Editor,
+    Transcript,
+    format_change_summary,
+    is_exit_command,
+    layout_rows,
+    visible_transcript,
+)
 
 
-FOOTER = "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q exit"
+FOOTER = "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
 TASK_DIFF_MAX_CHARS = 4_000
+TOOL_OUTPUT_MAX_CHARS = 4_000
 
 
 def debug_enabled() -> bool:
@@ -105,18 +113,36 @@ class _Display:
         self.debug = debug_enabled()
         self.transcript = transcript
         self.on_connection = on_connection
+        self.state = "IDLE"
         self._started = False
         self._verification_failed = False
         self._tool_purposes: dict[str, str] = {}
 
+    @staticmethod
+    def _compact(text: str, limit: int = 240) -> str:
+        text = " ".join(text.split())
+        return text if len(text) <= limit else f"{text[:limit]}…"
+
+    @staticmethod
+    def _debug_tool_output(output: str) -> str:
+        if len(output) <= TOOL_OUTPUT_MAX_CHARS:
+            return output
+        omitted = len(output) - TOOL_OUTPUT_MAX_CHARS
+        return f"{output[:TOOL_OUTPUT_MAX_CHARS]}\n… display truncated ({omitted} characters omitted)"
+
+    def _set_state(self, state: str, detail: str = "") -> None:
+        self.state = state if not detail else f"{state} · {self._compact(detail)}"
+        if self.transcript is not None:
+            self.transcript.stage(self.state)
+
     def _tool_stage(self, name: str, purpose: str = "inspect") -> str:
         if name in {"list_directory", "search_files", "read_file"}:
-            return "investigating"
+            return "INVESTIGATING"
         if name in {"replace_in_file", "write_file"}:
-            return "correcting" if self._verification_failed else "acting"
+            return "CORRECTING" if self._verification_failed else "EDITING"
         if name == "run_command":
-            return "verifying" if purpose == "verify" else "investigating"
-        return "acting"
+            return "VERIFYING" if purpose == "verify" else "INVESTIGATING"
+        return "EDITING"
 
     def event(self, event) -> None:
         if isinstance(event, UserMessageSubmitted):
@@ -125,16 +151,15 @@ class _Display:
             else:
                 print(_plain_user(event.message), flush=True)
         elif isinstance(event, RequestStarted):
-            if self.transcript is not None:
-                self.transcript.thinking()
+            self._set_state("INVESTIGATING")
         elif isinstance(event, AssistantMessageDelta):
             self._text(event.delta)
         elif isinstance(event, ToolStarted):
-            label = f"{event.name}  {event.detail}".rstrip()
+            label = f"{event.name}  {self._compact(event.detail)}".rstrip()
             self._tool_purposes[event.call_id] = event.purpose
             if self.transcript is not None:
                 self.transcript.tool_started(label)
-                self.transcript.stage(self._tool_stage(event.name, event.purpose))
+                self._set_state(self._tool_stage(event.name, event.purpose))
                 if self.debug:
                     self.transcript.debug(
                         f"[tool_started] call_id={event.call_id} name={event.name} detail={event.detail}"
@@ -145,54 +170,63 @@ class _Display:
                     flush=True,
                 )
             else:
-                print("\n" + format_tool_call(event.name, event.detail), flush=True)
+                print("\n" + format_tool_call(event.name, self._compact(event.detail)), flush=True)
         elif isinstance(event, ToolOutput):
             if self.debug:
+                output = self._debug_tool_output(event.output)
                 if self.transcript is not None:
-                    self.transcript.debug(f"[tool_output] call_id={event.call_id}\n{event.output}")
+                    self.transcript.debug(f"[tool_output] call_id={event.call_id}\n{output}")
                 else:
-                    print(f"\n[tool_output] call_id={event.call_id}\n{event.output}", flush=True)
+                    print(f"\n[tool_output] call_id={event.call_id}\n{output}", flush=True)
         elif isinstance(event, ToolCompleted):
             label = event.detail or event.name
             purpose = self._tool_purposes.pop(event.call_id, "inspect")
             if self.transcript is not None:
-                self.transcript.stage(self._tool_stage(event.name, purpose))
                 self.transcript.tool_finished(label, ok=event.success)
             elif not self.debug:
                 print(format_tool_result(event.name, event.success, event.exit_code), flush=True)
+            if event.success:
+                self._set_state(self._tool_stage(event.name, purpose))
+            else:
+                self._set_state("FAILED", f"tool {event.name}")
         elif isinstance(event, VerificationStarted):
-            if self.transcript is not None:
-                self.transcript.stage("verifying")
+            self._set_state("VERIFYING", event.command)
         elif isinstance(event, VerificationPassed):
             self._verification_failed = False
             if self.transcript is not None:
-                self.transcript.stage("verification passed")
+                self.transcript.verification(event.evidence.command, ok=True)
+            self._set_state("VERIFYING", f"passed · {event.evidence.command}")
         elif isinstance(event, VerificationFailed):
             self._verification_failed = True
             if self.transcript is not None:
-                self.transcript.stage("verification failed")
+                self.transcript.verification(event.evidence.command, ok=False)
+            self._set_state("CORRECTING", event.evidence.command)
         elif isinstance(event, RequestCompleted):
             if self.transcript is not None:
                 self.transcript.completed(event.evidence)
-            elif self._started:
+            self._set_state("FAILED" if event.evidence is not None and not event.evidence.success else "COMPLETE")
+            if self.transcript is None and self._started:
                 print(flush=True)
         elif isinstance(event, RequestCancelled):
             if self.transcript is not None:
                 self.transcript.cancelled()
-            else:
+            self._set_state("CANCELLED")
+            if self.transcript is None:
                 print("\ninterrupted", flush=True)
         elif isinstance(event, RequestFailed):
+            titles = {
+                "configuration": "configuration failed",
+                "authentication": "authentication failed",
+                "context": "context limit exceeded",
+                "connection": "connection failed",
+                "model": "model request failed",
+                "tool": "tool failed",
+                "runtime": "runtime failed",
+            }
+            title = titles.get(event.category, "model request failed")
+            self._set_state("FAILED", title)
             if self.transcript is not None:
-                titles = {
-                    "configuration": "configuration failed",
-                    "authentication": "authentication failed",
-                    "context": "context limit exceeded",
-                    "connection": "connection failed",
-                    "model": "model request failed",
-                    "tool": "tool failed",
-                    "runtime": "runtime failed",
-                }
-                self.transcript.error(titles.get(event.category, "model request failed"), event.message[:160])
+                self.transcript.error(title, event.message[:160])
                 if self.debug:
                     self.transcript.debug(f"[{event.category}] {event.debug_message or event.message}")
             else:
@@ -203,14 +237,15 @@ class _Display:
                     flush=True,
                 )
         elif isinstance(event, TaskChangeSummary):
+            summary = format_change_summary(event.summary)
             if self.transcript is not None:
-                self.transcript.tool_started(f"changes: {event.summary}")
+                self.transcript.change(summary)
             else:
-                print(f"\nchanges: {event.summary}", flush=True)
+                print(f"\nchanges:\n{summary}", flush=True)
         elif isinstance(event, TaskDiff):
-            diff = event.diff or "(no HANS task changes)"
+            diff = (event.diff or "(no HANS task changes)")[:TASK_DIFF_MAX_CHARS]
             if self.transcript is not None:
-                self.transcript.tool_started(f"task diff\n{diff}")
+                self.transcript.diff(diff)
             else:
                 print(f"\ntask diff\n{diff}", flush=True)
         elif isinstance(event, TaskUndoSucceeded):
@@ -219,17 +254,19 @@ class _Display:
                 details.append("restored: " + ", ".join(event.restored_files))
             if event.removed_files:
                 details.append("removed: " + ", ".join(event.removed_files))
-            label = "undo completed" + (f" ({'; '.join(details)})" if details else " (no task changes)")
+            label = "Undo completed" + (f" · {'; '.join(details)}" if details else " · no HANS task changes")
             if self.transcript is not None:
-                self.transcript.tool_finished(label, ok=True)
+                self.transcript.change(f"✓ {label}", title="UNDO")
             else:
                 print(f"\n✓ {label}", flush=True)
+            self._set_state("IDLE", "undo complete")
         elif isinstance(event, TaskUndoRefused):
             conflicts = ", ".join(event.conflicting_files) or "task changes"
             if self.transcript is not None:
-                self.transcript.error("undo refused", f"conflicts: {conflicts}")
+                self.transcript.error("Undo refused", f"Conflicts: {conflicts}")
             else:
                 print(f"\n✗ undo refused: conflicts: {conflicts}", flush=True)
+            self._set_state("IDLE", "undo refused")
         elif isinstance(event, ConnectionChanged) and self.on_connection is not None:
             self.on_connection(event.connected)
         elif isinstance(event, AssistantMessageComplete):
@@ -337,6 +374,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
 
     def request_cancel(*_args) -> None:
         state["cancel"] = True
+        state["display"]._set_state("CANCELLED", "cancellation requested")
         runtime.cancel_active()
 
     previous_int = signal.signal(signal.SIGINT, request_cancel)
@@ -357,7 +395,8 @@ async def _run_curses(runtime: HansRuntime) -> None:
             stdscr.addnstr(3 + offset, 0, line, width - 1)
         footer_at = 3 + conversation
         stdscr.hline(footer_at, 0, curses.ACS_HLINE, width - 1)
-        stdscr.addnstr(footer_at + 1, 0, FOOTER, width - 1)
+        status_footer = f"{state['display'].state}  |  {FOOTER}"
+        stdscr.addnstr(footer_at + 1, 0, status_footer, width - 1)
         for offset, line in enumerate(editor.display_lines()):
             row = footer_at + 2 + offset
             if row < height:
@@ -427,6 +466,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
     tty_attr = termios.tcgetattr(sys.stdin)
     raw_attr = termios.tcgetattr(sys.stdin)
     raw_attr[0] = raw_attr[0] & ~(termios.IXON | termios.IXOFF)
+    raw_attr[3] = raw_attr[3] & ~termios.ISIG
     termios.tcsetattr(sys.stdin, termios.TCSANOW, raw_attr)
     _set_enhanced_input(True)
     try:

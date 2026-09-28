@@ -11,6 +11,41 @@ from dataclasses import dataclass, field
 from bolt_next.events import VerificationEvidence
 
 
+def format_change_summary(summary: str) -> str:
+    """Present the task journal summary without inventing another tracker."""
+    fields: dict[str, str] = {}
+    for line in summary.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key.strip()] = value.strip()
+
+    known_keys = {
+        "changed_files",
+        "created_files",
+        "preexisting_git_worktree_changes",
+        "git",
+    }
+    if not fields or not set(fields).intersection(known_keys):
+        return summary.strip()
+
+    def paths(key: str) -> list[str]:
+        value = fields.get(key, "")
+        if not value or value.lower() == "none":
+            return []
+        return [path.strip() for path in value.split(",") if path.strip()]
+
+    created = set(paths("created_files"))
+    changed = paths("changed_files")
+    lines = [f"{'A' if path in created else 'M'} {path}  HANS" for path in changed]
+    for path in paths("created_files"):
+        if path not in changed:
+            lines.append(f"A {path}  HANS")
+    preexisting = paths("preexisting_git_worktree_changes")
+    if preexisting:
+        lines.append("Existing worktree changes preserved: " + ", ".join(preexisting))
+    return "\n".join(lines) or "No HANS task changes"
+
+
 @dataclass
 class Piece:
     kind: str
@@ -26,7 +61,7 @@ class Transcript:
         self.pieces.append(Piece("user", text.rstrip("\n")))
 
     def thinking(self) -> None:
-        self.stage("thinking…")
+        self.stage("INVESTIGATING")
 
     def stage(self, text: str) -> None:
         self._drop_status()
@@ -41,20 +76,20 @@ class Transcript:
 
     def finish(self) -> None:
         self._drop_status()
-        self.pieces.append(Piece("status", "completed"))
+        self.pieces.append(Piece("final", "COMPLETE"))
 
     def completed(self, evidence: VerificationEvidence | None) -> None:
         self._drop_status()
         if evidence is None:
-            self.pieces.append(Piece("status", "completed (verification not established)"))
+            self.pieces.append(Piece("final", "COMPLETE", "Verification not established"))
         elif evidence.success:
-            self.pieces.append(Piece("status", "completed"))
+            self.pieces.append(Piece("final", "COMPLETE", f"Verified: {evidence.command}"))
         else:
-            self.pieces.append(Piece("status", "completed (verification failed)"))
+            self.pieces.append(Piece("final", "VERIFICATION FAILED", f"{evidence.command}\nHANS did not claim completion."))
 
     def cancelled(self) -> None:
         self._drop_status()
-        self.pieces.append(Piece("error", "cancelled"))
+        self.pieces.append(Piece("error", "CANCELLED", "The request was stopped. You can send another prompt."))
 
     def tool_started(self, label: str) -> None:
         self._drop_status()
@@ -62,6 +97,18 @@ class Transcript:
 
     def tool_finished(self, label: str, *, ok: bool) -> None:
         self.pieces.append(Piece("tool", label, "ok" if ok else "fail"))
+
+    def verification(self, command: str, *, ok: bool) -> None:
+        marker = "passed" if ok else "failed"
+        self.pieces.append(Piece("verification", command, marker))
+
+    def change(self, text: str, *, title: str = "CHANGES") -> None:
+        self._drop_status()
+        self.pieces.append(Piece("change", text, title))
+
+    def diff(self, text: str) -> None:
+        self._drop_status()
+        self.pieces.append(Piece("diff", text, "TASK DIFF"))
 
     def error(self, title: str, detail: str = "") -> None:
         self._drop_status()
@@ -102,17 +149,29 @@ def _wrap(text: str, width: int, indent: str = "") -> list[str]:
 def _render_piece(piece: Piece, width: int) -> list[str]:
     if piece.kind == "user":
         rows = piece.text.split("\n") or [""]
-        return [("> " if index == 0 else "  ") + row for index, row in enumerate(rows)]
+        return ["YOU"] + [("> " if index == 0 else "  ") + row for index, row in enumerate(rows)]
     if piece.kind == "assistant":
-        return _wrap(piece.text, width)
+        return ["HANS", *_wrap(piece.text, width)]
     if piece.kind == "tool":
         mark = {"run": "◇", "ok": "✓", "fail": "✗"}.get(piece.detail, "◇")
-        return _wrap(f"{mark} {piece.text}", width, "  ")
+        return _wrap(f"{mark} TOOL {piece.text}", width, "  ")
+    if piece.kind == "verification":
+        mark = "✓" if piece.detail == "passed" else "✗"
+        return _wrap(f"VERIFICATION\n{mark} {piece.text} {piece.detail}", width, "  ")
+    if piece.kind == "change":
+        return _wrap(f"{piece.detail}\n{piece.text}", width, "  ")
+    if piece.kind == "diff":
+        return _wrap(f"{piece.detail}\n{piece.text}", width, "  ")
+    if piece.kind == "final":
+        mark = "✗" if piece.text == "VERIFICATION FAILED" else "✓"
+        lines = ["FINAL RESULT", f"  {mark} {piece.text}"]
+        if piece.detail:
+            lines.extend(_wrap(piece.detail, width, "  "))
+        return lines
     if piece.kind == "status":
-        mark = "✓" if piece.text.startswith("completed") else "◌"
-        return [f"  {mark} {piece.text}"]
+        return [f"  ◌ {piece.text}"]
     if piece.kind == "error":
-        lines = [f"  ✗ {piece.text}"]
+        lines = ["ERROR", f"  ✗ {piece.text}"]
         if piece.detail:
             lines.extend(_wrap(piece.detail, width, "    "))
         return lines

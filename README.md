@@ -19,9 +19,9 @@ calling, tool results, streaming, and conversation history. HANS owns the termin
 configuration, workspace policy, the tool implementations, and how SDK events are displayed.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.4.0**.
+branding are HANS. Current release: **0.5.0**.
 
-## What 0.4.0 provides
+## What 0.5.0 provides
 
 - Interactive prompt with `exit`, `quit`, EOF, and Ctrl-C handling
 - Streaming assistant text through `Runner.run_streamed()` and `result.stream_events()`
@@ -137,9 +137,9 @@ hans
 
 On a TTY, HANS starts the Textual UI by default. Set `HANS_TUI=curses` to use the preserved curses fallback.
 
-In the Textual UI, Enter submits the prompt and Shift+Enter inserts a newline. Ctrl-D also submits and exits when the composer is empty. Ctrl-Q exits immediately, even if the composer is not empty. Ctrl-C cancels an active request and keeps HANS running. A prompt whose entire text is `exit` or `quit` exits without calling the model.
+In the Textual UI, Enter submits the prompt and Shift+Enter inserts a newline. Ctrl-D also submits and exits when the composer is empty. Ctrl-Q exits immediately, even if the composer is not empty. Ctrl-C cancels an active request and keeps HANS running. Ctrl-G opens a bounded diff of the current HANS task changes; press Esc to return. Ctrl-Z requests a task-scoped safe undo and reports any conflicts. These review controls do not call the model. A prompt whose entire text is `exit` or `quit` exits without calling the model.
 
-The curses fallback keeps its existing controls: Enter submits, Shift+Enter inserts a newline, Ctrl-D submits or exits when the editor is empty, Ctrl-C cancels, and Ctrl-Q exits. Piped input is still read until EOF and submitted as one message.
+The curses fallback keeps the same controls and renders task diffs inline: Enter submits, Shift+Enter inserts a newline, Ctrl-D submits or exits when the editor is empty, Ctrl-C cancels, Ctrl-G reviews the current task diff, Ctrl-Z requests safe undo, and Ctrl-Q exits. Piped input is still read until EOF and submitted as one message.
 
 Example prompts:
 

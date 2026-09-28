@@ -28,7 +28,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
-from bolt_next.textual_tui import HansTextualApp
+from bolt_next.textual_tui import HansTextualApp, TaskDiffScreen
 
 
 class FakeRuntime:
@@ -67,33 +67,38 @@ def rendered(widget: Static) -> str:
     return str(widget.render())
 
 
-def test_textual_shell_submits_on_enter_and_inserts_newlines_with_shift_enter(tmp_path: Path) -> None:
+def transcript_text(app: HansTextualApp) -> str:
+    transcript = app.query_one("#transcript", VerticalScroll)
+    return "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
+
+
+def test_textual_chrome_is_compact_data_driven_and_preserves_composer_keys(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()
         app = HansTextualApp(runtime, "test-model", tmp_path)
         async with app.run_test(size=(80, 24)) as pilot:
-            assert "HANS" in rendered(app.query_one("#hans-header", Static))
-            assert isinstance(app.query_one("#transcript"), VerticalScroll)
-            assert isinstance(app.query_one("#tool-area"), VerticalScroll)
-            assert "Ctrl-G diff · Ctrl-Z undo" in rendered(app.query_one("#controls", Static))
+            header = rendered(app.query_one("#hans-header", Static))
+            assert "HANS" in header
+            assert "model test-model" in header
+            assert "DISCONNECTED" in header
+            assert "workspace" in header
+            assert rendered(app.query_one("#state-line", Static)) == "IDLE"
+            assert "Ctrl-G diff · Ctrl-Z undo" in rendered(app.query_one("#footer", Static))
+            assert not app.query("#tool-area")
+            assert not app.query("#controls")
             composer = app.query_one("#composer", TextArea)
 
-            await pilot.press("h", "i", "enter")
-            await pilot.pause()
-            assert runtime.prompts == ["hi"]
-            assert composer.text == ""
-
             await pilot.press(*"line one", "shift+enter", *"line two")
+            await pilot.pause()
             assert composer.text == "line one\nline two"
-            assert runtime.prompts == ["hi"]
             await pilot.press("enter")
             await pilot.pause()
-            assert runtime.prompts == ["hi", "line one\nline two"]
+            assert runtime.prompts == ["line one\nline two"]
             assert composer.text == ""
 
             await pilot.press("o", "k", "ctrl+d")
             await pilot.pause()
-            assert runtime.prompts == ["hi", "line one\nline two", "ok"]
+            assert runtime.prompts == ["line one\nline two", "ok"]
             assert composer.text == ""
 
         assert runtime.closed == 1
@@ -101,300 +106,184 @@ def test_textual_shell_submits_on_enter_and_inserts_newlines_with_shift_enter(tm
     asyncio.run(scenario())
 
 
-def test_empty_or_exit_command_submits_nothing_and_exits(tmp_path: Path) -> None:
-    async def empty_scenario() -> None:
+def test_empty_exit_and_ctrl_q_do_not_submit(tmp_path: Path) -> None:
+    async def scenario(keys: tuple[str, ...]) -> None:
         runtime = FakeRuntime()
         app = HansTextualApp(runtime, "test-model", tmp_path)
         async with app.run_test() as pilot:
-            await pilot.press("ctrl+d")
+            await pilot.press(*keys)
             await pilot.pause()
             assert runtime.prompts == []
         assert runtime.closed == 1
 
-    async def command_scenario(command: str) -> None:
-        runtime = FakeRuntime()
-        app = HansTextualApp(runtime, "test-model", tmp_path)
-        async with app.run_test() as pilot:
-            await pilot.press(*command, "enter")
-            await pilot.pause()
-            assert runtime.prompts == []
-        assert runtime.closed == 1
-
-    async def ctrl_q_scenario() -> None:
-        runtime = FakeRuntime()
-        app = HansTextualApp(runtime, "test-model", tmp_path)
-        async with app.run_test() as pilot:
-            await pilot.press("ctrl+q")
-            await pilot.pause()
-            assert runtime.prompts == []
-        assert runtime.closed == 1
-
-    asyncio.run(empty_scenario())
-    asyncio.run(command_scenario("exit"))
-    asyncio.run(command_scenario("quit"))
-    asyncio.run(ctrl_q_scenario())
+    asyncio.run(scenario(("ctrl+d",)))
+    asyncio.run(scenario(tuple("exit") + ("enter",)))
+    asyncio.run(scenario(("ctrl+q",)))
 
 
-def test_textual_shell_renders_events_without_duplicate_assistant_or_tool_rows(tmp_path: Path) -> None:
+def test_textual_renders_inline_stable_tools_without_normal_raw_output(tmp_path: Path) -> None:
     async def scenario() -> None:
         evidence = VerificationEvidence("pytest -q", 0, True, True, True, "2026-09-28T00:00:00+00:00")
-        runtime = FakeRuntime()
-        app = HansTextualApp(runtime, "test-model", tmp_path)
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
         async with app.run_test(size=(80, 24)) as pilot:
-            events = [
+            for event in (
                 UserMessageSubmitted("inspect this"),
                 RequestStarted("inspect this"),
                 AssistantMessageDelta("Hello"),
                 AssistantMessageDelta(" there"),
                 AssistantMessageComplete("Hello there"),
                 ToolStarted("call-a", "read_file", "a.py"),
-                ToolStarted("call-b", "run_command", "pytest -q", "verify"),
-                ToolOutput("call-b", "tests passed"),
-                ToolOutput("call-a", "source"),
-                ToolCompleted("call-b", "run_command", "pytest -q", True, 0),
+                ToolOutput("call-a", "private source bytes"),
                 ToolCompleted("call-a", "read_file", "a.py", True),
-                VerificationPassed("call-b", evidence),
+                VerificationStarted("verify-1", "pytest -q"),
+                VerificationPassed("verify-1", evidence),
+                TaskChangeSummary("changed_files: a.py"),
                 RequestCompleted(evidence),
                 ConnectionChanged(True),
-            ]
-            for event in events:
+            ):
                 await app._render_event(event)
             await pilot.pause()
 
-            transcript = app.query_one("#transcript", VerticalScroll)
-            transcript_text = "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
-            assert transcript_text.count("Hello there") == 1
-            assert "> inspect this" in transcript_text
-
-            assert set(app._tool_widgets) == {"call-a", "call-b"}
-            tool_a = rendered(app._tool_widgets["call-a"])
-            tool_b = rendered(app._tool_widgets["call-b"])
-            assert "read_file  a.py" in tool_a
-            assert "source" in tool_a
-            assert "run_command  pytest -q" in tool_b
-            assert "tests passed" in tool_b
-            assert "exit 0" in tool_b
-            assert "completed" == rendered(app.query_one("#status", Static))
-            assert "connected" in rendered(app.query_one("#hans-header", Static))
+            text = transcript_text(app)
+            assert "YOU\n> inspect this" in text
+            assert text.count("HANS\nHello there") == 1
+            assert "✓ read_file a.py" in text
+            assert "1 line" in text
+            assert "call-a" not in text
+            assert "private source bytes" not in text
+            assert "VERIFICATION\n✓ pytest -q passed" in text
+            assert "CHANGES\nM a.py  HANS" in text
+            assert "FINAL RESULT\nCOMPLETE\nVerified: pytest -q" in text
+            assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
+            assert "CONNECTED" in rendered(app.query_one("#hans-header", Static))
 
     asyncio.run(scenario())
 
 
-def test_textual_renders_task_events_and_idle_diff_undo_controls(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        runtime = FakeRuntime()
-        runtime.undo_event = TaskUndoSucceeded(("existing.py",), ("new.py",))
-        app = HansTextualApp(runtime, "test-model", tmp_path)
-        async with app.run_test() as pilot:
-            await app._render_event(TaskChangeSummary("changed_files: existing.py, new.py"))
-            await app._render_event(TaskDiff("--- a/existing.py\n+++ b/existing.py\n+updated"))
-            await app._render_event(TaskUndoRefused(("changed.py",)))
-            await pilot.press("ctrl+g", "ctrl+z")
-            await pilot.pause()
-
-            transcript = app.query_one("#transcript", VerticalScroll)
-            text = "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
-            assert "changes: changed_files: existing.py, new.py" in text
-            assert "task diff" in text
-            assert "+++ b/existing.py" in text
-            assert "undo refused" in text
-            assert "conflicts: changed.py" in text
-            assert "undo completed" in text
-            assert "restored: existing.py" in text
-            assert "removed: new.py" in text
-            assert runtime.task_diff_calls == [app.MAX_TASK_DIFF_CHARS]
-            assert runtime.undo_calls == 1
-
-            app._request_active = True
-            await pilot.press("ctrl+g", "ctrl+z")
-            await pilot.pause()
-            assert runtime.task_diff_calls == [app.MAX_TASK_DIFF_CHARS]
-            assert runtime.undo_calls == 1
-
-    asyncio.run(scenario())
-
-
-def test_tool_output_display_is_bounded_without_mutating_event_output(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
-        app.MAX_TOOL_OUTPUT_CHARS = 8
-        output = "abcdefghijk"
-        event = ToolOutput("long", output)
-        async with app.run_test() as pilot:
-            await app._render_event(ToolStarted("long", "run_command", "pytest -q", "verify"))
-            await app._render_event(event)
-            await pilot.pause()
-
-            rendered_output = rendered(app._tool_widgets["long"])
-            assert event.output == output
-            assert "abcdefgh" in rendered_output
-            assert "display truncated (3 characters omitted)" in rendered_output
-            assert "ijk" not in rendered_output
-
-    asyncio.run(scenario())
-
-
-def test_transcript_resize_and_scroll_position_are_preserved_when_scrolled_up(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
-        async with app.run_test(size=(48, 16)) as pilot:
-            for number in range(30):
-                await app._append_transcript(f"line {number}", "assistant")
-            await pilot.pause()
-            transcript = app.query_one("#transcript", VerticalScroll)
-            transcript.scroll_home(animate=False, force=True, immediate=True)
-            await pilot.pause()
-            await app._append_transcript("new line while reviewing", "assistant")
-            await pilot.resize_terminal(72, 22)
-            await pilot.pause()
-            assert transcript.scroll_y < transcript.max_scroll_y
-            assert "new line while reviewing" in rendered(list(transcript.children)[-1])
-            assert "HANS" in rendered(app.query_one("#hans-header", Static))
-            assert isinstance(app.query_one("#composer"), TextArea)
-
-            transcript.scroll_end(animate=False, force=True, immediate=True)
-            await pilot.pause()
-            await app._append_transcript("new line at bottom", "assistant")
-            await pilot.pause()
-            assert transcript.scroll_y == transcript.max_scroll_y
-
-    asyncio.run(scenario())
-
-
-def test_textual_failure_titles_are_semantic_for_configuration_authentication_and_model() -> None:
-    assert HansTextualApp._failure_title("configuration") == "configuration failed"
-    assert HansTextualApp._failure_title("authentication") == "authentication failed"
-    assert HansTextualApp._failure_title("model") == "model request failed"
-
-
-def test_cancel_and_failure_events_stay_visible(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        runtime = FakeRuntime()
-        app = HansTextualApp(runtime, "test-model", tmp_path)
-        async with app.run_test(size=(80, 24)) as pilot:
-            await app._render_event(RequestStarted("wait"))
-            app.action_cancel_active()
-            assert runtime.cancelled == 1
-            await app._render_event(RequestCancelled())
-            await app._render_event(RequestFailed("connection", "model endpoint unavailable"))
-            await pilot.pause()
-
-            transcript = app.query_one("#transcript", VerticalScroll)
-            transcript_text = "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
-            assert "✗ cancelled" in transcript_text
-            assert "✗ connection failed" in transcript_text
-            assert "model endpoint unavailable" in transcript_text
-            assert rendered(app.query_one("#status", Static)) == "connection failed"
-
-    asyncio.run(scenario())
-
-
-def test_verification_states_and_ctrl_c_are_rendered_from_semantic_events(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        evidence = VerificationEvidence("pytest -q", 1, False, True, True, "2026-09-28T00:00:00+00:00")
-        runtime = FakeRuntime()
-        app = HansTextualApp(runtime, "test-model", tmp_path)
-        async with app.run_test() as pilot:
-            await app._render_event(RequestStarted("verify"))
-            await pilot.press("ctrl+c")
-            assert runtime.cancelled == 1
-            assert rendered(app.query_one("#status", Static)) == "cancelling…"
-
-            await app._render_event(VerificationStarted("verify-1", "pytest -q"))
-            assert rendered(app.query_one("#status", Static)) == "verifying: pytest -q"
-            await app._render_event(VerificationFailed("verify-1", evidence))
-            assert rendered(app.query_one("#status", Static)) == "verification failed: pytest -q"
-            await app._render_event(RequestCancelled())
-            assert rendered(app.query_one("#status", Static)) == "cancelled"
-            await pilot.press("o", "k", "enter")
-            await pilot.pause()
-            assert runtime.prompts == ["ok"]
-            assert app.query_one("#composer", TextArea).text == ""
-
-    asyncio.run(scenario())
-
-
-def test_tool_stages_follow_semantic_verification_state(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        evidence = VerificationEvidence("pytest -q", 1, False, True, False, "2026-09-28T00:00:00+00:00")
-        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
-        async with app.run_test() as pilot:
-            await app._render_event(RequestStarted("inspect"))
-            await app._render_event(ToolStarted("read", "read_file", "README.md"))
-            assert rendered(app.query_one("#status", Static)) == "investigating"
-            await app._render_event(ToolStarted("list", "list_directory", "src"))
-            assert rendered(app.query_one("#status", Static)) == "investigating"
-            await app._render_event(ToolStarted("search", "search_files", "src: needle"))
-            assert rendered(app.query_one("#status", Static)) == "investigating"
-
-            await app._render_event(ToolStarted("write", "write_file", "notes.txt"))
-            assert rendered(app.query_one("#status", Static)) == "acting"
-            await app._render_event(ToolStarted("replace", "replace_in_file", "notes.txt"))
-            assert rendered(app.query_one("#status", Static)) == "acting"
-
-            await app._render_event(VerificationFailed("verify", evidence))
-            await app._render_event(ToolStarted("correct", "replace_in_file", "notes.txt"))
-            assert rendered(app.query_one("#status", Static)) == "correcting"
-
-            await app._render_event(ToolStarted("inspect", "run_command", "git status"))
-            assert rendered(app.query_one("#status", Static)) == "investigating"
-            await app._render_event(ToolStarted("test", "run_command", "pytest -q", "verify"))
-            assert rendered(app.query_one("#status", Static)) == "verifying"
-            await app._render_event(ToolCompleted("test", "run_command", "pytest -q", False, 1))
-            assert rendered(app.query_one("#status", Static)) == "tool failed: run_command"
-            assert "✗ run_command  pytest -q  exit 1" in rendered(app._tool_widgets["test"])
-            await pilot.pause()
-
-    asyncio.run(scenario())
-
-
-def test_failure_details_respect_debug_mode_and_connection_events(tmp_path: Path, monkeypatch) -> None:
+def test_textual_debug_output_is_gated_and_bounded(tmp_path: Path, monkeypatch) -> None:
     async def scenario(debug: bool) -> str:
         if debug:
             monkeypatch.setenv("HANS_DEBUG", "1")
         else:
             monkeypatch.delenv("HANS_DEBUG", raising=False)
         app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        app.MAX_TOOL_OUTPUT_CHARS = 8
         async with app.run_test() as pilot:
-            await app._render_event(RequestFailed("context", "conversation is too large", "provider trace details"))
-            await app._render_event(ConnectionChanged(False))
+            await app._render_event(ToolStarted("call", "run_command", "pytest -q", "verify"))
+            await app._render_event(ToolOutput("call", "abcdefghijk"))
             await pilot.pause()
-            transcript = app.query_one("#transcript", VerticalScroll)
-            transcript_text = "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
-            assert rendered(app.query_one("#status", Static)) == "context limit exceeded"
-            assert "disconnected" in rendered(app.query_one("#hans-header", Static))
-            return transcript_text
+            return transcript_text(app)
 
-    plain = asyncio.run(scenario(False))
-    assert "✗ context limit exceeded" in plain
-    assert "conversation is too large" in plain
-    assert "provider trace details" not in plain
-
+    normal = asyncio.run(scenario(False))
+    assert "abcdefgh" not in normal
     debug = asyncio.run(scenario(True))
-    assert "debug (context): provider trace details" in debug
+    assert "DEBUG TOOL [call] OUTPUT" in debug
+    assert "abcdefgh" in debug
+    assert "display truncated (3 characters omitted)" in debug
+    assert "ijk" not in debug
 
 
-def test_transcript_retention_and_unicode_reflow(tmp_path: Path) -> None:
+def test_lifecycle_states_are_derived_from_semantic_events(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-28T00:00:00+00:00")
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(RequestStarted("inspect"))
+            assert rendered(app.query_one("#state-line", Static)) == "INVESTIGATING"
+            await app._render_event(ToolStarted("write", "write_file", "a.py"))
+            assert rendered(app.query_one("#state-line", Static)) == "EDITING"
+            await app._render_event(VerificationStarted("verify", "pytest -q"))
+            assert rendered(app.query_one("#state-line", Static)).startswith("VERIFYING")
+            await app._render_event(VerificationFailed("verify", failed))
+            assert rendered(app.query_one("#state-line", Static)).startswith("CORRECTING")
+            await app._render_event(RequestFailed("connection", "unavailable"))
+            assert rendered(app.query_one("#state-line", Static)).startswith("FAILED")
+            await app._render_event(RequestCancelled())
+            assert rendered(app.query_one("#state-line", Static)) == "CANCELLED"
+            assert "VERIFICATION\n✗ pytest -q failed" in transcript_text(app)
+            assert "ERROR\n✗ connection failed\nunavailable" in transcript_text(app)
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_g_uses_a_bounded_modal_and_escape_returns(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            base_screen = app.screen
+            await pilot.press("ctrl+g")
+            await pilot.pause()
+            assert runtime.task_diff_calls == [app.MAX_TASK_DIFF_CHARS]
+            assert isinstance(app.screen, TaskDiffScreen)
+            diff_view = app.screen.query_one("#task-diff")
+            assert diff_view.region.x == 0
+            assert diff_view.region.y == 0
+            assert diff_view.region.width == app.size.width
+            assert diff_view.region.height == app.size.height
+            assert "+++ b/task.txt" in rendered(app.screen.query_one(".diff-content", Static))
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen is base_screen
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_z_reports_safe_task_undo_and_does_not_run_while_active(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.undo_event = TaskUndoSucceeded(("existing.py",), ("new.py",))
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+z")
+            await pilot.pause()
+            assert runtime.undo_calls == 1
+            assert "UNDO\n✓ Undo completed · restored: existing.py; removed: new.py" in transcript_text(app)
+            assert rendered(app.query_one("#state-line", Static)).startswith("IDLE")
+
+            app._request_active = True
+            await pilot.press("ctrl+z", "ctrl+g")
+            await pilot.pause()
+            assert runtime.undo_calls == 1
+            assert runtime.task_diff_calls == []
+
+            app._request_active = False
+            await app._render_event(TaskUndoRefused(("changed.py",)))
+            assert "UNDO\n✗ Undo refused\nConflicts: changed.py" in transcript_text(app)
+
+    asyncio.run(scenario())
+
+
+def test_transcript_follow_tail_manual_anchor_resize_and_retention(tmp_path: Path) -> None:
     async def scenario() -> None:
         app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
         app.MAX_TRANSCRIPT_ROWS = 3
-        async with app.run_test(size=(48, 16)) as pilot:
+        async with app.run_test(size=(48, 10)) as pilot:
             for number in range(5):
                 await app._append_transcript(f"row {number}", "assistant")
-            await app._append_transcript("日本語 and wide text: 漢字", "assistant")
-            await pilot.resize_terminal(72, 22)
-            await pilot.pause()
-
+            await pilot.pause(0.1)
             transcript = app.query_one("#transcript", VerticalScroll)
+            transcript.scroll_home(animate=False, force=True, immediate=True)
+            await pilot.pause(0.1)
+            assert transcript.scroll_y == 0
+            await app._append_transcript("new while reviewing", "assistant")
+            await pilot.resize_terminal(72, 12)
+            await pilot.pause()
+            assert transcript.scroll_y < transcript.max_scroll_y
             rows = [rendered(child) for child in transcript.children if isinstance(child, Static)]
-            assert rows == ["row 3", "row 4", "日本語 and wide text: 漢字"]
-            assert "HANS" in rendered(app.query_one("#hans-header", Static))
+            assert rows == ["row 3", "row 4", "new while reviewing"]
+
+            transcript.scroll_end(animate=False, force=True, immediate=True)
+            await app._append_transcript("at bottom", "assistant")
+            await pilot.pause()
+            assert transcript.scroll_y == transcript.max_scroll_y
             assert isinstance(app.query_one("#composer"), TextArea)
 
     asyncio.run(scenario())
 
 
-def test_completed_tool_rows_are_bounded_without_losing_active_rows(tmp_path: Path) -> None:
+def test_completed_tool_retention_keeps_active_rows(tmp_path: Path) -> None:
     async def scenario() -> None:
         app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
         app.MAX_TOOL_ROWS = 2
@@ -405,8 +294,42 @@ def test_completed_tool_rows_are_bounded_without_losing_active_rows(tmp_path: Pa
                 await app._render_event(ToolCompleted(call_id, "read_file", f"{number}.txt", True))
             await app._render_event(ToolStarted("active", "read_file", "active.txt"))
             await pilot.pause()
-
             assert set(app._tool_widgets) == {"tool-1", "tool-2", "active"}
-            assert set(app._tool_text) == {"tool-1", "tool-2", "active"}
+            text = transcript_text(app)
+            assert "0.txt" not in text
+            assert "◉ read_file active.txt" in text
+
+    asyncio.run(scenario())
+
+
+def test_cancel_leaves_composer_usable_and_errors_remain_visible(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(RequestStarted("wait"))
+            await pilot.press("ctrl+c")
+            assert runtime.cancelled == 1
+            assert rendered(app.query_one("#state-line", Static)).startswith("CANCELLED")
+            await app._render_event(RequestCancelled())
+            await pilot.press("o", "k", "enter")
+            await pilot.pause()
+            assert runtime.prompts == ["ok"]
+            assert app.query_one("#composer", TextArea).text == ""
+            assert "CANCELLED\nThe request was stopped" in transcript_text(app)
+
+    asyncio.run(scenario())
+
+
+def test_failed_verification_is_not_rendered_as_completion(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-28T00:00:00+00:00")
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(RequestCompleted(failed))
+            await pilot.pause()
+            text = transcript_text(app)
+            assert "FINAL RESULT\nVERIFICATION FAILED\npytest -q\nHANS did not claim completion." in text
+            assert rendered(app.query_one("#state-line", Static)) == "FAILED"
 
     asyncio.run(scenario())

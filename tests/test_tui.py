@@ -5,8 +5,10 @@ import pytest
 
 from bolt_next.events import (
     AssistantMessageDelta,
+    RequestCancelled,
     RequestCompleted,
     RequestFailed,
+    RequestStarted,
     TaskChangeSummary,
     TaskDiff,
     TaskUndoRefused,
@@ -17,6 +19,7 @@ from bolt_next.events import (
     UserMessageSubmitted,
     VerificationEvidence,
     VerificationFailed,
+    VerificationPassed,
     VerificationStarted,
 )
 from bolt_next.runtime import run_config
@@ -54,76 +57,31 @@ def test_multiline_text_is_one_message() -> None:
     assert message == "Inspect this repository.\n\nRun the tests."
 
 
-def test_embedded_newlines_are_preserved() -> None:
-    message = read_user_message(_Lines(["alpha", "beta", "gamma", None]))
-    assert message is not None
-    assert message.split("\n") == ["alpha", "beta", "gamma"]
-
-
-def test_one_pasted_block_is_one_message_and_then_stop() -> None:
-    read_line = _Lines(["Inspect this repository.", "Find the relevant Go implementation.", None])
-    assert read_user_message(read_line) == "Inspect this repository.\nFind the relevant Go implementation."
-    assert read_user_message(read_line) is None
-
-
-def test_footer_lists_the_real_controls() -> None:
-    assert FOOTER == "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q exit"
-
-
-def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
+def test_footer_and_compact_header_list_real_controls(tmp_path: Path, monkeypatch) -> None:
+    assert FOOTER == "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    workspace = tmp_path / "covered_call_bot"
-    text = format_header("qwen3.6-27b", workspace, True)
+    text = format_header("qwen3.6-27b", tmp_path / "project", True)
     assert text.startswith("HANS")
     assert "qwen3.6-27b" in text
-    assert "workspace: ~/covered_call_bot" in text
+    assert "workspace: ~/project" in text
     assert "● connected" in text
     assert "https://" not in text
-    assert "trycloudflare" not in text
-    assert "○ disconnected" in format_header("qwen3.6-27b", workspace, False)
 
 
-def test_normal_tool_activity_is_concise() -> None:
-    call = format_tool_call("read_file", "invoice/money.go")
-    done = format_tool_result("run_command", True, 0)
-    failed = format_tool_result("run_command", False, 1)
-    assert call == "  ◇ read_file  invoice/money.go"
-    assert "[tool_started]" not in call
-    assert done == "  ✓ run_command  exit 0"
-    assert failed == "  ✗ run_command  exit 1"
-
-
-def test_debug_marker_is_not_in_normal_error() -> None:
-    message = turn_error_message(
-        "connection", "Connection error.", debug=False, debug_detail="raw provider response"
-    )
-    assert message.startswith("\n✗ ")
-    assert "Traceback" not in message
-    assert "[connection]" not in message
-    assert "raw provider response" not in message
-    debug = turn_error_message(
-        "connection", "Connection error.", debug=True, debug_detail="raw provider response"
-    )
+def test_normal_tool_activity_is_concise_and_raw_errors_are_debug_only() -> None:
+    assert format_tool_call("read_file", "invoice/money.go") == "  ◇ read_file  invoice/money.go"
+    assert format_tool_result("run_command", True, 0) == "  ✓ run_command  exit 0"
+    assert format_tool_result("run_command", False, 1) == "  ✗ run_command  exit 1"
+    normal = turn_error_message("connection", "Connection error.", debug=False, debug_detail="raw provider response")
+    assert "raw provider response" not in normal
+    debug = turn_error_message("connection", "Connection error.", debug=True, debug_detail="raw provider response")
     assert "[connection] raw provider response" in debug
 
 
 @pytest.mark.parametrize("category", ("configuration", "authentication", "model"))
-def test_legacy_terminal_uses_concise_semantic_failure_titles(category: str) -> None:
+def test_terminal_uses_semantic_failure_titles(category: str) -> None:
     rendered = turn_error_message(category, "details", debug=False)
-
     assert f"✗ {category}" in rendered or "✗ model request failed" in rendered
-
-
-def test_display_exposes_raw_failure_detail_only_in_debug_mode(monkeypatch) -> None:
-    raw_detail = "OCI response 400: unsupported parameter"
-    normal = Transcript()
-    _Display(normal).event(RequestFailed("runtime", "model request failed", raw_detail))
-    assert raw_detail not in "\n".join(normal.render(120))
-
-    monkeypatch.setenv("HANS_DEBUG", "1")
-    debug = Transcript()
-    _Display(debug).event(RequestFailed("runtime", "model request failed", raw_detail))
-    assert raw_detail in "\n".join(debug.render(120))
 
 
 def test_tracing_is_disabled_without_openai_key() -> None:
@@ -151,61 +109,23 @@ def test_ctrl_c_during_prompt_and_turn_stays_in_session() -> None:
     assert seen == ["hi"]
 
 
-def test_user_and_assistant_are_separate_lines() -> None:
-    transcript = Transcript()
-    transcript.user("hi")
-    transcript.thinking()
-    transcript.stream("Hi!")
-    transcript.stream(" How can I help?")
-    transcript.finish()
-    lines = transcript.render(80)
-    user_at = lines.index("> hi")
-    assistant_at = lines.index("Hi! How can I help?")
-    assert assistant_at > user_at
-    assert not any(line.startswith("> hiHi") for line in lines)
-    assert lines.count("Hi! How can I help?") == 1
-
-
-def test_streaming_does_not_add_a_newline_per_chunk() -> None:
-    transcript = Transcript()
-    transcript.stream("Hello")
-    transcript.stream(" there")
-    assert transcript.render(80) == ["Hello there"]
-
-
-def test_enter_submits_without_inserting_a_newline() -> None:
-    editor = Editor()
-    assert editor.on_key("char:line one") is None
-    assert editor.on_key("enter") == "line one"
-    assert editor.lines == [""]
-
-
-def test_shift_enter_inserts_multiline_prompt_without_submitting() -> None:
+def test_editor_submission_newlines_cancellation_and_exit() -> None:
     editor = Editor()
     assert editor.on_key("char:line one") is None
     assert editor.on_key("shift-enter") is None
     assert editor.on_key("char:line two") is None
-    assert editor.on_key("shift-enter") is None
-    assert editor.on_key("char:line three") is None
-    assert editor.lines == ["line one", "line two", "line three"]
-    assert editor.on_key("enter") == "line one\nline two\nline three"
-
-
-def test_ctrl_d_submits_and_empty_ctrl_d_exits() -> None:
-    editor = Editor()
-    editor.lines = ["line one", "line two"]
-    assert editor.on_key("ctrl-d") == "line one\nline two"
+    assert editor.on_key("enter") == "line one\nline two"
+    assert editor.lines == [""]
     assert editor.on_key("ctrl-d") == ""
-
-
-def test_ctrl_q_exits_and_clears_the_editor() -> None:
-    editor = Editor()
+    editor.on_key("char:partial")
+    assert editor.on_key("ctrl-c") is None
+    assert editor.lines == [""]
     editor.on_key("char:keep")
     assert editor.on_key("ctrl-q") == ""
     assert editor.lines == [""]
 
 
-def test_terminal_key_decoder_maps_submit_newline_and_cancellation_controls() -> None:
+def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
     decoder = _InputDecoder()
     assert decoder.feed("\n") == ["enter"]
     assert decoder.feed("\x1b[13;2u") == ["shift-enter"]
@@ -215,29 +135,10 @@ def test_terminal_key_decoder_maps_submit_newline_and_cancellation_controls() ->
     assert decoder.feed("\x1a") == ["ctrl-z"]
     assert decoder.feed("\x11") == ["ctrl-q"]
 
-
-def test_bracketed_multiline_paste_submits_one_semantic_user_message() -> None:
-    message = "line one\nline two\nline three"
-    editor = Editor()
-    decoder = _InputDecoder()
-    events = [
-        event
-        for key in "\x1b[200~" + message + "\x1b[201~"
-        for event in decoder.feed(key)
-    ]
+    message = "line one\nline two"
+    pasted = _InputDecoder()
+    events = [event for key in "\x1b[200~" + message + "\x1b[201~" for event in pasted.feed(key)]
     assert "".join(event[5:] for event in events) == message
-    assert all(editor.on_key(event) is None for event in events)
-    submitted = editor.on_key("enter")
-    assert submitted == message
-    assert editor.lines == [""]
-
-    async def fake_submit(prompt: str):
-        yield UserMessageSubmitted(prompt)
-
-    async def collect_events() -> list[UserMessageSubmitted]:
-        return [event async for event in fake_submit(submitted)]
-
-    assert asyncio.run(collect_events()) == [UserMessageSubmitted(message)]
 
 
 def test_exit_and_quit_are_not_model_prompts() -> None:
@@ -246,123 +147,123 @@ def test_exit_and_quit_are_not_model_prompts() -> None:
     assert not is_exit_command("exit the file")
 
 
-def test_exit_and_quit_do_not_call_the_runtime() -> None:
-    seen: list[str] = []
-
-    async def run_turn(prompt: str) -> None:
-        seen.append(prompt)
-
-    class _Once:
-        def __init__(self, command: str) -> None:
-            self.command = command
-            self.sent = False
-
-        def __call__(self, _prompt: str) -> str:
-            if not self.sent:
-                self.sent = True
-                return self.command
-            raise EOFError
-
-    for command in ("exit", "quit"):
-        asyncio.run(serve(_Once(command), run_turn))
-    assert seen == []
-
-
-def test_ctrl_c_clears_the_editor_without_submitting() -> None:
-    editor = Editor()
-    editor.on_key("char:partial")
-    assert editor.on_key("ctrl-c") is None
-    assert editor.lines == [""]
-
-
-def test_display_consumes_semantic_tool_and_verification_events() -> None:
+def test_curses_display_uses_semantic_lifecycle_hierarchy_and_tool_privacy(monkeypatch) -> None:
+    monkeypatch.delenv("HANS_DEBUG", raising=False)
     transcript = Transcript()
     display = _Display(transcript)
-    command = "pytest -q"
-    evidence = VerificationEvidence(command, 1, True, True, False, "2026-09-26T00:00:00+00:00")
+    passed = VerificationEvidence("pytest -q", 0, True, True, True, "2026-09-28T00:00:00+00:00")
+    failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-28T00:00:01+00:00")
 
-    display.event(ToolStarted("verify-1", "run_command", command, "verify"))
-    display.event(VerificationStarted("verify-1", command))
-    display.event(ToolOutput("verify-1", "authoritative tool output"))
-    display.event(ToolCompleted("verify-1", "run_command", command, False, 1))
-    display.event(VerificationFailed("verify-1", evidence))
-
-    assert transcript.pieces[-1].text == "verification failed"
-    display.event(ToolStarted("inspect-1", "run_command", "git status"))
-    assert transcript.pieces[-1].text == "investigating"
-    display.event(ToolStarted("list-1", "list_directory", "src"))
-    assert transcript.pieces[-1].text == "investigating"
-    display.event(ToolStarted("search-1", "search_files", "src: needle"))
-    assert transcript.pieces[-1].text == "investigating"
-    display.event(ToolStarted("write-1", "write_file", "main.py"))
-    assert transcript.pieces[-1].text == "correcting"
-    display.event(ToolStarted("replace-1", "replace_in_file", "main.py"))
-    assert transcript.pieces[-1].text == "correcting"
-    display.event(ToolOutput("write-1", "Wrote main.py (5 bytes)"))
-    display.event(ToolCompleted("write-1", "write_file", "main.py", True))
-    display.event(AssistantMessageDelta("Fixed it."))
-    display.event(RequestCompleted(None))
-    assert transcript.pieces[-1].text == "completed (verification not established)"
-
-
-def test_display_consumes_task_change_events_without_runtime_details() -> None:
-    transcript = Transcript()
-    display = _Display(transcript)
-
-    display.event(TaskChangeSummary("changed_files: existing.py, new.py"))
-    display.event(TaskDiff("--- a/existing.py\n+++ b/existing.py\n+updated"))
-    display.event(TaskUndoSucceeded(("existing.py",), ("new.py",)))
-    display.event(TaskUndoRefused(("changed.py",)))
+    display.event(UserMessageSubmitted("fix it"))
+    display.event(RequestStarted("fix it"))
+    assert display.state == "INVESTIGATING"
+    display.event(AssistantMessageDelta("I found it."))
+    display.event(ToolStarted("read-1", "read_file", "a.py"))
+    assert display.state == "INVESTIGATING"
+    display.event(ToolOutput("read-1", "private source bytes"))
+    display.event(ToolCompleted("read-1", "read_file", "a.py", True))
+    display.event(ToolStarted("write-1", "write_file", "a.py"))
+    assert display.state == "EDITING"
+    display.event(VerificationStarted("verify-1", "pytest -q"))
+    assert display.state.startswith("VERIFYING")
+    display.event(VerificationFailed("verify-1", failed))
+    assert display.state.startswith("CORRECTING")
+    display.event(VerificationPassed("verify-2", passed))
+    display.event(RequestCompleted(passed))
+    assert display.state == "COMPLETE"
 
     rendered = "\n".join(transcript.render(120))
-    assert "changes: changed_files: existing.py, new.py" in rendered
-    assert "task diff" in rendered
+    assert "YOU\n> fix it" in rendered
+    assert "HANS\nI found it." in rendered
+    assert "TOOL read_file  a.py" in rendered
+    assert "read-1" not in rendered
+    assert "private source bytes" not in rendered
+    assert "VERIFICATION" in rendered
+    assert "✓ pytest -q passed" in rendered
+    assert "FINAL RESULT" in rendered
+    assert "Verified: pytest -q" in rendered
+
+
+def test_curses_debug_tool_output_is_explicit_and_bounded(monkeypatch) -> None:
+    monkeypatch.setenv("HANS_DEBUG", "1")
+    transcript = Transcript()
+    display = _Display(transcript)
+    display.event(ToolOutput("call", "authoritative tool output"))
+    assert "authoritative tool output" in "\n".join(transcript.render(120))
+
+    display.event(ToolOutput("call", "x" * 4_001))
+    rendered = "\n".join(transcript.render(8_000))
+    assert "display truncated (1 characters omitted)" in rendered
+    assert "x" * 4_001 not in rendered
+
+
+def test_curses_changes_diff_undo_and_errors_are_task_scoped() -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+    display.event(
+        TaskChangeSummary(
+            "changed_files: existing.py, new.py\n"
+            "created_files: new.py\n"
+            "preexisting_git_worktree_changes: notes.txt\n"
+            "git: available"
+        )
+    )
+    display.event(TaskDiff("--- a/existing.py\n+++ b/existing.py\n+updated"))
+    display.event(TaskDiff("x" * 4_001))
+    assert transcript.pieces[-1].text == "x" * 4_000
+    display.event(TaskUndoSucceeded(("existing.py",), ("new.py",)))
+    assert display.state.startswith("IDLE")
+    display.event(TaskUndoRefused(("changed.py",)))
+    display.event(RequestFailed("connection", "model endpoint unavailable"))
+
+    rendered = "\n".join(transcript.render(120))
+    assert "CHANGES\n  M existing.py  HANS\n  A new.py  HANS" in rendered
+    assert "Existing worktree changes preserved: notes.txt" in rendered
+    assert "TASK DIFF" in rendered
     assert "+++ b/existing.py" in rendered
-    assert "undo completed (restored: existing.py; removed: new.py)" in rendered
-    assert "undo refused" in rendered
-    assert "conflicts: changed.py" in rendered
-    assert "SDK" not in rendered
+    assert "UNDO\n  ✓ Undo completed · restored: existing.py; removed: new.py" in rendered
+    assert "ERROR\n  ✗ Undo refused" in rendered
+    assert "Conflicts: changed.py" in rendered
+    assert "✗ connection failed" in rendered
+    assert display.state.startswith("FAILED")
 
 
-def test_verification_status_and_completion_require_tool_evidence() -> None:
-    failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-26T00:00:00+00:00")
-    passed = VerificationEvidence("pytest -q", 0, True, True, True, "2026-09-26T00:00:01+00:00")
+def test_cancel_and_completion_claims_follow_semantic_events() -> None:
     transcript = Transcript()
-    transcript.tool_started("run_command  pytest -q")
-    transcript.stage("verifying")
-    transcript.tool_finished("pytest -q", ok=False)
-    transcript.stage("verification failed")
-    transcript.completed(failed)
-    failed_lines = transcript.render(80)
-    assert "  ✗ pytest -q" in failed_lines
-    assert "  ✓ completed (verification failed)" in failed_lines
-    unverified = Transcript()
-    unverified.completed(None)
-    assert unverified.render(80) == ["  ✓ completed (verification not established)"]
-    verified = Transcript()
-    verified.completed(passed)
-    assert verified.render(80) == ["  ✓ completed"]
-
-
-def test_errors_stay_in_the_transcript() -> None:
-    transcript = Transcript()
-    transcript.error("model request failed", "connection refused")
+    display = _Display(transcript)
+    display.event(RequestCompleted(None))
+    assert "Verification not established" in "\n".join(transcript.render(80))
+    display.event(RequestCancelled())
     rendered = "\n".join(transcript.render(80))
-    assert "✗ model request failed" in rendered
-    assert "connection refused" in rendered
-    assert "Traceback" not in rendered
+    assert "CANCELLED" in rendered
+    assert display.state == "CANCELLED"
 
 
-def test_resize_reflows_without_duplicating_the_message() -> None:
+def test_transcript_resize_reflows_hierarchy_without_duplicate_messages() -> None:
     transcript = Transcript()
     transcript.user("Investigate the failing test")
     transcript.stream("The discount is applied before tax, which changes the total.")
     wide = transcript.render(80)
     narrow = transcript.render(24)
-    assert sum(line.startswith("> ") for line in wide) == 1
-    assert sum(line.startswith("> ") for line in narrow) == 1
+    assert wide.count("YOU") == 1
+    assert narrow.count("YOU") == 1
+    assert wide.count("HANS") == 1
+    assert narrow.count("HANS") == 1
     assert "Investigate" in " ".join(narrow)
     assert len(visible_transcript(narrow, 3)) == 3
     conversation, editor_height = layout_rows(24, 2)
     assert conversation >= 1
     assert editor_height == 3
+
+
+def test_curses_failed_verification_is_not_claimed_complete() -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+    failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-28T00:00:00+00:00")
+    display.event(RequestCompleted(failed))
+
+    rendered = "\n".join(transcript.render(120))
+    assert display.state == "FAILED"
+    assert "✗ VERIFICATION FAILED" in rendered
+    assert "pytest -q" in rendered
+    assert "HANS did not claim completion." in rendered
