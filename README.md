@@ -19,7 +19,13 @@ calling, tool results, streaming, and conversation history. HANS owns the termin
 configuration, workspace policy, the tool implementations, and how SDK events are displayed.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.5.0**.
+branding are HANS. Current release: **0.5.1**.
+
+## What 0.5.1 provides
+
+- Context-aware shortcut footer: composer controls while idle, cancellation controls while active, and diff/undo controls only when HANS-owned task changes are reviewable.
+- Compact `DIFF · Esc back` review chrome, with the same lifecycle/footer behavior in the curses fallback.
+- Existing semantic styling retained; runtime, provider, workspace, and agent-loop behavior are unchanged.
 
 ## What 0.5.0 provides
 

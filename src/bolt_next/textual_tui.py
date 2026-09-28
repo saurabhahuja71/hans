@@ -38,7 +38,12 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
-from bolt_next.tui_screen import format_change_summary, is_exit_command
+from bolt_next.tui_screen import (
+    footer_text,
+    format_change_summary,
+    is_exit_command,
+    task_summary_has_hans_changes,
+)
 
 
 class Runtime(Protocol):
@@ -93,7 +98,7 @@ class TaskDiffScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Container(id="task-diff"):
-            yield Static("TASK DIFF  ·  Esc back", id="task-diff-title", markup=False)
+            yield Static("DIFF  ·  Esc back", id="task-diff-title", markup=False)
             with VerticalScroll(id="task-diff-body"):
                 yield Static(self.diff, classes="diff-content", markup=False)
 
@@ -224,13 +229,15 @@ class HansTextualApp(App[None]):
         self._transcript_rows: deque[Static] = deque()
         self._verification_failed = False
         self._request_active = False
+        self._has_task_changes = False
+        self._state = "IDLE"
         self._closed = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._header_text(), id="hans-header", markup=False)
         yield VerticalScroll(id="transcript")
-        yield Static("IDLE", id="state-line", markup=False)
-        yield Static("Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit", id="footer", markup=False)
+        yield Static(self._state, id="state-line", markup=False)
+        yield Static(self._footer_text(), id="footer", markup=False)
         yield TextArea("", id="composer")
 
     def on_mount(self) -> None:
@@ -267,10 +274,21 @@ class HansTextualApp(App[None]):
             shown_workspace = str(self.workspace)
         return f"HANS  |  model {self.model}  |  {marker}\nworkspace {shown_workspace}"
 
+    def _footer_text(self) -> str:
+        return footer_text(
+            self._state,
+            request_active=self._request_active,
+            has_task_changes=self._has_task_changes,
+        )
+
+    def _update_footer(self) -> None:
+        self.query_one("#footer", Static).update(self._footer_text())
+
     def _set_state(self, state: str, detail: str = "") -> None:
         shown_detail = self._compact(detail, self.MAX_TOOL_DETAIL_CHARS)
-        text = state if not shown_detail else f"{state}  ·  {shown_detail}"
-        self.query_one("#state-line", Static).update(text)
+        self._state = state if not shown_detail else f"{state}  ·  {shown_detail}"
+        self.query_one("#state-line", Static).update(self._state)
+        self._update_footer()
 
     @staticmethod
     def _tool_stage(name: str, verification_failed: bool, purpose: str = "inspect") -> str:
@@ -466,6 +484,7 @@ class HansTextualApp(App[None]):
             self._assistant_text = ""
             self._assistant_widget = None
             self._verification_failed = False
+            self._has_task_changes = False
             self._request_active = True
             self._set_state("INVESTIGATING")
         elif isinstance(event, AssistantMessageDelta):
@@ -559,6 +578,8 @@ class HansTextualApp(App[None]):
                     f"DEBUG ({event.category})\n{event.debug_message}", "debug"
                 )
         elif isinstance(event, TaskChangeSummary):
+            self._has_task_changes = task_summary_has_hans_changes(event.summary)
+            self._update_footer()
             await self._append_transcript(
                 f"CHANGES\n{format_change_summary(event.summary)}", "change"
             )
@@ -571,6 +592,7 @@ class HansTextualApp(App[None]):
             if event.removed_files:
                 details.append("removed: " + ", ".join(event.removed_files))
             feedback = "; ".join(details) if details else "no HANS task changes"
+            self._has_task_changes = False
             self._set_state("IDLE", "undo complete")
             await self._append_transcript(f"UNDO\n✓ Undo completed · {feedback}", "change")
         elif isinstance(event, TaskUndoRefused):
@@ -629,6 +651,7 @@ class HansTextualApp(App[None]):
                 await self._render_event(event)
         finally:
             self._request_active = False
+            self._update_footer()
 
     def _close_runtime(self) -> None:
         if not self._closed:

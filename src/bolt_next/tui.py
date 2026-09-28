@@ -31,14 +31,16 @@ from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import (
     Editor,
     Transcript,
+    footer_text,
     format_change_summary,
     is_exit_command,
     layout_rows,
+    task_summary_has_hans_changes,
     visible_transcript,
 )
 
 
-FOOTER = "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+FOOTER = footer_text("IDLE", request_active=False, has_task_changes=False)
 TASK_DIFF_MAX_CHARS = 4_000
 TOOL_OUTPUT_MAX_CHARS = 4_000
 
@@ -114,6 +116,8 @@ class _Display:
         self.transcript = transcript
         self.on_connection = on_connection
         self.state = "IDLE"
+        self.request_active = False
+        self.has_task_changes = False
         self._started = False
         self._verification_failed = False
         self._tool_purposes: dict[str, str] = {}
@@ -151,6 +155,8 @@ class _Display:
             else:
                 print(_plain_user(event.message), flush=True)
         elif isinstance(event, RequestStarted):
+            self.request_active = True
+            self.has_task_changes = False
             self._set_state("INVESTIGATING")
         elif isinstance(event, AssistantMessageDelta):
             self._text(event.delta)
@@ -202,18 +208,21 @@ class _Display:
                 self.transcript.verification(event.evidence.command, ok=False)
             self._set_state("CORRECTING", event.evidence.command)
         elif isinstance(event, RequestCompleted):
+            self.request_active = False
             if self.transcript is not None:
                 self.transcript.completed(event.evidence)
             self._set_state("FAILED" if event.evidence is not None and not event.evidence.success else "COMPLETE")
             if self.transcript is None and self._started:
                 print(flush=True)
         elif isinstance(event, RequestCancelled):
+            self.request_active = False
             if self.transcript is not None:
                 self.transcript.cancelled()
             self._set_state("CANCELLED")
             if self.transcript is None:
                 print("\ninterrupted", flush=True)
         elif isinstance(event, RequestFailed):
+            self.request_active = False
             titles = {
                 "configuration": "configuration failed",
                 "authentication": "authentication failed",
@@ -237,6 +246,7 @@ class _Display:
                     flush=True,
                 )
         elif isinstance(event, TaskChangeSummary):
+            self.has_task_changes = task_summary_has_hans_changes(event.summary)
             summary = format_change_summary(event.summary)
             if self.transcript is not None:
                 self.transcript.change(summary)
@@ -259,6 +269,7 @@ class _Display:
                 self.transcript.change(f"✓ {label}", title="UNDO")
             else:
                 print(f"\n✓ {label}", flush=True)
+            self.has_task_changes = False
             self._set_state("IDLE", "undo complete")
         elif isinstance(event, TaskUndoRefused):
             conflicts = ", ".join(event.conflicting_files) or "task changes"
@@ -395,7 +406,12 @@ async def _run_curses(runtime: HansRuntime) -> None:
             stdscr.addnstr(3 + offset, 0, line, width - 1)
         footer_at = 3 + conversation
         stdscr.hline(footer_at, 0, curses.ACS_HLINE, width - 1)
-        status_footer = f"{state['display'].state}  |  {FOOTER}"
+        display = state["display"]
+        status_footer = footer_text(
+            display.state,
+            request_active=display.request_active,
+            has_task_changes=display.has_task_changes,
+        )
         stdscr.addnstr(footer_at + 1, 0, status_footer, width - 1)
         for offset, line in enumerate(editor.display_lines()):
             row = footer_at + 2 + offset

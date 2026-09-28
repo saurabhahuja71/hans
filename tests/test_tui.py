@@ -34,7 +34,15 @@ from bolt_next.tui import (
     serve,
     turn_error_message,
 )
-from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
+from bolt_next.tui_screen import (
+    Editor,
+    Transcript,
+    footer_text,
+    is_exit_command,
+    layout_rows,
+    task_summary_has_hans_changes,
+    visible_transcript,
+)
 
 
 class _Lines:
@@ -58,7 +66,7 @@ def test_multiline_text_is_one_message() -> None:
 
 
 def test_footer_and_compact_header_list_real_controls(tmp_path: Path, monkeypatch) -> None:
-    assert FOOTER == "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+    assert FOOTER == "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     text = format_header("qwen3.6-27b", tmp_path / "project", True)
     assert text.startswith("HANS")
@@ -66,6 +74,43 @@ def test_footer_and_compact_header_list_real_controls(tmp_path: Path, monkeypatc
     assert "workspace: ~/project" in text
     assert "● connected" in text
     assert "https://" not in text
+
+
+@pytest.mark.parametrize(
+    ("state", "request_active", "has_task_changes", "expected"),
+    (
+        ("IDLE", False, False, "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"),
+        ("INVESTIGATING", True, False, "◉ INVESTIGATING · Ctrl-C cancel · Ctrl-Q quit"),
+        ("VERIFYING · pytest -q", True, False, "◉ VERIFYING · Ctrl-C cancel · Ctrl-Q quit"),
+        ("COMPLETE", False, True, "✓ COMPLETE · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"),
+        ("COMPLETE", False, False, "✓ COMPLETE · Enter new task · Ctrl-Q quit"),
+        ("CANCELLED", False, False, "⏸ CANCELLED · Enter new task · Ctrl-Q quit"),
+        ("FAILED", False, False, "✗ FAILED · Enter retry/new task · Ctrl-Q quit"),
+        ("IDLE", False, True, "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"),
+    ),
+)
+def test_footer_text_uses_semantic_task_context(
+    state: str, request_active: bool, has_task_changes: bool, expected: str
+) -> None:
+    assert (
+        footer_text(state, request_active=request_active, has_task_changes=has_task_changes)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"),
+    (
+        ("preexisting_git_worktree_changes: notes.txt", False),
+        ("changed_files: none\ncreated_files: none", False),
+        ("changed_files: modified.py", True),
+        ("created_files: created.py", True),
+    ),
+)
+def test_task_summary_has_hans_changes_distinguishes_task_and_preexisting_work(
+    summary: str, expected: bool
+) -> None:
+    assert task_summary_has_hans_changes(summary) is expected
 
 
 def test_normal_tool_activity_is_concise_and_raw_errors_are_debug_only() -> None:
@@ -117,6 +162,9 @@ def test_editor_submission_newlines_cancellation_and_exit() -> None:
     assert editor.on_key("enter") == "line one\nline two"
     assert editor.lines == [""]
     assert editor.on_key("ctrl-d") == ""
+    editor.on_key("char:submit with ctrl-d")
+    assert editor.on_key("ctrl-d") == "submit with ctrl-d"
+    assert editor.lines == [""]
     editor.on_key("char:partial")
     assert editor.on_key("ctrl-c") is None
     assert editor.lines == [""]
@@ -226,6 +274,51 @@ def test_curses_changes_diff_undo_and_errors_are_task_scoped() -> None:
     assert "Conflicts: changed.py" in rendered
     assert "✗ connection failed" in rendered
     assert display.state.startswith("FAILED")
+
+
+def test_curses_display_footer_context_tracks_task_lifecycle() -> None:
+    display = _Display(Transcript())
+    display.has_task_changes = True
+
+    display.event(RequestStarted("change a file"))
+    assert display.request_active is True
+    assert display.has_task_changes is False
+
+    display.event(TaskChangeSummary("changed_files: changed.py"))
+    assert display.has_task_changes is True
+    display.event(RequestCompleted(None))
+    assert display.request_active is False
+    assert (
+        footer_text(
+            display.state,
+            request_active=display.request_active,
+            has_task_changes=display.has_task_changes,
+        )
+        == "✓ COMPLETE · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+    )
+
+    display.event(TaskUndoSucceeded(("changed.py",), ()))
+    assert display.has_task_changes is False
+    assert (
+        footer_text(
+            display.state,
+            request_active=display.request_active,
+            has_task_changes=display.has_task_changes,
+        )
+        == "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
+    )
+
+    display.event(TaskChangeSummary("created_files: new.py"))
+    display.event(TaskUndoRefused(("new.py",)))
+    assert display.has_task_changes is True
+    assert (
+        footer_text(
+            display.state,
+            request_active=display.request_active,
+            has_task_changes=display.has_task_changes,
+        )
+        == "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+    )
 
 
 def test_cancel_and_completion_claims_follow_semantic_events() -> None:

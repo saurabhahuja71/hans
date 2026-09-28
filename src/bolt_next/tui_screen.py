@@ -46,6 +46,34 @@ def format_change_summary(summary: str) -> str:
     return "\n".join(lines) or "No HANS task changes"
 
 
+def task_summary_has_hans_changes(summary: str) -> bool:
+    """Identify HANS-owned mutations in an existing task-local summary."""
+    for line in summary.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() in {"changed_files", "created_files"}:
+            if value.strip().lower() not in {"", "none"}:
+                return True
+    return False
+
+
+def footer_text(state: str, *, request_active: bool, has_task_changes: bool) -> str:
+    """Return compact controls for the current semantic task state."""
+    stage = state.partition("·")[0].strip() or "IDLE"
+    if request_active:
+        return f"◉ {stage} · Ctrl-C cancel · Ctrl-Q quit"
+    if stage == "COMPLETE":
+        if has_task_changes:
+            return "✓ COMPLETE · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+        return "✓ COMPLETE · Enter new task · Ctrl-Q quit"
+    if stage == "CANCELLED":
+        return "⏸ CANCELLED · Enter new task · Ctrl-Q quit"
+    if stage == "FAILED":
+        return "✗ FAILED · Enter retry/new task · Ctrl-Q quit"
+    if has_task_changes:
+        return "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+    return "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
+
+
 @dataclass
 class Piece:
     kind: str

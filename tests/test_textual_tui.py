@@ -83,7 +83,10 @@ def test_textual_chrome_is_compact_data_driven_and_preserves_composer_keys(tmp_p
             assert "DISCONNECTED" in header
             assert "workspace" in header
             assert rendered(app.query_one("#state-line", Static)) == "IDLE"
-            assert "Ctrl-G diff · Ctrl-Z undo" in rendered(app.query_one("#footer", Static))
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
+            )
             assert not app.query("#tool-area")
             assert not app.query("#controls")
             composer = app.query_one("#composer", TextArea)
@@ -118,6 +121,7 @@ def test_empty_exit_and_ctrl_q_do_not_submit(tmp_path: Path) -> None:
 
     asyncio.run(scenario(("ctrl+d",)))
     asyncio.run(scenario(tuple("exit") + ("enter",)))
+    asyncio.run(scenario(tuple("quit") + ("enter",)))
     asyncio.run(scenario(("ctrl+q",)))
 
 
@@ -183,6 +187,29 @@ def test_textual_debug_output_is_gated_and_bounded(tmp_path: Path, monkeypatch) 
     assert "ijk" not in debug
 
 
+def test_completed_footer_uses_task_change_summary(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            for event in (
+                RequestStarted("change a file"),
+                TaskChangeSummary("changed_files: a.py"),
+                RequestCompleted(None),
+            ):
+                await app._render_event(event)
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "✓ COMPLETE · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+            )
+
+            await app._render_event(RequestStarted("inspect only"))
+            await app._render_event(RequestCompleted(None))
+            assert rendered(app.query_one("#footer", Static)) == "✓ COMPLETE · Enter new task · Ctrl-Q quit"
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
 def test_lifecycle_states_are_derived_from_semantic_events(tmp_path: Path) -> None:
     async def scenario() -> None:
         failed = VerificationEvidence("pytest -q", 1, True, True, False, "2026-09-28T00:00:00+00:00")
@@ -190,16 +217,33 @@ def test_lifecycle_states_are_derived_from_semantic_events(tmp_path: Path) -> No
         async with app.run_test() as pilot:
             await app._render_event(RequestStarted("inspect"))
             assert rendered(app.query_one("#state-line", Static)) == "INVESTIGATING"
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "◉ INVESTIGATING · Ctrl-C cancel · Ctrl-Q quit"
+            )
             await app._render_event(ToolStarted("write", "write_file", "a.py"))
             assert rendered(app.query_one("#state-line", Static)) == "EDITING"
             await app._render_event(VerificationStarted("verify", "pytest -q"))
             assert rendered(app.query_one("#state-line", Static)).startswith("VERIFYING")
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "◉ VERIFYING · Ctrl-C cancel · Ctrl-Q quit"
+            )
+            assert "pytest" not in rendered(app.query_one("#footer", Static))
             await app._render_event(VerificationFailed("verify", failed))
             assert rendered(app.query_one("#state-line", Static)).startswith("CORRECTING")
             await app._render_event(RequestFailed("connection", "unavailable"))
             assert rendered(app.query_one("#state-line", Static)).startswith("FAILED")
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "✗ FAILED · Enter retry/new task · Ctrl-Q quit"
+            )
             await app._render_event(RequestCancelled())
             assert rendered(app.query_one("#state-line", Static)) == "CANCELLED"
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "⏸ CANCELLED · Enter new task · Ctrl-Q quit"
+            )
             assert "VERIFICATION\n✗ pytest -q failed" in transcript_text(app)
             assert "ERROR\n✗ connection failed\nunavailable" in transcript_text(app)
             await pilot.pause()
@@ -222,6 +266,7 @@ def test_ctrl_g_uses_a_bounded_modal_and_escape_returns(tmp_path: Path) -> None:
             assert diff_view.region.y == 0
             assert diff_view.region.width == app.size.width
             assert diff_view.region.height == app.size.height
+            assert rendered(app.screen.query_one("#task-diff-title", Static)) == "DIFF  ·  Esc back"
             assert "+++ b/task.txt" in rendered(app.screen.query_one(".diff-content", Static))
             await pilot.press("escape")
             await pilot.pause()
@@ -241,6 +286,10 @@ def test_ctrl_z_reports_safe_task_undo_and_does_not_run_while_active(tmp_path: P
             assert runtime.undo_calls == 1
             assert "UNDO\n✓ Undo completed · restored: existing.py; removed: new.py" in transcript_text(app)
             assert rendered(app.query_one("#state-line", Static)).startswith("IDLE")
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
+            )
 
             app._request_active = True
             await pilot.press("ctrl+z", "ctrl+g")
@@ -249,10 +298,43 @@ def test_ctrl_z_reports_safe_task_undo_and_does_not_run_while_active(tmp_path: P
             assert runtime.task_diff_calls == []
 
             app._request_active = False
-            await app._render_event(TaskUndoRefused(("changed.py",)))
+            for event in (
+                RequestStarted("change a file"),
+                TaskChangeSummary("changed_files: changed.py"),
+                RequestCompleted(None),
+                TaskUndoRefused(("changed.py",)),
+            ):
+                await app._render_event(event)
+            assert app._has_task_changes is True
             assert "UNDO\n✗ Undo refused\nConflicts: changed.py" in transcript_text(app)
+            assert (
+                rendered(app.query_one("#footer", Static))
+                == "Ctrl-G diff · Ctrl-Z undo · Ctrl-Q quit"
+            )
 
     asyncio.run(scenario())
+
+
+def test_textual_css_and_lifecycle_footer_remain_semantic(tmp_path: Path) -> None:
+    css = HansTextualApp.CSS
+    for color in ("$background", "$surface", "$accent", "$success", "$warning", "$error"):
+        assert color in css
+    for selector in (".user", ".tool", ".verification", ".final", ".error"):
+        assert selector in css
+
+    app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+    app._request_active = True
+    app._state = "VERIFYING  ·  pytest -q"
+    assert app._footer_text() == "◉ VERIFYING · Ctrl-C cancel · Ctrl-Q quit"
+
+    app._request_active = False
+    app._state = "COMPLETE"
+    app._has_task_changes = True
+    assert "✓ COMPLETE" in app._footer_text()
+    app._state = "CANCELLED"
+    assert "⏸ CANCELLED" in app._footer_text()
+    app._state = "FAILED"
+    assert "✗ FAILED" in app._footer_text()
 
 
 def test_transcript_follow_tail_manual_anchor_resize_and_retention(tmp_path: Path) -> None:
