@@ -127,13 +127,11 @@ With the environment activated and the model variables set:
 hans
 ```
 
-The banner is followed by one line of the form:
+On a TTY, HANS starts the Textual UI by default. Set `HANS_TUI=curses` to use the preserved curses fallback.
 
-```text
-model=qwen3.6-27b endpoint=https://<tunnel-host>/v1
-```
+In the Textual UI, Enter submits the prompt and Shift+Enter inserts a newline. Ctrl-D also submits and exits when the composer is empty. Ctrl-Q exits immediately, even if the composer is not empty. Ctrl-C cancels an active request and keeps HANS running. A prompt whose entire text is `exit` or `quit` exits without calling the model.
 
-Enter submits the prompt. Ctrl-D also submits; either key exits when the prompt is empty. Ctrl-Q exits immediately, even if the prompt is not empty. Ctrl-C cancels the current input or request and stays in HANS. A prompt whose entire text is `exit` or `quit` also exits without calling the model. Piped input is still read until EOF and submitted as one message.
+The curses fallback keeps its existing controls: Enter submits, Shift+Enter inserts a newline, Ctrl-D submits or exits when the editor is empty, Ctrl-C cancels, and Ctrl-Q exits. Piped input is still read until EOF and submitted as one message.
 
 Example prompts:
 

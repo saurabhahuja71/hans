@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Protocol
@@ -86,9 +88,17 @@ class HansTextualApp(App[None]):
     .tool {
         color: $secondary;
     }
+
+    .debug {
+        color: $text-muted;
+    }
     """
 
+    MAX_TRANSCRIPT_ROWS = 300
+
     BINDINGS = [
+        Binding("enter", "submit_or_exit", "send", show=False, priority=True),
+        Binding("shift+enter", "insert_newline", "newline", show=False, priority=True),
         Binding("ctrl+d", "submit_or_exit", "send", show=False),
         Binding("ctrl+c", "cancel_active", "cancel", show=False),
         Binding("ctrl+q", "exit_app", "exit", show=False),
@@ -105,6 +115,8 @@ class HansTextualApp(App[None]):
         self._assistant_flush_scheduled = False
         self._tool_widgets: dict[str, Static] = {}
         self._tool_text: dict[str, str] = {}
+        self._transcript_rows: deque[Static] = deque()
+        self._verification_failed = False
         self._request_active = False
         self._closed = False
 
@@ -113,7 +125,7 @@ class HansTextualApp(App[None]):
         yield VerticalScroll(id="transcript")
         yield VerticalScroll(Static("tools", classes="tool"), id="tool-area")
         yield Static("ready", id="status")
-        yield Static("Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit", id="controls")
+        yield Static("Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit", id="controls")
         yield TextArea("", id="composer")
 
     def on_mount(self) -> None:
@@ -145,15 +157,48 @@ class HansTextualApp(App[None]):
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
 
+    @staticmethod
+    def _tool_stage(name: str, verification_failed: bool) -> str:
+        if name == "read_file":
+            return "investigating"
+        if name == "write_file":
+            return "correcting" if verification_failed else "acting"
+        if name == "run_command":
+            return "verifying"
+        return "acting"
+
+    @staticmethod
+    def _failure_title(category: str) -> str:
+        if category == "context":
+            return "context limit exceeded"
+        if category == "connection":
+            return "connection failed"
+        if category == "tool":
+            return "tool failed"
+        return "model request failed"
+
+    @staticmethod
+    def _debug_enabled() -> bool:
+        return os.environ.get("HANS_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
     def _follow_transcript(self, transcript: VerticalScroll, follow: bool) -> None:
         if follow:
             self.call_after_refresh(transcript.scroll_end, animate=False, force=True, immediate=True)
+
+    async def _trim_transcript(self) -> None:
+        while len(self._transcript_rows) > self.MAX_TRANSCRIPT_ROWS:
+            removed = self._transcript_rows.popleft()
+            if removed is self._assistant_widget:
+                self._assistant_widget = None
+            await removed.remove()
 
     async def _append_transcript(self, text: str, classes: str) -> Static:
         transcript = self.query_one("#transcript", VerticalScroll)
         follow = transcript.scroll_y >= transcript.max_scroll_y
         widget = Static(text, classes=classes)
         await transcript.mount(widget)
+        self._transcript_rows.append(widget)
+        await self._trim_transcript()
         self._follow_transcript(transcript, follow)
         return widget
 
@@ -205,6 +250,7 @@ class HansTextualApp(App[None]):
             await self._flush_assistant_deltas()
             self._assistant_text = ""
             self._assistant_widget = None
+            self._verification_failed = False
             self._request_active = True
             self._set_status("thinking…")
         elif isinstance(event, AssistantMessageDelta):
@@ -223,7 +269,7 @@ class HansTextualApp(App[None]):
             text = f"◇ {event.name}  {event.detail}".rstrip()
             self._tool_text[event.call_id] = text
             widget.update(text)
-            self._set_status(f"running {event.name}")
+            self._set_status(self._tool_stage(event.name, self._verification_failed))
         elif isinstance(event, ToolOutput):
             widget = await self._tool_widget(event.call_id)
             text = self._tool_text.get(event.call_id, f"◇ tool {event.call_id}")
@@ -238,12 +284,15 @@ class HansTextualApp(App[None]):
             text = f"{text}\n{mark} {event.name}  {event.detail}{suffix}".rstrip()
             self._tool_text[event.call_id] = text
             widget.update(text)
-            self._set_status(f"{event.name} {'completed' if event.success else 'failed'}")
+            stage = self._tool_stage(event.name, self._verification_failed)
+            self._set_status(stage if event.success else f"tool failed: {event.name}")
         elif isinstance(event, VerificationStarted):
             self._set_status(f"verifying: {event.command}")
         elif isinstance(event, VerificationPassed):
+            self._verification_failed = False
             self._set_status(f"verification passed: {event.evidence.command}")
         elif isinstance(event, VerificationFailed):
+            self._verification_failed = True
             self._set_status(f"verification failed: {event.evidence.command}")
         elif isinstance(event, RequestCompleted):
             await self._flush_assistant_deltas()
@@ -255,13 +304,18 @@ class HansTextualApp(App[None]):
             else:
                 self._set_status("completed (verification failed)")
         elif isinstance(event, RequestCancelled):
+            await self._flush_assistant_deltas()
             self._request_active = False
             self._set_status("cancelled")
             await self._append_transcript("✗ cancelled", "error")
         elif isinstance(event, RequestFailed):
+            await self._flush_assistant_deltas()
             self._request_active = False
-            self._set_status(f"failed: {event.category}")
-            await self._append_transcript(f"✗ {event.message}", "error")
+            title = self._failure_title(event.category)
+            self._set_status(title)
+            await self._append_transcript(f"✗ {title}\n{event.message}", "error")
+            if self._debug_enabled() and event.debug_message:
+                await self._append_transcript(f"debug ({event.category}): {event.debug_message}", "debug")
         elif isinstance(event, ConnectionChanged):
             self.query_one("#hans-header", Static).update(self._header_text(event.connected))
 
@@ -277,6 +331,9 @@ class HansTextualApp(App[None]):
         self._request_active = True
         self._set_status("thinking…")
         self._submit(prompt)
+
+    def action_insert_newline(self) -> None:
+        self.query_one("#composer", TextArea).insert("\n")
 
     def action_cancel_active(self) -> None:
         if self._request_active:
