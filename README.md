@@ -19,9 +19,9 @@ calling, tool results, streaming, and conversation history. HANS owns the termin
 configuration, workspace policy, the tool implementations, and how SDK events are displayed.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.2.1**.
+branding are HANS. Current release: **0.4.0**.
 
-## What 0.2.1 provides
+## What 0.4.0 provides
 
 - Interactive prompt with `exit`, `quit`, EOF, and Ctrl-C handling
 - Streaming assistant text through `Runner.run_streamed()` and `result.stream_events()`
