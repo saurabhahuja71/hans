@@ -94,6 +94,8 @@ def make_read_file_tool(workspace: Path):
         """
         try:
             target = resolve_workspace_path(workspace, path)
+            if target.is_dir():
+                return f"Error reading {path!r}: path is a directory; use list_directory instead"
             if not target.is_file():
                 return f"Error: file does not exist: {path}"
             text = target.read_text(encoding="utf-8")
@@ -187,7 +189,23 @@ def _bounded_lines(lines: list[str], *, max_results: int | None = None) -> str:
     return f"{result}\n{notice}" if result else notice
 
 
-_SEARCH_IGNORED_DIRECTORIES = {".git", ".hans-tmp", "__pycache__"}
+_SEARCH_IGNORED_DIRECTORIES = {
+    ".eggs",
+    ".git",
+    ".hans-tmp",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "venv",
+}
 
 
 def _search_match_line(path: Path, line_number: int, line: str) -> str:
@@ -200,13 +218,13 @@ def _search_match_line(path: Path, line_number: int, line: str) -> str:
 
 
 def _search_candidates(workspace: Path, target: Path):
+    if target.is_file():
+        yield target
+        return
     try:
         if any(part in _SEARCH_IGNORED_DIRECTORIES for part in target.relative_to(workspace).parts):
             return
     except ValueError:
-        return
-    if target.is_file():
-        yield target
         return
     for candidate in sorted(target.iterdir(), key=lambda entry: entry.name):
         try:
@@ -232,9 +250,21 @@ def make_list_directory_tool(workspace: Path):
         """
         try:
             target = resolve_workspace_path(workspace, path)
+            if target.is_file():
+                return f"Error listing {path!r}: path is a file; use read_file instead"
             if not target.is_dir():
                 return f"Error listing {path!r}: directory does not exist"
-            entries = sorted(entry.name for entry in target.iterdir())
+            entries = []
+            for entry in sorted(target.iterdir(), key=lambda candidate: candidate.name):
+                if entry.is_symlink():
+                    kind = "symlink"
+                elif entry.is_dir():
+                    kind = "directory"
+                elif entry.is_file():
+                    kind = "file"
+                else:
+                    kind = "other"
+                entries.append(f"{kind}: {entry.name}")
             return _bounded_lines(entries)
         except (OSError, WorkspaceError) as exc:
             return f"Error listing {path!r}: {exc}"

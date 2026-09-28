@@ -27,10 +27,13 @@ branding are HANS. Current release: **0.2.1**.
 - Streaming assistant text through `Runner.run_streamed()` and `result.stream_events()`
 - Multi-turn history for the life of the process through the SDK's in-memory `SQLiteSession`
 - OpenAI-compatible Chat Completions through `OpenAIChatCompletionsModel`
-- Three structured function tools, executed by HANS only when the SDK emits a tool call:
-  - `read_file(path)` reads a UTF-8 file inside the workspace
+- Six structured workspace tools, executed by HANS only when the SDK emits a tool call:
+  - `list_directory(path)` lists bounded, sorted direct entries with their type
+  - `search_files(query, path, max_results)` performs bounded literal text search through relevant files
+  - `read_file(path, start_line, end_line)` reads a UTF-8 file or an explicit bounded line range
+  - `replace_in_file(path, old_text, new_text)` makes one exact, single-occurrence replacement
   - `write_file(path, content)` creates or replaces a UTF-8 file inside the workspace
-  - `run_command(command)` runs one command with the workspace as its working directory
+  - `run_command(command)` runs one direct command with the workspace as its working directory
 - Startup line showing the configured model name and endpoint host (the API key is never printed)
 - Tool diagnostics: `[tool_called] name=... arguments=...` and `[tool_output]` with the Python result
 - Model and tool errors printed without terminating the TUI
@@ -156,16 +159,27 @@ message verified that output. `go` must be on `PATH` for that command to succeed
 
 ## Workspace safety
 
-All three tools resolve paths against the workspace root. Traversal (`../`) and symlinks that land
-outside the workspace are rejected. Missing, unreadable, and non-UTF-8 reads are returned as tool
-errors rather than raised out of the SDK loop.
+All workspace file paths resolve against the workspace root. Traversal (`../`) and symlinks that
+resolve outside the workspace are rejected. Missing, unreadable, and non-UTF-8 reads are returned
+as tool errors rather than raised out of the SDK loop. `list_directory` reports only direct entries,
+in deterministic sorted order, as `directory`, `file`, `symlink`, or `other`; its output is bounded
+to the tool-result context budget. A symlink is reported as a symlink rather than followed during
+listing.
 
-`write_file` creates parent directories that stay inside the workspace and replaces the target
-file. `run_command` does not use a shell and will not grow one silently. The command string is
-rejected if it contains shell metacharacters, including pipes, redirects, `&` (`&&` / `||`),
-`;`, substitution (`$`, backticks), globs, or a newline. A shell program (`sh`, `bash`, and the
-other common shells) is also rejected. Otherwise the string is split with `shlex` into argv and
-executed directly.
+`search_files` performs a literal, line-by-line search with sorted traversal, a result limit, and
+a context budget. It skips default generated and dependency directories during recursive discovery
+(such as virtual environments, caches, build output, and `node_modules`), avoids directory
+symlinks, and skips binary or unreadable files. An explicitly requested file remains searchable.
+`read_file` returns an explicit bounded line range when needed. `replace_in_file` requires exactly
+one literal occurrence and uses a temporary file replacement; use it for targeted edits. `write_file`
+creates parent directories that stay inside the workspace and replaces the target file.
+
+`run_command` does not use a shell and will not grow one silently. The command string is rejected
+if it contains shell metacharacters, including pipes, redirects, `&` (`&&` / `||`), `;`, substitution
+(`$`, backticks), globs, or a newline. A shell program (`sh`, `bash`, and the other common shells)
+is also rejected. Otherwise the string is split with `shlex` into argv and executed directly. Safe
+read-only Git inspection can use direct commands such as `git status --short`, `git diff --check`,
+or `git diff`; they do not require a custom Git tool.
 
 The working directory is the workspace. Arguments that are absolute paths outside the workspace,
 or that contain a `..` segment, are rejected before the process starts. Arguments that begin with
@@ -176,9 +190,7 @@ copied and are not printed.
 
 This is not a complete sandbox. The process still runs as the same user. A tool such as `go` can
 read its own `GOROOT` or module cache outside the workspace. There is no seccomp profile, mount
-namespace, or approval prompt. The boundary is argv checking plus a reduced environment.
-
-No search, SSH, or separate edit tool is included. File changes go through `write_file`. There is
+namespace, or approval prompt. The boundary is argv checking plus a reduced environment. There is
 no `run_shell`.
 
 ## Development
@@ -189,16 +201,15 @@ python -m pytest -q
 python -m pip check
 ```
 
-The SDK tests use a scripted model. They check that a structured `read_file` call executes and
-reaches the next model turn, that `write_file` then `run_command` does the same, that streaming
-completes, that the SQLite session keeps a later turn, and that a later turn still runs after a
-model error. Workspace tests cover path checks, traversal, an outside symlink, write, and command
-stdout.
+The SDK tests use a scripted model. They check that structured tool calls execute and reach the
+next model turn, that streaming completes, that the SQLite session keeps a later turn, and that a
+later turn still runs after a model error. Workspace tests cover bounded discovery, path checks,
+traversal, symlink safety, targeted replacement, and command stdout.
 
 Do not claim a live Qwen path from the unit tests alone. The live checks above were run against
 the configured tunnel with the proxy left set.
 
 ## What is not in this version
 
-Directory listing, search, and a human approval step before `run_command` are not implemented.
-Session history is in memory and ends when the process exits.
+A human approval step before `run_command` is not implemented. Session history is in memory and
+ends when the process exits.

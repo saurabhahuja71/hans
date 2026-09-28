@@ -58,10 +58,13 @@ def test_write_file_rejects_traversal(tmp_path: Path) -> None:
     assert not (tmp_path.parent / "secret.txt").exists()
 
 
-def test_list_directory_is_nonrecursive_sorted_and_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    (tmp_path / "zeta.txt").write_text("z", encoding="utf-8")
+def test_list_directory_is_typed_nonrecursive_sorted_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "beta.txt").write_text("z", encoding="utf-8")
     (tmp_path / "alpha").mkdir()
     (tmp_path / "alpha" / "nested.txt").write_text("nested", encoding="utf-8")
+    (tmp_path / "link.txt").symlink_to(tmp_path / "beta.txt")
     for index in range(100):
         (tmp_path / f"long-entry-{index:03d}.txt").write_text("x", encoding="utf-8")
     monkeypatch.setenv("BOLT_MODEL_CONTEXT_TOKENS", "1024")
@@ -70,11 +73,24 @@ def test_list_directory_is_nonrecursive_sorted_and_bounded(tmp_path: Path, monke
 
     lines = result.splitlines()
     entries = [line for line in lines if not line.startswith("...")]
-    assert entries == sorted(entries)
-    assert "alpha" in entries
-    assert any(line.startswith("long-entry-") for line in entries)
+    assert entries == sorted(entries, key=lambda entry: entry.split(": ", 1)[1])
+    assert "directory: alpha" in entries
+    assert "file: beta.txt" in entries
+    assert "symlink: link.txt" in entries
+    assert any(line.startswith("file: long-entry-") for line in entries)
     assert "nested.txt" not in result
     assert estimate_tokens(result) <= tool_result_token_budget()
+
+
+def test_list_and_read_file_give_wrong_kind_guidance(tmp_path: Path) -> None:
+    (tmp_path / "directory").mkdir()
+    (tmp_path / "file.txt").write_text("contents", encoding="utf-8")
+
+    listed_file = invoke(make_list_directory_tool(tmp_path), '{"path":"file.txt"}')
+    read_directory = invoke(make_read_file_tool(tmp_path), '{"path":"directory"}')
+
+    assert listed_file == "Error listing 'file.txt': path is a file; use read_file instead"
+    assert read_directory == "Error reading 'directory': path is a directory; use list_directory instead"
 
 
 def test_list_directory_rejects_workspace_escape(tmp_path: Path) -> None:
@@ -94,37 +110,50 @@ def test_search_files_returns_sorted_matches_and_skips_binary_files(tmp_path: Pa
     assert "binary.bin" not in result
 
 
-def test_search_files_rejects_escape_and_honors_context_budget(
+def test_search_files_preserves_escape_and_context_protections(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for index in range(100):
         (tmp_path / f"file-{index:03d}.txt").write_text("needle " + "x" * 30, encoding="utf-8")
+    outside = tmp_path.parent / "outside-search.txt"
+    outside.write_text("needle outside\n", encoding="utf-8")
+    (tmp_path / "outside-link.txt").symlink_to(outside)
     monkeypatch.setenv("BOLT_MODEL_CONTEXT_TOKENS", "1024")
     tool = make_search_files_tool(tmp_path)
 
     result = invoke(tool, '{"query":"needle","max_results":100}')
     escaped = invoke(tool, '{"query":"needle","path":"../"}')
+    linked = invoke(tool, '{"query":"needle","path":"outside-link.txt"}')
 
     assert estimate_tokens(result) <= tool_result_token_budget()
+    assert "outside-link.txt" not in result
     assert "outside the workspace" in escaped
+    assert "outside the workspace" in linked
 
 
-def test_search_files_skips_vcs_and_cache_directories_without_reading_whole_files(
+def test_search_files_skips_generated_and_dependency_directories_but_allows_explicit_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "visible.txt").write_text("needle visible\n", encoding="utf-8")
-    for directory in (".git", ".hans-tmp", "__pycache__"):
+    ignored_files = []
+    for directory in (".git", ".hans-tmp", "__pycache__", ".venv", "build", "dist", "node_modules", "target"):
         ignored = tmp_path / directory
         ignored.mkdir()
-        (ignored / "ignored.txt").write_text("needle ignored\n", encoding="utf-8")
+        ignored_file = ignored / "ignored.txt"
+        ignored_file.write_text(f"needle {directory}\n", encoding="utf-8")
+        ignored_files.append(ignored_file)
 
     def read_bytes(*_args, **_kwargs):
         raise AssertionError("search_files must read files line by line")
 
     monkeypatch.setattr(Path, "read_bytes", read_bytes)
-    result = invoke(make_search_files_tool(tmp_path), '{"query":"needle"}')
+    tool = make_search_files_tool(tmp_path)
+    recursive = invoke(tool, '{"query":"needle"}')
+    explicit = invoke(tool, '{"query":"needle","path":"node_modules/ignored.txt"}')
 
-    assert result == "visible.txt:1: needle visible"
+    assert recursive == "visible.txt:1: needle visible"
+    assert explicit == "node_modules/ignored.txt:1: needle node_modules"
+    assert all(str(path.relative_to(tmp_path)) not in recursive for path in ignored_files)
 
 
 def test_search_files_truncates_a_huge_matching_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

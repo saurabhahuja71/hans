@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -106,67 +107,128 @@ def test_discovery_search_targeted_replace_and_verification_workflow(tmp_path: P
     session.close()
 
 
-def test_scripted_agent_repairs_a_multifile_python_repository_without_touching_unrelated_changes(
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def make_python_repository(root: Path, *, user_changes: bool) -> dict[str, Path]:
+    source = root / "src"
+    tests = root / "tests"
+    source.mkdir()
+    tests.mkdir()
+    (root / "pyproject.toml").write_text(
+        "[project]\nname = 'sample-service'\nversion = '0.1.0'\n", encoding="utf-8"
+    )
+    (root / "README.md").write_text("# Sample service\nFeature: next_value\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".hans-tmp/\n__pycache__/\n", encoding="utf-8")
+    math_ops = source / "math_ops.py"
+    math_ops.write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+    service = source / "service.py"
+    service.write_text(
+        "from math_ops import add\n\n\ndef next_value(value):\n    return add(value, -1)\n", encoding="utf-8"
+    )
+    (source / "formatting.py").write_text("def label(value):\n    return f'[{value}]'\n", encoding="utf-8")
+    focused_test = tests / "test_service.py"
+    focused_test.write_text(
+        "import sys\n\nsys.path.insert(0, 'src')\n\nfrom service import next_value\n\n\ndef test_next_value():\n    assert next_value(2) == 3\n",
+        encoding="utf-8",
+    )
+    docs = root / "docs"
+    docs.mkdir()
+    (docs / "large-unrelated.md").write_text("unrelated\n" * 30_000, encoding="utf-8")
+    for number in range(20):
+        (docs / f"note-{number}.md").write_text(f"note {number}\n", encoding="utf-8")
+    notes = root / "notes.md"
+    notes.write_text("tracked baseline\n", encoding="utf-8")
+    git(root, "init")
+    git(root, "config", "user.name", "HANS Test")
+    git(root, "config", "user.email", "hans-test@example.invalid")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "baseline")
+    paths = {"math_ops": math_ops, "service": service, "focused_test": focused_test, "notes": notes}
+    if user_changes:
+        notes.write_text("tracked user edit\n", encoding="utf-8")
+        scratch = root / "scratch.txt"
+        scratch.write_text("untracked user work\n", encoding="utf-8")
+        paths["scratch"] = scratch
+    return paths
+
+
+def test_scripted_agent_repairs_a_git_python_repository_without_touching_user_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PATH", f"/tmp/hans-python312/bin:{os.environ['PATH']}")
-    implementation = tmp_path / "calculator.py"
-    regression_test = tmp_path / "tests" / "test_calculator.py"
-    unrelated = tmp_path / "notes.py"
-    implementation.write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
-    regression_test.parent.mkdir()
-    regression_test.write_text(
-        "from calculator import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n", encoding="utf-8"
-    )
-    unrelated_contents = "STATUS = 'pre-existing local change'\n"
-    unrelated.write_text(unrelated_contents, encoding="utf-8")
+    paths = make_python_repository(tmp_path, user_changes=True)
     model = ScriptedModel(
         [
             ModelStep(output=[function_call("list_directory", {"path": "."}, call_id="list-1")]),
-            ModelStep(
-                output=[function_call("search_files", {"query": "return left - right"}, call_id="search-1")]
-            ),
-            ModelStep(
-                output=[
-                    function_call(
-                        "replace_in_file",
-                        {
-                            "path": "calculator.py",
-                            "old_text": "return left - right",
-                            "new_text": "return left + right",
-                        },
-                        call_id="replace-1",
-                    )
-                ]
-            ),
-            ModelStep(
-                output=[
-                    function_call(
-                        "run_command",
-                        {"command": "python -m pytest -q tests/test_calculator.py"},
-                        call_id="verify-1",
-                    )
-                ]
-            ),
-            ModelStep(output=[assistant_message("The calculator regression test now passes.")]),
+            ModelStep(output=[function_call("read_file", {"path": "pyproject.toml"}, call_id="read-metadata")]),
+            ModelStep(output=[function_call("search_files", {"query": "next_value", "path": "src"}, call_id="search-1")]),
+            ModelStep(output=[function_call("read_file", {"path": "src/math_ops.py"}, call_id="read-math")]),
+            ModelStep(output=[function_call("read_file", {"path": "src/service.py"}, call_id="read-service")]),
+            ModelStep(output=[function_call("run_command", {"command": "git status --short"}, call_id="status-before")]),
+            ModelStep(output=[function_call("run_command", {"command": "git diff"}, call_id="diff-before")]),
+            ModelStep(output=[function_call("replace_in_file", {"path": "src/math_ops.py", "old_text": "return left - right", "new_text": "return left + right"}, call_id="replace-math")]),
+            ModelStep(output=[function_call("replace_in_file", {"path": "src/service.py", "old_text": "add(value, -1)", "new_text": "add(value, 1)"}, call_id="replace-callsite")]),
+            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py"}, call_id="pytest")]),
+            ModelStep(output=[function_call("run_command", {"command": "git diff --check"}, call_id="diff-check")]),
+            ModelStep(output=[function_call("run_command", {"command": "git status --short"}, call_id="status-after")]),
+            ModelStep(output=[assistant_message("The focused repair is verified without touching user work.")]),
         ]
     )
-    agent = make_agent(model, tmp_path)
-    session = SQLiteSession("sdk-multifile-python-repair-test")
+    session = SQLiteSession("sdk-git-python-repair-test")
 
-    result = run(Runner.run(agent, "Fix the calculator implementation and verify its test.", session=session))
-
-    assert result.final_output == "The calculator regression test now passes."
-    assert implementation.read_text(encoding="utf-8") == "def add(left, right):\n    return left + right\n"
-    assert regression_test.read_text(encoding="utf-8") == (
-        "from calculator import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+    result = run(
+        Runner.run(make_agent(model, tmp_path), "Repair next_value and verify it.", session=session, max_turns=20)
     )
-    assert unrelated.read_text(encoding="utf-8") == unrelated_contents
-    assert len(model.calls) == 5
-    assert "calculator.py:2:     return left - right" in repr(model.calls[2].input)
-    verification_input = repr(model.calls[4].input)
-    assert "exit_code=0" in verification_input
-    assert "1 passed" in verification_input
+
+    assert result.final_output == "The focused repair is verified without touching user work."
+    assert paths["math_ops"].read_text(encoding="utf-8") == "def add(left, right):\n    return left + right\n"
+    assert paths["service"].read_text(encoding="utf-8").endswith("return add(value, 1)\n")
+    assert paths["notes"].read_text(encoding="utf-8") == "tracked user edit\n"
+    assert paths["scratch"].read_text(encoding="utf-8") == "untracked user work\n"
+    status = git(tmp_path, "status", "--short")
+    assert " M notes.md" in status
+    assert " M src/math_ops.py" in status
+    assert " M src/service.py" in status
+    assert "?? scratch.txt" in status
+    assert "directory: src" in repr(model.calls[1].input)
+    assert "src/service.py:4: def next_value" in repr(model.calls[3].input)
+    assert "exit_code=0" in repr(model.calls[6].input) and "notes.md" in repr(model.calls[6].input)
+    assert "diff --git a/notes.md" in repr(model.calls[7].input)
+    assert "Replaced text in src/math_ops.py" in repr(model.calls[8].input)
+    assert "Replaced text in src/service.py" in repr(model.calls[9].input)
+    assert "1 passed" in repr(model.calls[10].input)
+    assert "exit_code=0" in repr(model.calls[11].input)
+    assert "scratch.txt" in repr(model.calls[12].input)
+    session.close()
+
+
+def test_scripted_agent_discovers_an_unfamiliar_repository_without_changes(tmp_path: Path) -> None:
+    paths = make_python_repository(tmp_path, user_changes=False)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and ".git" not in path.parts}
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("list_directory", {"path": "."}, call_id="list-1")]),
+            ModelStep(output=[function_call("read_file", {"path": "pyproject.toml"}, call_id="metadata")]),
+            ModelStep(output=[function_call("search_files", {"query": "next_value", "path": "src"}, call_id="search")]),
+            ModelStep(output=[function_call("read_file", {"path": "src/service.py"}, call_id="feature")]),
+            ModelStep(output=[assistant_message("The sample-service next_value feature is implemented in src/service.py.")]),
+        ]
+    )
+    session = SQLiteSession("sdk-read-only-discovery-test")
+
+    result = run(Runner.run(make_agent(model, tmp_path), "Find the next_value feature without changing files.", session=session))
+
+    after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and ".git" not in path.parts}
+    assert result.final_output.endswith("src/service.py.")
+    assert before == after
+    assert git(tmp_path, "status", "--short") == ""
+    assert paths["service"].read_text(encoding="utf-8").endswith("add(value, -1)\n")
+    assert "name = 'sample-service'" in repr(model.calls[2].input)
+    assert "src/service.py:4: def next_value" in repr(model.calls[3].input)
     session.close()
 
 
@@ -193,60 +255,41 @@ def test_write_then_run_command_reaches_next_model_turn(tmp_path: Path) -> None:
     session.close()
 
 
-def test_failed_verification_reaches_a_targeted_repair_and_verification(
+def test_failed_verification_reaches_focused_source_and_callsite_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PATH", f"/tmp/hans-python312/bin:{os.environ['PATH']}")
-    (tmp_path / "calculator.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_calculator.py").write_text(
-        "from calculator import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n", encoding="utf-8"
+    paths = make_python_repository(tmp_path, user_changes=False)
+    paths["service"].write_text(
+        "from math_ops import add\n\n\ndef next_value(value):\n    return add(value, 2)\n", encoding="utf-8"
     )
     model = ScriptedModel(
         [
-            ModelStep(
-                output=[
-                    function_call(
-                        "run_command",
-                        {"command": "python -m pytest -q tests/test_calculator.py"},
-                        call_id="verify-1",
-                    )
-                ]
-            ),
-            ModelStep(
-                output=[
-                    function_call(
-                        "replace_in_file",
-                        {"path": "calculator.py", "old_text": "return left - right", "new_text": "return left + right"},
-                        call_id="replace-1",
-                    )
-                ]
-            ),
-            ModelStep(
-                output=[
-                    function_call(
-                        "run_command",
-                        {"command": "python -m pytest -q tests/test_calculator.py"},
-                        call_id="verify-2",
-                    )
-                ]
-            ),
-            ModelStep(output=[assistant_message("The repair is verified.")]),
+            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py"}, call_id="failed-test")]),
+            ModelStep(output=[function_call("search_files", {"query": "return left - right", "path": "src"}, call_id="search-source")]),
+            ModelStep(output=[function_call("read_file", {"path": "src/math_ops.py"}, call_id="read-source")]),
+            ModelStep(output=[function_call("read_file", {"path": "src/service.py"}, call_id="read-callsite")]),
+            ModelStep(output=[function_call("replace_in_file", {"path": "src/math_ops.py", "old_text": "return left - right", "new_text": "return left + right"}, call_id="repair-source")]),
+            ModelStep(output=[function_call("replace_in_file", {"path": "src/service.py", "old_text": "add(value, 2)", "new_text": "add(value, 1)"}, call_id="repair-callsite")]),
+            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py"}, call_id="retest")]),
+            ModelStep(output=[assistant_message("The failed focused test was repaired and now passes.")]),
         ]
     )
-    agent = make_agent(model, tmp_path)
     session = SQLiteSession("sdk-verification-recovery-test")
 
-    result = run(Runner.run(agent, "Repair the project and verify it.", session=session))
+    result = run(Runner.run(make_agent(model, tmp_path), "Repair the project and verify it.", session=session))
 
-    assert (tmp_path / "calculator.py").read_text(encoding="utf-8") == "def add(left, right):\n    return left + right\n"
-    assert result.final_output == "The repair is verified."
-    assert len(model.calls) == 4
+    assert paths["math_ops"].read_text(encoding="utf-8") == "def add(left, right):\n    return left + right\n"
+    assert paths["service"].read_text(encoding="utf-8").endswith("add(value, 1)\n")
+    assert result.final_output == "The failed focused test was repaired and now passes."
     assert "exit_code=1" in repr(model.calls[1].input)
-    assert "Replaced text in calculator.py" in repr(model.calls[2].input)
-    final_verification_input = repr(model.calls[3].input)
-    assert "exit_code=0" in final_verification_input
-    assert "1 passed" in final_verification_input
+    assert "AssertionError" in repr(model.calls[1].input)
+    assert "src/math_ops.py:2:     return left - right" in repr(model.calls[2].input)
+    assert "return add(value, 2)" in repr(model.calls[4].input)
+    assert "Replaced text in src/math_ops.py" in repr(model.calls[5].input)
+    assert "Replaced text in src/service.py" in repr(model.calls[6].input)
+    assert "exit_code=0" in repr(model.calls[7].input)
+    assert "1 passed" in repr(model.calls[7].input)
     session.close()
 
 
