@@ -76,18 +76,6 @@ The verified remote endpoint is a Cloudflare Quick Tunnel in front of Kaggle `ll
 running Qwen3.6-27B. Set `BOLT_MODEL_BASE_URL` to that tunnel's `/v1` URL. Do not replace it with
 a local model, Ollama, or an OpenAI-hosted model when you intend to exercise the Kaggle path.
 
-On this network the tunnel is reached through the corporate proxy. Export it before starting HANS;
-do not unset it for that path:
-
-```bash
-export http_proxy=http://www-proxy.us.oracle.com:80
-export https_proxy=http://www-proxy.us.oracle.com:80
-export HTTP_PROXY="$http_proxy"
-export HTTPS_PROXY="$https_proxy"
-```
-
-Unset those variables only when the endpoint is reachable directly and the proxy is what blocks it.
-
 ## Install
 
 Python 3.12 or newer is required. This installs `hans` into `~/.local/bin`:
@@ -101,7 +89,7 @@ system Python. If [uv](https://docs.astral.sh/uv/) is installed, it automaticall
 downloads a private Python 3.12 when no suitable interpreter is available. Otherwise,
 install Python 3.12+ (or uv) and rerun the command.
 
-If `~/.local/bin` is not on `PATH`, the script prints the one `export` to add. Behind the corporate proxy, export `https_proxy` before running the command. The model URL and API key are still set in the shell; the installer does not embed them.
+If `~/.local/bin` is not on `PATH`, the script prints the one `export` to add. The model URL and API key are still set in the shell; the installer does not embed them.
 
 ## Fresh installation
 
@@ -190,7 +178,7 @@ or `git diff`; they do not require a custom Git tool.
 The working directory is the workspace. Arguments that are absolute paths outside the workspace,
 or that contain a `..` segment, are rejected before the process starts. Arguments that begin with
 `-` are treated as flags and are not path-checked. The command receives a reduced environment:
-`PATH` and the Go, locale, proxy, and CA variables copied from the parent, plus `HOME`, `TMPDIR`,
+`PATH` and selected Go, locale, and CA variables copied from the parent, plus `HOME`, `TMPDIR`,
 and `PWD` set inside the workspace. API keys and the rest of the process environment are not
 copied and are not printed.
 
@@ -212,8 +200,7 @@ next model turn, that streaming completes, that the SQLite session keeps a later
 later turn still runs after a model error. Workspace tests cover bounded discovery, path checks,
 traversal, symlink safety, targeted replacement, and command stdout.
 
-Do not claim a live Qwen path from the unit tests alone. The live checks above were run against
-the configured tunnel with the proxy left set.
+Unit tests do not establish live-provider behavior.
 
 ## What is not in this version
 
