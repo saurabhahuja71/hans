@@ -6,6 +6,10 @@ prompt editor so the screen can be drawn without mixing them.
 
 from __future__ import annotations
 
+import base64
+import os
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from bolt_next.events import VerificationEvidence
@@ -273,3 +277,142 @@ def visible_transcript(lines: list[str], height: int) -> list[str]:
     if len(lines) <= height:
         return lines
     return lines[-height:]
+
+
+@dataclass(frozen=True)
+class TodoItem:
+    id: int
+    text: str
+    done: bool = False
+
+
+@dataclass
+class TodoList:
+    """Small UI-local task list; it is never part of an agent request."""
+
+    max_items: int = 32
+    max_text_chars: int = 240
+    _items: list[TodoItem] = field(default_factory=list)
+    _next_id: int = 1
+
+    @property
+    def items(self) -> tuple[TodoItem, ...]:
+        return tuple(self._items)
+
+    def add(self, text: str) -> str:
+        text = " ".join(text.split())
+        if not text:
+            return "TODO error: provide text after /todo add"
+        if len(text) > self.max_text_chars:
+            return f"TODO error: item is limited to {self.max_text_chars} characters"
+        if len(self._items) >= self.max_items:
+            return f"TODO error: list is limited to {self.max_items} items"
+        item = TodoItem(self._next_id, text)
+        self._next_id += 1
+        self._items.append(item)
+        return f"TODO added #{item.id}: {item.text}"
+
+    def list_text(self) -> str:
+        if not self._items:
+            return "TODO\n(no items)"
+        rows = ["TODO"]
+        rows.extend(f"{'x' if item.done else ' '} #{item.id} {item.text}" for item in self._items)
+        return "\n".join(rows)
+
+    def done(self, item_id: str) -> str:
+        return self._replace(item_id, done=True, action="completed")
+
+    def remove(self, item_id: str) -> str:
+        try:
+            value = int(item_id)
+        except ValueError:
+            return "TODO error: id must be a number"
+        for index, item in enumerate(self._items):
+            if item.id == value:
+                self._items.pop(index)
+                return f"TODO removed #{value}"
+        return f"TODO error: no item #{value}"
+
+    def clear(self) -> str:
+        count = len(self._items)
+        self._items.clear()
+        return f"TODO cleared ({count} item{'s' if count != 1 else ''})"
+
+    def _replace(self, item_id: str, *, done: bool, action: str) -> str:
+        try:
+            value = int(item_id)
+        except ValueError:
+            return "TODO error: id must be a number"
+        for index, item in enumerate(self._items):
+            if item.id == value:
+                self._items[index] = TodoItem(item.id, item.text, done)
+                return f"TODO {action} #{value}: {item.text}"
+        return f"TODO error: no item #{value}"
+
+
+@dataclass(frozen=True)
+class LocalCommand:
+    handled: bool
+    text: str = ""
+    theme: str | None = None
+    show_theme_selector: bool = False
+
+
+THEME_NAMES = ("dark", "light", "high-contrast", "terminal")
+
+
+def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
+    """Handle presentation-only commands, leaving ordinary prompts untouched."""
+    stripped = prompt.strip()
+    if not stripped.startswith("/"):
+        return LocalCommand(False)
+    command, _, argument = stripped.partition(" ")
+    argument = argument.strip()
+    if command == "/todo":
+        if not argument or argument == "list":
+            return LocalCommand(True, todos.list_text())
+        verb, _, value = argument.partition(" ")
+        value = value.strip()
+        if verb == "add":
+            return LocalCommand(True, todos.add(value))
+        if verb == "done":
+            return LocalCommand(True, todos.done(value))
+        if verb == "remove":
+            return LocalCommand(True, todos.remove(value))
+        if verb == "clear" and not value:
+            return LocalCommand(True, todos.clear())
+        return LocalCommand(True, "TODO error: use /todo [list|add|done|remove|clear]")
+    if command == "/theme":
+        if not argument:
+            return LocalCommand(True, "Theme: choose dark, light, high-contrast, or terminal", show_theme_selector=True)
+        if argument in THEME_NAMES:
+            return LocalCommand(True, f"Theme selected: {argument}", theme=argument)
+        return LocalCommand(True, f"Theme error: choose one of {', '.join(THEME_NAMES)}")
+    return LocalCommand(True, f"Command error: unknown command {command}")
+
+
+def display_bounded(text: str, limit: int) -> str:
+    """Keep a UI snapshot bounded while explaining omitted user-visible data."""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n… display truncated ({len(text) - limit} characters omitted)"
+
+
+def copy_osc52(
+    text: str,
+    writer: Callable[[bytes], object] | None = None,
+    *,
+    max_chars: int | None = 4_000,
+) -> tuple[bool, str]:
+    """Copy bounded plain text through OSC 52 when the terminal permits it."""
+    if writer is None:
+        if not sys.stdout.isatty() or not os.environ.get("TERM"):
+            return False, "Clipboard unavailable in this terminal"
+        writer = lambda data: os.write(sys.stdout.fileno(), data)
+    try:
+        bounded = text if max_chars is None else display_bounded(text, max(1, max_chars))
+        encoded = base64.b64encode(bounded.encode("utf-8")).decode("ascii")
+        writer(f"\x1b]52;c;{encoded}\x07".encode("ascii"))
+    except Exception:
+        return False, "Clipboard unavailable"
+    return True, "Copied"

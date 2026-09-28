@@ -13,8 +13,9 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
-from textual.events import Key
+from textual.events import Click, Key
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import Static, TextArea
 
 from bolt_next.events import (
@@ -39,8 +40,12 @@ from bolt_next.events import (
     VerificationStarted,
 )
 from bolt_next.tui_screen import (
+    THEME_NAMES,
+    TodoList,
+    display_bounded,
     footer_text,
     format_change_summary,
+    handle_local_command,
     is_exit_command,
     task_summary_has_hans_changes,
 )
@@ -58,49 +63,96 @@ class Runtime(Protocol):
     def close(self) -> None: ...
 
 
-class TaskDiffScreen(ModalScreen[None]):
-    """Bounded task-scoped diff review, independent of the model."""
+class DetailScreen(ModalScreen[None]):
+    """Reusable bounded plain-text review overlay."""
 
-    BINDINGS = [Binding("escape", "close", "back", show=False)]
+    BINDINGS = [
+        Binding("escape", "close", "back", show=False),
+        Binding("ctrl+y", "copy", "copy", show=False),
+    ]
 
     CSS = """
-    TaskDiffScreen {
-        background: $background;
-    }
+    DetailScreen { background: $background; }
+    #detail { width: 100%; height: 100%; border: heavy $accent; background: $surface; padding: 1 2; }
+    #detail-title { color: $accent; text-style: bold; height: 1; }
+    #detail-body { height: 1fr; margin-top: 1; }
+    .detail-content { color: $text; }
+    """
 
-    #task-diff {
-        width: 100%;
-        height: 100%;
-        border: heavy $accent;
-        background: $surface;
-        padding: 1 2;
-    }
+    def __init__(self, title: str, content: str) -> None:
+        super().__init__()
+        self.title = title
+        self.content = content or "(no content)"
 
-    #task-diff-title {
-        color: $accent;
-        text-style: bold;
-        height: 1;
-    }
+    def compose(self) -> ComposeResult:
+        with Container(id="detail"):
+            yield Static(f"{self.title}  ·  Ctrl-Y copy  ·  Esc back", id="detail-title", markup=False)
+            with VerticalScroll(id="detail-body"):
+                yield Static(self.content, classes="detail-content", markup=False)
 
-    #task-diff-body {
-        height: 1fr;
-        margin-top: 1;
-    }
+    def action_close(self) -> None:
+        self.dismiss()
 
-    .diff-content {
-        color: $text;
-    }
+    def action_copy(self) -> None:
+        self.app.copy_plain_text(self.content)
+
+
+class TaskDiffScreen(DetailScreen):
+    """Task-diff detail overlay with retained query IDs for callers."""
+
+    CSS = """
+    TaskDiffScreen { background: $background; }
+    #task-diff { width: 100%; height: 100%; border: heavy $accent; background: $surface; padding: 1 2; }
+    #task-diff-title { color: $accent; text-style: bold; height: 1; }
+    #task-diff-body { height: 1fr; margin-top: 1; }
+    .diff-content { color: $text; }
     """
 
     def __init__(self, diff: str) -> None:
-        super().__init__()
-        self.diff = diff or "(no HANS task changes)"
+        super().__init__("DIFF", diff or "(no HANS task changes)")
 
     def compose(self) -> ComposeResult:
         with Container(id="task-diff"):
-            yield Static("DIFF  ·  Esc back", id="task-diff-title", markup=False)
+            yield Static("DIFF  ·  Ctrl-Y copy  ·  Esc back", id="task-diff-title", markup=False)
             with VerticalScroll(id="task-diff-body"):
-                yield Static(self.diff, classes="diff-content", markup=False)
+                yield Static(self.content, classes="diff-content", markup=False)
+
+
+class ToolRow(Static):
+    """Compact tool row that opens its own retained output when clicked."""
+
+    def __init__(self, call_id: str, text: str = "◉ tool") -> None:
+        super().__init__(text, classes="tool", markup=False)
+        self.call_id = call_id
+
+    def on_click(self, event: Click) -> None:
+        event.stop()
+        self.app.open_tool_output(self.call_id)
+
+
+class ThemeScreen(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "back", show=False)]
+
+    CSS = """
+    ThemeScreen { background: $background; }
+    #theme-selector { width: 100%; height: auto; border: heavy $accent; background: $surface; padding: 1 2; }
+    #theme-title { color: $accent; text-style: bold; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="theme-selector"):
+            yield Static(
+                "THEME  ·  d dark  l light  h high-contrast  t terminal  ·  Esc back",
+                id="theme-title",
+                markup=False,
+            )
+            yield Static("Themes are session-only and preserve text and state symbols.", markup=False)
+
+    def on_key(self, event: Key) -> None:
+        themes = {"d": "dark", "l": "light", "h": "high-contrast", "t": "terminal"}
+        if event.key in themes:
+            self.app.apply_theme(themes[event.key])
+            self.dismiss()
 
     def action_close(self) -> None:
         self.dismiss()
@@ -207,6 +259,8 @@ class HansTextualApp(App[None]):
         Binding("ctrl+c", "cancel_active", "cancel", show=False),
         Binding("ctrl+g", "show_task_diff", "diff", show=False),
         Binding("ctrl+z", "undo_task", "undo", show=False),
+        Binding("ctrl+o", "show_latest_output", "output", show=False),
+        Binding("ctrl+y", "copy_visible", "copy", show=False),
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
@@ -224,7 +278,11 @@ class HansTextualApp(App[None]):
         self._tool_names: dict[str, str] = {}
         self._tool_details: dict[str, str] = {}
         self._tool_results: dict[str, str] = {}
+        self._tool_outputs: dict[str, str] = {}
         self._tool_purposes: dict[str, str] = {}
+        self._latest_tool_call_id: str | None = None
+        self._todos = TodoList()
+        self._theme_name = "dark"
         self._completed_tool_rows: deque[str] = deque()
         self._transcript_rows: deque[Static] = deque()
         self._verification_failed = False
@@ -241,7 +299,41 @@ class HansTextualApp(App[None]):
         yield TextArea("", id="composer")
 
     def on_mount(self) -> None:
+        self._register_themes()
+        self.apply_theme(self._theme_name, announce=False)
         self.query_one("#composer", TextArea).focus()
+
+    def _register_themes(self) -> None:
+        palettes = {
+            "dark": dict(primary="#64b5f6", secondary="#b39ddb", warning="#ffcc80", error="#ff8a80", success="#81c784", accent="#80cbc4", foreground="#f5f5f5", background="#101418", surface="#1b2128", dark=True),
+            "light": dict(primary="#1565c0", secondary="#6a1b9a", warning="#b45309", error="#b91c1c", success="#15803d", accent="#00796b", foreground="#17202a", background="#f8fafc", surface="#ffffff", dark=False),
+            "high-contrast": dict(primary="#00ffff", secondary="#ffff00", warning="#ffff00", error="#ff5555", success="#55ff55", accent="#ffffff", foreground="#ffffff", background="#000000", surface="#000000", dark=True),
+            "terminal": dict(primary="#ffffff", secondary="#ffffff", warning="#ffffff", error="#ffffff", success="#ffffff", accent="#ffffff", foreground="#ffffff", background="#000000", surface="#000000", dark=True),
+        }
+        for name, palette in palettes.items():
+            self.register_theme(Theme(f"hans-{name}", **palette))
+
+    def apply_theme(self, name: str, *, announce: bool = True) -> bool:
+        if name not in THEME_NAMES:
+            self._set_state("IDLE", f"theme error: {name}")
+            return False
+        self.theme = f"hans-{name}"
+        self._theme_name = name
+        if announce and self.is_mounted:
+            self._set_state("IDLE", f"theme {name}")
+        return True
+
+    def copy_plain_text(self, text: str) -> bool:
+        if not text:
+            self._set_state("IDLE", "nothing to copy")
+            return False
+        try:
+            self.copy_to_clipboard(text)
+        except Exception:
+            self._set_state("IDLE", "clipboard unavailable")
+            return False
+        self._set_state("IDLE", "copied")
+        return True
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "composer":
@@ -250,11 +342,18 @@ class HansTextualApp(App[None]):
         event.text_area.styles.height = rows + 2
 
     def on_key(self, event: Key) -> None:
+        if event.key == "ctrl+y" and isinstance(self.screen, DetailScreen):
+            event.stop()
+            event.prevent_default()
+            self.screen.action_copy()
+            return
         actions = {
             "ctrl+d": self.action_submit_or_exit,
             "ctrl+c": self.action_cancel_active,
             "ctrl+g": self.action_show_task_diff,
             "ctrl+z": self.action_undo_task,
+            "ctrl+o": self.action_show_latest_output,
+            "ctrl+y": self.action_copy_visible,
             "ctrl+q": self.action_exit_app,
         }
         action = actions.get(event.key)
@@ -307,12 +406,6 @@ class HansTextualApp(App[None]):
             return normalized
         return f"{normalized[:limit]}…"
 
-    def _display_tool_output(self, output: str) -> str:
-        if len(output) <= self.MAX_TOOL_OUTPUT_CHARS:
-            return output
-        omitted = len(output) - self.MAX_TOOL_OUTPUT_CHARS
-        return f"{output[:self.MAX_TOOL_OUTPUT_CHARS]}\n… display truncated ({omitted} characters omitted)"
-
     @staticmethod
     def _failure_title(category: str) -> str:
         if category == "configuration":
@@ -354,6 +447,9 @@ class HansTextualApp(App[None]):
                 self._tool_names.pop(call_id, None)
                 self._tool_details.pop(call_id, None)
                 self._tool_results.pop(call_id, None)
+                self._tool_outputs.pop(call_id, None)
+                if self._latest_tool_call_id == call_id:
+                    self._latest_tool_call_id = None
                 self._tool_purposes.pop(call_id, None)
                 try:
                     self._completed_tool_rows.remove(call_id)
@@ -372,6 +468,9 @@ class HansTextualApp(App[None]):
                     self._tool_names.pop(call_id, None)
                     self._tool_details.pop(call_id, None)
                     self._tool_results.pop(call_id, None)
+                    self._tool_outputs.pop(call_id, None)
+                    if self._latest_tool_call_id == call_id:
+                        self._latest_tool_call_id = None
                     self._tool_purposes.pop(call_id, None)
                     try:
                         self._completed_tool_rows.remove(call_id)
@@ -460,21 +559,28 @@ class HansTextualApp(App[None]):
         widget = self._tool_widgets.get(call_id)
         if widget is not None:
             return widget
-        widget = await self._append_transcript("◉ tool", "tool")
+        transcript = self.query_one("#transcript", VerticalScroll)
+        position = transcript.scroll_y
+        follow = position >= transcript.max_scroll_y
+        widget = ToolRow(call_id)
+        await transcript.mount(widget)
+        self._transcript_rows.append(widget)
         self._tool_widgets[call_id] = widget
+        await self._trim_transcript()
+        self._follow_transcript(transcript, follow, position)
         return widget
 
     async def _trim_completed_tools(self) -> None:
         while len(self._completed_tool_rows) > self.MAX_TOOL_ROWS:
             call_id = self._completed_tool_rows.popleft()
-            widget = self._tool_widgets.pop(call_id, None)
-            self._tool_names.pop(call_id, None)
-            self._tool_details.pop(call_id, None)
-            self._tool_results.pop(call_id, None)
-            self._tool_purposes.pop(call_id, None)
+            widget = self._tool_widgets.get(call_id)
             if widget is not None:
                 self._forget_row(widget)
                 await widget.remove()
+            else:
+                self._tool_outputs.pop(call_id, None)
+            if self._latest_tool_call_id == call_id:
+                self._latest_tool_call_id = None
 
     async def _render_event(self, event: HansEvent) -> None:
         if isinstance(event, UserMessageSubmitted):
@@ -512,8 +618,10 @@ class HansTextualApp(App[None]):
             summary = self._tool_result_summary(name, event.output)
             if summary:
                 self._tool_results[event.call_id] = summary
+            output = display_bounded(event.output, self.MAX_TOOL_OUTPUT_CHARS)
+            self._tool_outputs[event.call_id] = output
+            self._latest_tool_call_id = event.call_id
             if self._debug_enabled():
-                output = self._display_tool_output(event.output)
                 await self._append_transcript(f"DEBUG TOOL [{event.call_id}] OUTPUT\n{output}", "debug")
         elif isinstance(event, ToolCompleted):
             self._tool_names.setdefault(event.call_id, event.name)
@@ -584,7 +692,7 @@ class HansTextualApp(App[None]):
                 f"CHANGES\n{format_change_summary(event.summary)}", "change"
             )
         elif isinstance(event, TaskDiff):
-            self.push_screen(TaskDiffScreen(event.diff[: self.MAX_TASK_DIFF_CHARS]))
+            self.push_screen(TaskDiffScreen(display_bounded(event.diff, self.MAX_TASK_DIFF_CHARS)))
         elif isinstance(event, TaskUndoSucceeded):
             details = []
             if event.restored_files:
@@ -609,6 +717,15 @@ class HansTextualApp(App[None]):
         if not prompt.strip() or is_exit_command(prompt):
             self.action_exit_app()
             return
+        local = handle_local_command(prompt, self._todos)
+        if local.handled:
+            composer.text = ""
+            if local.theme:
+                self.apply_theme(local.theme)
+            if local.show_theme_selector:
+                self.push_screen(ThemeScreen())
+            self.run_worker(self._append_transcript(local.text, "change"), exclusive=False)
+            return
         if self._request_active:
             return
         composer.text = ""
@@ -625,6 +742,25 @@ class HansTextualApp(App[None]):
             self._set_state("CANCELLED", "cancellation requested")
         else:
             self.query_one("#composer", TextArea).text = ""
+
+    def action_show_latest_output(self) -> None:
+        if self._request_active:
+            return
+        if self._latest_tool_call_id is None:
+            self._set_state("IDLE", "no retained tool output")
+            return
+        self.open_tool_output(self._latest_tool_call_id)
+
+    def open_tool_output(self, call_id: str) -> None:
+        output = self._tool_outputs.get(call_id)
+        if output is None:
+            self._set_state("IDLE", "tool output is no longer retained")
+            return
+        name = self._tool_names.get(call_id, "tool")
+        self.push_screen(DetailScreen(f"TOOL OUTPUT · {name}", output))
+
+    def action_copy_visible(self) -> None:
+        self.copy_plain_text(display_bounded(self._assistant_text, self.MAX_TOOL_OUTPUT_CHARS))
 
     def action_show_task_diff(self) -> None:
         if not self._request_active:

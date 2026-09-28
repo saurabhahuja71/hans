@@ -30,9 +30,13 @@ from bolt_next.events import (
 from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import (
     Editor,
+    TodoList,
     Transcript,
+    copy_osc52,
+    display_bounded,
     footer_text,
     format_change_summary,
+    handle_local_command,
     is_exit_command,
     layout_rows,
     task_summary_has_hans_changes,
@@ -78,6 +82,17 @@ def format_tool_result(name: str, success: bool, exit_code: int | None = None) -
     return f"  {mark} {name}"
 
 
+def detail_window(content: str, width: int, height: int, offset: int = 0) -> list[str]:
+    """Return a bounded, width-aware slice for the curses detail overlay."""
+    room = max(1, width)
+    rows: list[str] = []
+    for line in content.splitlines() or [""]:
+        rows.extend(line[index : index + room] for index in range(0, max(1, len(line)), room))
+    window_height = max(1, height)
+    start = min(max(0, offset), max(0, len(rows) - window_height))
+    return rows[start : start + window_height]
+
+
 def turn_error_message(
     category: str | BaseException,
     message: str | None = None,
@@ -121,6 +136,10 @@ class _Display:
         self._started = False
         self._verification_failed = False
         self._tool_purposes: dict[str, str] = {}
+        self.tool_outputs: dict[str, str] = {}
+        self.latest_tool_call_id: str | None = None
+        self.max_tool_outputs = 100
+        self.max_transcript_pieces = 300
 
     @staticmethod
     def _compact(text: str, limit: int = 240) -> str:
@@ -129,10 +148,21 @@ class _Display:
 
     @staticmethod
     def _debug_tool_output(output: str) -> str:
-        if len(output) <= TOOL_OUTPUT_MAX_CHARS:
-            return output
-        omitted = len(output) - TOOL_OUTPUT_MAX_CHARS
-        return f"{output[:TOOL_OUTPUT_MAX_CHARS]}\n… display truncated ({omitted} characters omitted)"
+        return display_bounded(output, TOOL_OUTPUT_MAX_CHARS)
+
+    def latest_tool_output(self) -> str | None:
+        if self.latest_tool_call_id is None:
+            return None
+        return self.tool_outputs.get(self.latest_tool_call_id)
+
+    def _trim_presentation(self) -> None:
+        while len(self.tool_outputs) > self.max_tool_outputs:
+            call_id = next(iter(self.tool_outputs))
+            self.tool_outputs.pop(call_id, None)
+            if self.latest_tool_call_id == call_id:
+                self.latest_tool_call_id = None
+        if self.transcript is not None and len(self.transcript.pieces) > self.max_transcript_pieces:
+            del self.transcript.pieces[: len(self.transcript.pieces) - self.max_transcript_pieces]
 
     def _set_state(self, state: str, detail: str = "") -> None:
         self.state = state if not detail else f"{state} · {self._compact(detail)}"
@@ -178,8 +208,10 @@ class _Display:
             else:
                 print("\n" + format_tool_call(event.name, self._compact(event.detail)), flush=True)
         elif isinstance(event, ToolOutput):
+            output = self._debug_tool_output(event.output)
+            self.tool_outputs[event.call_id] = output
+            self.latest_tool_call_id = event.call_id
             if self.debug:
-                output = self._debug_tool_output(event.output)
                 if self.transcript is not None:
                     self.transcript.debug(f"[tool_output] call_id={event.call_id}\n{output}")
                 else:
@@ -253,7 +285,7 @@ class _Display:
             else:
                 print(f"\nchanges:\n{summary}", flush=True)
         elif isinstance(event, TaskDiff):
-            diff = (event.diff or "(no HANS task changes)")[:TASK_DIFF_MAX_CHARS]
+            diff = display_bounded(event.diff or "(no HANS task changes)", TASK_DIFF_MAX_CHARS)
             if self.transcript is not None:
                 self.transcript.diff(diff)
             else:
@@ -282,6 +314,7 @@ class _Display:
             self.on_connection(event.connected)
         elif isinstance(event, AssistantMessageComplete):
             return
+        self._trim_presentation()
 
     def _text(self, delta: str) -> None:
         if not delta:
@@ -380,7 +413,14 @@ async def _run_curses(runtime: HansRuntime) -> None:
 
     transcript = Transcript()
     editor = Editor()
-    state = {"connected": False, "task": None, "cancel": False}
+    state = {
+        "connected": False,
+        "task": None,
+        "cancel": False,
+        "detail": None,
+        "theme": "terminal",
+        "todos": TodoList(),
+    }
     state["display"] = _Display(transcript, lambda connected: state.__setitem__("connected", connected))
 
     def request_cancel(*_args) -> None:
@@ -396,9 +436,21 @@ async def _run_curses(runtime: HansRuntime) -> None:
         if height < 8 or width < 20:
             return
         stdscr.erase()
+        detail = state["detail"]
+        if detail is not None:
+            title, content, offset = detail
+            stdscr.addnstr(0, 0, f"{title}  ·  Ctrl-Y copy  ·  Esc back", width - 1, curses.A_BOLD)
+            stdscr.hline(1, 0, curses.ACS_HLINE, width - 1)
+            for row, line in enumerate(detail_window(content, width - 1, height - 4, offset), start=2):
+                stdscr.addnstr(row, 0, line, width - 1)
+            stdscr.hline(height - 2, 0, curses.ACS_HLINE, width - 1)
+            stdscr.addnstr(height - 1, 0, "Up/Down/Page scroll · Esc back", width - 1)
+            stdscr.refresh()
+            return
         header = format_header(_model_name(), _workspace(), state["connected"]).splitlines()
+        header_attr = curses.A_REVERSE if state["theme"] == "high-contrast" else curses.A_NORMAL
         for row, line in enumerate(header[:2]):
-            stdscr.addnstr(row, 0, line, width - 1)
+            stdscr.addnstr(row, 0, line, width - 1, header_attr)
         stdscr.hline(2, 0, curses.ACS_HLINE, width - 1)
         conversation, _editor_height = layout_rows(height, len(editor.lines))
         body = visible_transcript(transcript.render(width - 1), conversation)
@@ -426,6 +478,83 @@ async def _run_curses(runtime: HansRuntime) -> None:
             runtime.cancel_active()
             raise
 
+    def open_detail(title: str, content: str | None) -> None:
+        if content is None:
+            state["display"]._set_state("IDLE", "no retained tool output")
+            return
+        state["detail"] = (title, content, 0)
+
+    def detail_key(name: str) -> bool:
+        detail = state["detail"]
+        if detail is None:
+            return False
+        title, content, offset = detail
+        if name == "escape":
+            state["detail"] = None
+        elif name == "ctrl-y":
+            _ok, message = copy_osc52(content, max_chars=None)
+            state["display"]._set_state("IDLE", message.lower())
+        elif name == "up":
+            state["detail"] = (title, content, max(0, offset - 1))
+        elif name == "down":
+            state["detail"] = (title, content, offset + 1)
+        elif name == "pageup":
+            state["detail"] = (title, content, max(0, offset - 10))
+        elif name == "pagedown":
+            state["detail"] = (title, content, offset + 10)
+        return True
+
+    async def handle_input(name: str) -> bool:
+        if state["detail"] is not None:
+            if name == "ctrl-q":
+                return True
+            detail_key(name)
+            return False
+        if state["task"] is not None:
+            if name == "ctrl-c":
+                request_cancel()
+            elif name == "ctrl-q":
+                request_cancel()
+                return True
+            return False
+        if name == "ctrl-g":
+            diff = runtime.task_diff(max_chars=TASK_DIFF_MAX_CHARS)
+            open_detail("DIFF", display_bounded(diff.diff, TASK_DIFF_MAX_CHARS))
+            return False
+        if name == "ctrl-o":
+            open_detail("TOOL OUTPUT", state["display"].latest_tool_output())
+            return False
+        if name == "ctrl-y":
+            assistant = next(
+                (piece.text for piece in reversed(transcript.pieces) if piece.kind == "assistant"),
+                "",
+            )
+            if not assistant:
+                state["display"]._set_state("IDLE", "nothing to copy")
+            else:
+                _ok, message = copy_osc52(
+                    display_bounded(assistant, TOOL_OUTPUT_MAX_CHARS), max_chars=None
+                )
+                state["display"]._set_state("IDLE", message.lower())
+            return False
+        if name == "ctrl-z":
+            state["display"].event(runtime.undo_task())
+            return False
+        submitted = editor.on_key(name)
+        if submitted is None:
+            return False
+        if submitted == "" or is_exit_command(submitted):
+            return True
+        local = handle_local_command(submitted, state["todos"])
+        if local.handled:
+            if local.theme:
+                state["theme"] = "high-contrast" if local.theme == "high-contrast" else "terminal"
+            transcript.change(local.text, title="LOCAL")
+            state["display"]._trim_presentation()
+            return False
+        state["task"] = asyncio.create_task(run_prompt(submitted))
+        return False
+
     async def loop(stdscr) -> None:
         try:
             curses.curs_set(1)
@@ -434,6 +563,12 @@ async def _run_curses(runtime: HansRuntime) -> None:
         stdscr.keypad(True)
         stdscr.nodelay(True)
         decoder = _InputDecoder()
+        special_keys = {
+            curses.KEY_UP: "up",
+            curses.KEY_DOWN: "down",
+            curses.KEY_PPAGE: "pageup",
+            curses.KEY_NPAGE: "pagedown",
+        }
         while True:
             try:
                 draw(stdscr)
@@ -445,6 +580,9 @@ async def _run_curses(runtime: HansRuntime) -> None:
                 try:
                     key = stdscr.get_wch()
                 except curses.error:
+                    for name in decoder.flush():
+                        if await handle_input(name):
+                            return
                     await asyncio.sleep(0.04)
                     continue
             except KeyboardInterrupt:
@@ -455,26 +593,10 @@ async def _run_curses(runtime: HansRuntime) -> None:
                 continue
             if key == curses.KEY_RESIZE:
                 continue
-            for name in decoder.feed(key):
-                if state["task"] is not None:
-                    if name == "ctrl-c":
-                        request_cancel()
-                    elif name == "ctrl-q":
-                        request_cancel()
-                        return
-                    continue
-                if name == "ctrl-g":
-                    state["display"].event(runtime.task_diff(max_chars=TASK_DIFF_MAX_CHARS))
-                    continue
-                if name == "ctrl-z":
-                    state["display"].event(runtime.undo_task())
-                    continue
-                submitted = editor.on_key(name)
-                if submitted is None:
-                    continue
-                if submitted == "" or is_exit_command(submitted):
+            names = [special_keys[key]] if key in special_keys else decoder.feed(key)
+            for name in names:
+                if await handle_input(name):
                     return
-                state["task"] = asyncio.create_task(run_prompt(submitted))
 
     stdscr = curses.initscr()
     curses.noecho()
@@ -551,6 +673,12 @@ class _InputDecoder:
                 events.append(name)
         return events
 
+    def flush(self) -> list[str]:
+        if self._pending == "\x1b":
+            self._pending = ""
+            return ["escape"]
+        return []
+
 
 def _set_enhanced_input(enabled: bool) -> None:
     sequence = "\x1b[?2004h\x1b[>1u\x1b[>4;2m" if enabled else "\x1b[?2004l\x1b[<u\x1b[>4;0m"
@@ -564,14 +692,22 @@ def _key_name(key) -> str | None:
         return "ctrl-d"
     if key in {7, "\x07"}:
         return "ctrl-g"
-    if key in {26, "\x1a"}:
-        return "ctrl-z"
+    if key in {15, "\x0f"}:
+        return "ctrl-o"
     if key in {17, "\x11"}:
         return "ctrl-q"
+    if key in {25, "\x19"}:
+        return "ctrl-y"
+    if key in {26, "\x1a"}:
+        return "ctrl-z"
+    if key in {27, "\x1b"}:
+        return "escape"
     if key in {"\n", "\r", 10}:
         return "enter"
     if key in {"\x7f", "\b", 127, 263}:
         return "backspace"
+    if key in {259, 258, 339, 338}:
+        return {259: "up", 258: "down", 339: "pageup", 338: "pagedown"}[key]
     if isinstance(key, str) and key.isprintable():
         return "char:" + key
     return None

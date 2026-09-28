@@ -28,7 +28,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
-from bolt_next.textual_tui import HansTextualApp, TaskDiffScreen
+from bolt_next.textual_tui import DetailScreen, HansTextualApp, TaskDiffScreen, ThemeScreen
 
 
 class FakeRuntime:
@@ -266,7 +266,7 @@ def test_ctrl_g_uses_a_bounded_modal_and_escape_returns(tmp_path: Path) -> None:
             assert diff_view.region.y == 0
             assert diff_view.region.width == app.size.width
             assert diff_view.region.height == app.size.height
-            assert rendered(app.screen.query_one("#task-diff-title", Static)) == "DIFF  ·  Esc back"
+            assert rendered(app.screen.query_one("#task-diff-title", Static)) == "DIFF  ·  Ctrl-Y copy  ·  Esc back"
             assert "+++ b/task.txt" in rendered(app.screen.query_one(".diff-content", Static))
             await pilot.press("escape")
             await pilot.pause()
@@ -413,5 +413,110 @@ def test_failed_verification_is_not_rendered_as_completion(tmp_path: Path) -> No
             text = transcript_text(app)
             assert "FINAL RESULT\nVERIFICATION FAILED\npytest -q\nHANS did not claim completion." in text
             assert rendered(app.query_one("#state-line", Static)) == "FAILED"
+
+    asyncio.run(scenario())
+
+
+def test_tool_output_detail_is_bounded_clickable_and_copyable(tmp_path: Path, monkeypatch) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        app.MAX_TOOL_OUTPUT_CHARS = 8
+        copied: list[str] = []
+        monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+        async with app.run_test() as pilot:
+            await app._render_event(ToolStarted("call", "read_file", "a.py"))
+            await app._render_event(ToolOutput("call", "abcdefghijk"))
+            await app._render_event(ToolCompleted("call", "read_file", "a.py", True))
+            await pilot.pause()
+
+            assert app._tool_outputs["call"] == "abcdefgh\n… display truncated (3 characters omitted)"
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            assert isinstance(app.screen, DetailScreen)
+            assert app.screen.content == app._tool_outputs["call"]
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert copied == ["abcdefgh\n… display truncated (3 characters omitted)"]
+            await pilot.press("escape")
+            await pilot.pause()
+
+            await pilot.click(".tool")
+            await pilot.pause()
+            assert isinstance(app.screen, DetailScreen)
+            await pilot.press("escape")
+
+    asyncio.run(scenario())
+
+
+def test_tool_output_retention_tracks_evicted_rows(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        app.MAX_TOOL_ROWS = 1
+        async with app.run_test() as pilot:
+            for call_id in ("old", "new"):
+                await app._render_event(ToolStarted(call_id, "read_file", f"{call_id}.py"))
+                await app._render_event(ToolOutput(call_id, call_id))
+                await app._render_event(ToolCompleted(call_id, "read_file", f"{call_id}.py", True))
+            await pilot.pause()
+            assert "old" not in app._tool_outputs
+            assert app._tool_outputs == {"new": "new"}
+            assert app._latest_tool_call_id == "new"
+
+    asyncio.run(scenario())
+
+
+def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) -> None:
+    async def submit(pilot, text: str) -> None:
+        await pilot.press(*text, "enter")
+        await pilot.pause()
+
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await submit(pilot, "/todo add write tests")
+            await submit(pilot, "/todo list")
+            await submit(pilot, "/todo done 1")
+            await submit(pilot, "/todo list")
+            await submit(pilot, "/todo remove 1")
+            await submit(pilot, "/todo clear")
+            await submit(pilot, "/unknown")
+            assert runtime.prompts == []
+            text = transcript_text(app)
+            assert "TODO added #1: write tests" in text
+            assert "TODO\nx #1 write tests" in text
+            assert "TODO completed #1: write tests" in text
+            assert "TODO removed #1" in text
+            assert "TODO cleared (0 items)" in text
+            assert "Command error: unknown command /unknown" in text
+
+            await submit(pilot, "/theme light")
+            assert app._theme_name == "light"
+            assert app.theme == "hans-light"
+            await submit(pilot, "/theme")
+            assert isinstance(app.screen, ThemeScreen)
+            await pilot.press("h")
+            await pilot.pause()
+            assert app._theme_name == "high-contrast"
+            assert app.theme == "hans-high-contrast"
+            assert runtime.prompts == []
+
+            await submit(pilot, "ordinary prompt")
+            assert runtime.prompts == ["ordinary prompt"]
+
+    asyncio.run(scenario())
+
+
+def test_copy_reports_clipboard_failure_without_runtime_submission(tmp_path: Path, monkeypatch) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        monkeypatch.setattr(app, "copy_to_clipboard", lambda _text: (_ for _ in ()).throw(RuntimeError()))
+        async with app.run_test() as pilot:
+            await app._render_event(AssistantMessageComplete("plain assistant text"))
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert "clipboard unavailable" in rendered(app.query_one("#state-line", Static))
+            assert runtime.prompts == []
 
     asyncio.run(scenario())

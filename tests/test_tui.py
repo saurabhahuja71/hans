@@ -27,6 +27,7 @@ from bolt_next.tui import (
     FOOTER,
     _Display,
     _InputDecoder,
+    detail_window,
     format_header,
     format_tool_call,
     format_tool_result,
@@ -36,8 +37,12 @@ from bolt_next.tui import (
 )
 from bolt_next.tui_screen import (
     Editor,
+    TodoList,
     Transcript,
+    copy_osc52,
+    display_bounded,
     footer_text,
+    handle_local_command,
     is_exit_command,
     layout_rows,
     task_summary_has_hans_changes,
@@ -258,7 +263,8 @@ def test_curses_changes_diff_undo_and_errors_are_task_scoped() -> None:
     )
     display.event(TaskDiff("--- a/existing.py\n+++ b/existing.py\n+updated"))
     display.event(TaskDiff("x" * 4_001))
-    assert transcript.pieces[-1].text == "x" * 4_000
+    assert transcript.pieces[-1].text.startswith("x" * 4_000)
+    assert "display truncated (1 characters omitted)" in transcript.pieces[-1].text
     display.event(TaskUndoSucceeded(("existing.py",), ("new.py",)))
     assert display.state.startswith("IDLE")
     display.event(TaskUndoRefused(("changed.py",)))
@@ -360,3 +366,65 @@ def test_curses_failed_verification_is_not_claimed_complete() -> None:
     assert "✗ VERIFICATION FAILED" in rendered
     assert "pytest -q" in rendered
     assert "HANS did not claim completion." in rendered
+
+
+def test_local_todos_commands_and_bounded_presentation_are_ui_only() -> None:
+    todos = TodoList(max_items=2, max_text_chars=12)
+    assert handle_local_command("ordinary prompt", todos).handled is False
+    assert handle_local_command("/unknown", todos).text == "Command error: unknown command /unknown"
+    assert handle_local_command("/todo add  write   tests ", todos).text == "TODO added #1: write tests"
+    assert handle_local_command("/todo add review", todos).text == "TODO added #2: review"
+    assert handle_local_command("/todo add one too many", todos).text == "TODO error: list is limited to 2 items"
+    assert handle_local_command("/todo done 1", todos).text == "TODO completed #1: write tests"
+    assert handle_local_command("/todo list", todos).text == "TODO\nx #1 write tests\n  #2 review"
+    assert handle_local_command("/todo remove no", todos).text == "TODO error: id must be a number"
+    assert handle_local_command("/todo remove 2", todos).text == "TODO removed #2"
+    assert handle_local_command("/todo clear", todos).text == "TODO cleared (1 item)"
+    assert handle_local_command("/theme terminal", todos).theme == "terminal"
+    assert handle_local_command("/theme sepia", todos).text == (
+        "Theme error: choose one of dark, light, high-contrast, terminal"
+    )
+    assert display_bounded("abcdef", 3) == "abc\n… display truncated (3 characters omitted)"
+    assert display_bounded("abc", 3) == "abc"
+
+
+def test_osc52_copy_is_plain_text_bounded_and_failure_safe() -> None:
+    captured: list[bytes] = []
+    ok, message = copy_osc52("a\nb", captured.append)
+    assert (ok, message) == (True, "Copied")
+    assert captured == [b"\x1b]52;c;YQpi\x07"]
+
+    ok, message = copy_osc52("abcdef", captured.append, max_chars=3)
+    assert (ok, message) == (True, "Copied")
+    assert b"YWJjCuKApiBkaXNwbGF5IHRydW5jYXRlZCAoMyBjaGFyYWN0ZXJzIG9taXR0ZWQp" in captured[-1]
+
+    def fail(_data: bytes) -> None:
+        raise RuntimeError("no clipboard")
+
+    assert copy_osc52("text", fail) == (False, "Clipboard unavailable")
+
+
+def test_detail_window_decoder_and_retention_bounds() -> None:
+    assert detail_window("abcdef\nx", 3, 2) == ["abc", "def"]
+    assert detail_window("abcdef\nx", 3, 2, 1) == ["def", "x"]
+    assert detail_window("abcdef\nx", 3, 2, 100) == ["def", "x"]
+
+    decoder = _InputDecoder()
+    assert decoder.feed("\x0f\x19\x1b") == ["ctrl-o", "ctrl-y"]
+    assert decoder.flush() == ["escape"]
+    assert decoder.feed(259) == ["up"]
+    assert decoder.feed(258) == ["down"]
+    assert decoder.feed(339) == ["pageup"]
+    assert decoder.feed(338) == ["pagedown"]
+
+    transcript = Transcript()
+    display = _Display(transcript)
+    display.max_tool_outputs = 1
+    display.max_transcript_pieces = 2
+    for number in range(3):
+        display.event(UserMessageSubmitted(f"message {number}"))
+    display.event(ToolOutput("old", "old output"))
+    display.event(ToolOutput("new", "new output"))
+    assert display.tool_outputs == {"new": "new output"}
+    assert display.latest_tool_output() == "new output"
+    assert [piece.text for piece in transcript.pieces] == ["message 1", "message 2"]
