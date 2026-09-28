@@ -290,13 +290,12 @@ def make_run_command_tool(workspace: Path):
         budget = tool_result_token_budget()
         if estimate_tokens(result) <= budget:
             return result
-        keep = budget * 4
-        return (
-            result[:keep]
-            + "\n---\n"
-            + "command output truncated to fit the context budget. "
-            + f"original_tokens≈{estimate_tokens(result)} budget_tokens={budget}. "
-            + "This is not a summary. Re-run a narrower command for the omitted output.\n"
+        notice = (
+            "\n---\n"
+            "command output truncated to fit the context budget. "
+            f"original_tokens≈{estimate_tokens(result)} budget_tokens={budget}. "
+            "This is not a summary. Re-run a narrower command for the omitted output.\n"
         )
+        return result[: max(0, budget * 3 - len(notice))] + notice
 
     return run_command

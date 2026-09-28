@@ -76,10 +76,16 @@ def turn_error_message(
         lowered = message.lower()
         category = "context" if "context" in lowered or "exceed_context" in lowered else "runtime"
     message = message or "request failed"
-    if category == "context":
+    if category == "configuration":
+        rendered = f"\n✗ configuration failed: {message}\n"
+    elif category == "authentication":
+        rendered = f"\n✗ authentication failed: {message}\n"
+    elif category == "context":
         rendered = "\n✗ context budget exceeded; the session is still open. Request a smaller file range.\n"
     elif category == "connection":
         rendered = f"\n✗ connection failed: {message}\n"
+    elif category == "model":
+        rendered = f"\n✗ model request failed: {message}\n"
     else:
         rendered = f"\n✗ {message}\n"
     if debug if debug is not None else debug_enabled():
@@ -169,11 +175,16 @@ class _Display:
                 print("\ninterrupted", flush=True)
         elif isinstance(event, RequestFailed):
             if self.transcript is not None:
-                title = "model request failed"
-                if event.category == "context":
-                    self.transcript.error("context limit exceeded", event.message)
-                else:
-                    self.transcript.error(title, event.message[:160])
+                titles = {
+                    "configuration": "configuration failed",
+                    "authentication": "authentication failed",
+                    "context": "context limit exceeded",
+                    "connection": "connection failed",
+                    "model": "model request failed",
+                    "tool": "tool failed",
+                    "runtime": "runtime failed",
+                }
+                self.transcript.error(titles.get(event.category, "model request failed"), event.message[:160])
                 if self.debug:
                     self.transcript.debug(f"[{event.category}] {event.debug_message or event.message}")
             else:
@@ -325,7 +336,10 @@ async def _run_curses(runtime: HansRuntime) -> None:
             raise
 
     async def loop(stdscr) -> None:
-        curses.curs_set(1)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
         stdscr.keypad(True)
         stdscr.nodelay(True)
         decoder = _InputDecoder()

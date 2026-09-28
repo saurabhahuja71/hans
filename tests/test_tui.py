@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from bolt_next.events import (
     AssistantMessageDelta,
     RequestCompleted,
@@ -99,6 +101,13 @@ def test_debug_marker_is_not_in_normal_error() -> None:
         "connection", "Connection error.", debug=True, debug_detail="raw provider response"
     )
     assert "[connection] raw provider response" in debug
+
+
+@pytest.mark.parametrize("category", ("configuration", "authentication", "model"))
+def test_legacy_terminal_uses_concise_semantic_failure_titles(category: str) -> None:
+    rendered = turn_error_message(category, "details", debug=False)
+
+    assert f"✗ {category}" in rendered or "✗ model request failed" in rendered
 
 
 def test_display_exposes_raw_failure_detail_only_in_debug_mode(monkeypatch) -> None:

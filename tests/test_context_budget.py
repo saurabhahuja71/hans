@@ -11,6 +11,7 @@ from bolt_next.context_budget import (
     estimate_tokens,
     fit_model_input,
     request_tokens,
+    tool_result_token_budget,
 )
 from bolt_next.tui import turn_error_message
 from bolt_next.workspace import make_read_file_tool, make_run_command_tool, make_write_file_tool
@@ -91,6 +92,11 @@ def test_filter_keeps_request_inside_budget() -> None:
     assert items[3]["output"] == huge
 
 
+def test_token_estimate_is_conservative_for_source_payloads() -> None:
+    assert estimate_tokens("x" * 3) == 1
+    assert estimate_tokens("x" * 4) == 2
+
+
 def test_context_error_does_not_end_the_session() -> None:
     message = turn_error_message(
         RuntimeError("request (34229 tokens) exceeds the available context size (16384 tokens)")
@@ -127,3 +133,14 @@ def test_runner_does_not_send_the_whole_large_file(tmp_path: Path, monkeypatch: 
     assert result.final_output == "continued after the range"
     assert (tmp_path / "big.py").read_text(encoding="utf-8").endswith("UNIQUE_LAST_LINE\n")
     session.close()
+
+
+def test_large_command_output_including_notice_fits_tool_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BOLT_MODEL_CONTEXT_TOKENS", "1024")
+
+    result = invoke(make_run_command_tool(tmp_path), "{\"command\":\"seq 1 10000\"}")
+
+    assert "command output truncated to fit the context budget" in result
+    assert estimate_tokens(result) <= tool_result_token_budget()

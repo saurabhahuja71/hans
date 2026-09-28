@@ -193,6 +193,12 @@ def test_transcript_resize_and_scroll_position_are_preserved_when_scrolled_up(tm
     asyncio.run(scenario())
 
 
+def test_textual_failure_titles_are_semantic_for_configuration_authentication_and_model() -> None:
+    assert HansTextualApp._failure_title("configuration") == "configuration failed"
+    assert HansTextualApp._failure_title("authentication") == "authentication failed"
+    assert HansTextualApp._failure_title("model") == "model request failed"
+
+
 def test_cancel_and_failure_events_stay_visible(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()
@@ -308,5 +314,23 @@ def test_transcript_retention_and_unicode_reflow(tmp_path: Path) -> None:
             assert rows == ["row 3", "row 4", "日本語 and wide text: 漢字"]
             assert "HANS" in rendered(app.query_one("#hans-header", Static))
             assert isinstance(app.query_one("#composer"), TextArea)
+
+    asyncio.run(scenario())
+
+
+def test_completed_tool_rows_are_bounded_without_losing_active_rows(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        app.MAX_TOOL_ROWS = 2
+        async with app.run_test() as pilot:
+            for number in range(3):
+                call_id = f"tool-{number}"
+                await app._render_event(ToolStarted(call_id, "read_file", f"{number}.txt"))
+                await app._render_event(ToolCompleted(call_id, "read_file", f"{number}.txt", True))
+            await app._render_event(ToolStarted("active", "read_file", "active.txt"))
+            await pilot.pause()
+
+            assert set(app._tool_widgets) == {"tool-1", "tool-2", "active"}
+            assert set(app._tool_text) == {"tool-1", "tool-2", "active"}
 
     asyncio.run(scenario())

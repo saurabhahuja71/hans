@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from bolt_next.errors import FailureCategory
+
 
 @dataclass(frozen=True, slots=True)
 class VerificationEvidence:
@@ -64,7 +66,7 @@ class RequestCompleted:
 
 @dataclass(frozen=True, slots=True)
 class RequestFailed:
-    category: str
+    category: FailureCategory
     message: str
     debug_message: str | None = None
 

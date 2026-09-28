@@ -12,6 +12,8 @@ from copy import deepcopy
 
 from agents.run_config import CallModelData, ModelInputData
 
+from bolt_next.errors import ConfigurationError
+
 DEFAULT_CONTEXT_TOKENS = 16384
 
 
@@ -22,16 +24,25 @@ def context_token_limit() -> int:
     try:
         limit = int(raw)
     except ValueError as exc:
-        raise RuntimeError("BOLT_MODEL_CONTEXT_TOKENS must be an integer") from exc
+        raise ConfigurationError("BOLT_MODEL_CONTEXT_TOKENS must be an integer") from exc
     if limit < 1024:
-        raise RuntimeError("BOLT_MODEL_CONTEXT_TOKENS must be at least 1024")
+        raise ConfigurationError("BOLT_MODEL_CONTEXT_TOKENS must be at least 1024")
     return limit
+
+
+def completion_token_reserve() -> int:
+    return context_token_limit() - max_input_tokens()
 
 
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
-    return (len(text) + 3) // 4
+    # Tool payloads are mostly source code, JSON, and paths. Those tokenize
+    # more densely than ordinary prose, so 4 characters/token is unsafe for
+    # smaller-context deployments. Keep a conservative estimate here; it is a
+    # safety guard, not an attempt to replace the provider's
+    # tokenizer.
+    return (len(text) + 2) // 3
 
 
 def max_input_tokens() -> int:

@@ -95,6 +95,7 @@ class HansTextualApp(App[None]):
     """
 
     MAX_TRANSCRIPT_ROWS = 300
+    MAX_TOOL_ROWS = 100
 
     BINDINGS = [
         Binding("enter", "submit_or_exit", "send", show=False, priority=True),
@@ -115,6 +116,7 @@ class HansTextualApp(App[None]):
         self._assistant_flush_scheduled = False
         self._tool_widgets: dict[str, Static] = {}
         self._tool_text: dict[str, str] = {}
+        self._completed_tool_rows: deque[str] = deque()
         self._transcript_rows: deque[Static] = deque()
         self._verification_failed = False
         self._request_active = False
@@ -169,12 +171,18 @@ class HansTextualApp(App[None]):
 
     @staticmethod
     def _failure_title(category: str) -> str:
+        if category == "configuration":
+            return "configuration failed"
+        if category == "authentication":
+            return "authentication failed"
         if category == "context":
             return "context limit exceeded"
         if category == "connection":
             return "connection failed"
         if category == "tool":
             return "tool failed"
+        if category == "runtime":
+            return "runtime failed"
         return "model request failed"
 
     @staticmethod
@@ -243,6 +251,14 @@ class HansTextualApp(App[None]):
         await tool_area.mount(widget)
         return widget
 
+    async def _trim_completed_tools(self) -> None:
+        while len(self._completed_tool_rows) > self.MAX_TOOL_ROWS:
+            call_id = self._completed_tool_rows.popleft()
+            widget = self._tool_widgets.pop(call_id, None)
+            self._tool_text.pop(call_id, None)
+            if widget is not None:
+                await widget.remove()
+
     async def _render_event(self, event: HansEvent) -> None:
         if isinstance(event, UserMessageSubmitted):
             await self._append_transcript(f"> {event.message}", "user")
@@ -284,6 +300,8 @@ class HansTextualApp(App[None]):
             text = f"{text}\n{mark} {event.name}  {event.detail}{suffix}".rstrip()
             self._tool_text[event.call_id] = text
             widget.update(text)
+            self._completed_tool_rows.append(event.call_id)
+            await self._trim_completed_tools()
             stage = self._tool_stage(event.name, self._verification_failed)
             self._set_status(stage if event.success else f"tool failed: {event.name}")
         elif isinstance(event, VerificationStarted):

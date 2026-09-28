@@ -74,6 +74,22 @@ def test_missing_model_configuration_is_rendered_as_request_failure(
     runtime.close()
 
 
+def test_invalid_local_context_configuration_is_rendered_as_configuration_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BOLT_MODEL_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("BOLT_MODEL_CONTEXT_TOKENS", "invalid")
+    runtime = HansRuntime(session=SQLiteSession("runtime-invalid-context"), workspace=str(tmp_path))
+
+    events = run(collect(runtime, "Say hello."))
+
+    failure = next(event for event in events if isinstance(event, RequestFailed))
+    assert failure.category == "configuration"
+    assert failure.message == "BOLT_MODEL_CONTEXT_TOKENS must be an integer"
+    runtime.close()
+
+
 def test_scripted_model_submission_emits_semantic_lifecycle_and_connection(tmp_path: Path) -> None:
     model = ScriptedModel([ModelStep(output=[assistant_message("hello from HANS")])])
     runtime = HansRuntime(agent=make_agent(model, tmp_path), session=SQLiteSession("runtime-answer"))
@@ -151,6 +167,35 @@ def test_model_failure_becomes_generic_failure_and_disconnection(tmp_path: Path)
     runtime.close()
 
 
+@pytest.mark.parametrize(
+    ("exc", "category"),
+    [
+        (type("AuthError", (RuntimeError,), {"status_code": 401})("denied"), "authentication"),
+        (type("RequestError", (RuntimeError,), {"status": 400})("bad request"), "model"),
+        (TimeoutError("too slow"), "connection"),
+    ],
+)
+def test_runtime_classifies_generic_exception_attributes_without_provider_branches(exc, category) -> None:
+    from bolt_next.runtime import _failure_details
+
+    failure_category, _message, _debug = _failure_details(exc)
+
+    assert failure_category == category
+
+
+def test_runtime_redacts_credentials_from_debug_failure_details() -> None:
+    from bolt_next.runtime import _failure_details
+
+    category, _message, debug = _failure_details(
+        RuntimeError("Authorization: Bearer sk-secret-value-123 api_key=another-secret")
+    )
+
+    assert category == "runtime"
+    assert "sk-secret-value-123" not in debug
+    assert "another-secret" not in debug
+    assert "[REDACTED]" in debug
+
+
 def test_cancel_active_settles_as_request_cancelled() -> None:
     class _Result:
         def __init__(self) -> None:
@@ -185,6 +230,49 @@ def test_cancel_active_settles_as_request_cancelled() -> None:
     assert runner.result.cancelled
     assert isinstance(events[-1], RequestCancelled)
     assert not any(isinstance(event, RequestCompleted) for event in events)
+
+
+def test_cancel_active_interrupts_a_noncooperative_stream_and_allows_next_request() -> None:
+    class _BlockedResult:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+        async def stream_events(self):
+            await asyncio.Event().wait()
+            yield None
+
+    class _CompletedResult:
+        def cancel(self) -> None:
+            pass
+
+        async def stream_events(self):
+            return
+            yield None
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.results = [_BlockedResult(), _CompletedResult()]
+
+        def run_streamed(self, *_args, **_kwargs):
+            return self.results.pop(0)
+
+    async def scenario():
+        runner = _Runner()
+        runtime = HansRuntime(agent=object(), session=object(), runner=runner)
+        blocked = asyncio.create_task(collect(runtime, "Wait."))
+        await asyncio.sleep(0.01)
+        runtime.cancel_active()
+        cancelled_events = await asyncio.wait_for(blocked, timeout=1)
+        follow_up_events = await asyncio.wait_for(collect(runtime, "Continue."), timeout=1)
+        return cancelled_events, follow_up_events
+
+    cancelled_events, follow_up_events = run(scenario())
+    assert sum(isinstance(event, RequestCancelled) for event in cancelled_events) == 1
+    assert not any(isinstance(event, RequestCompleted) for event in cancelled_events)
+    assert any(isinstance(event, RequestCompleted) for event in follow_up_events)
 
 
 def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Iterable
@@ -13,6 +14,7 @@ from agents.run_config import RunConfig
 
 from bolt_next.agent import create_agent
 from bolt_next.context_budget import fit_model_input
+from bolt_next.errors import ConfigurationError, FailureCategory
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
@@ -95,20 +97,57 @@ def _verification_evidence(command: str, output: str) -> VerificationEvidence:
     )
 
 
-def _failure_details(exc: BaseException) -> tuple[str, str, str]:
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)([^\s,;]+)"),
+    re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[:=]\s*[\"']?)([^\s,;\"']+)"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+)
+
+
+def _debug_detail(exc: BaseException) -> str:
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else "request failed"
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups >= 2:
+            text = pattern.sub(r"\1[REDACTED]", text)
+        else:
+            text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def _status_code(exc: BaseException) -> int | None:
+    for name in ("status_code", "status"):
+        value = getattr(exc, name, None)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _failure_details(exc: BaseException) -> tuple[FailureCategory, str, str]:
+    text = _debug_detail(exc)
     lowered = text.lower()
-    if "set bolt_model_base_url" in lowered or "set bolt_model_api_key" in lowered:
-        return "configuration", text, text
-    if "context" in lowered or "exceed_context" in lowered:
+    type_name = type(exc).__name__.lower()
+    status = _status_code(exc)
+    if isinstance(exc, ConfigurationError) or "bolt_model_" in lowered:
+        return FailureCategory.CONFIGURATION, text, text
+    if status in {401, 403} or "auth" in type_name or "unauthorized" in lowered or "forbidden" in lowered:
+        return FailureCategory.AUTHENTICATION, "authentication with the configured model endpoint failed", text
+    if "context" in lowered or "token limit" in lowered or "exceed_context" in lowered:
         return (
-            "context",
+            FailureCategory.CONTEXT,
             "context budget exceeded; the session is still open. Request a smaller file range.",
             text,
         )
-    if "connection" in lowered or "tunnel" in lowered:
-        return "connection", "connection to the configured model endpoint failed", text
-    return "runtime", "model request failed", text
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)) or "timeout" in type_name or "connection" in type_name:
+        return FailureCategory.CONNECTION, "connection to the configured model endpoint failed", text
+    if "connection" in lowered or "tunnel" in lowered or "timed out" in lowered:
+        return FailureCategory.CONNECTION, "connection to the configured model endpoint failed", text
+    if "tool" in type_name or "tool" in lowered:
+        return FailureCategory.TOOL, "a tool operation failed", text
+    if status is not None or "request" in type_name or "model" in type_name:
+        return FailureCategory.MODEL, "the model request failed", text
+    return FailureCategory.RUNTIME, "an internal runtime error occurred", text
 
 
 class HansRuntime:
@@ -133,6 +172,7 @@ class HansRuntime:
         self._owns_session = session is None
         self._runner = runner
         self._active_result: Any | None = None
+        self._stream_waiter: asyncio.Future[Any] | None = None
         self._cancel_requested = False
         self._tool_calls: dict[str, _ToolCall] = {}
         self._evidence: VerificationEvidence | None = None
@@ -142,6 +182,8 @@ class HansRuntime:
         self._cancel_requested = True
         if self._active_result is not None:
             self._active_result.cancel()
+        if self._stream_waiter is not None:
+            self._stream_waiter.cancel()
 
     def close(self) -> None:
         if self._owns_session and self._session is not None:
@@ -167,7 +209,15 @@ class HansRuntime:
                 run_config=run_config(),
             )
             self._active_result = result
-            async for stream_event in result.stream_events():
+            stream = result.stream_events().__aiter__()
+            while True:
+                self._stream_waiter = asyncio.ensure_future(anext(stream))
+                try:
+                    stream_event = await self._stream_waiter
+                except StopAsyncIteration:
+                    break
+                finally:
+                    self._stream_waiter = None
                 for event in self.translate_stream_event(stream_event):
                     yield event
             if self._cancel_requested:
