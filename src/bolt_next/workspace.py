@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import hashlib
 import os
 import shlex
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from agents import function_tool
@@ -15,6 +18,213 @@ from bolt_next.context_budget import estimate_tokens, tool_result_token_budget
 
 class WorkspaceError(ValueError):
     """An attempted workspace access was invalid."""
+
+
+@dataclass(frozen=True)
+class _OriginalFileSnapshot:
+    existed: bool
+    content: bytes | None
+    mode: int | None
+    had_git_worktree_change: bool | None
+
+
+@dataclass(frozen=True)
+class _ExpectedFileState:
+    digest: str
+    mode: int
+    content: bytes
+
+
+@dataclass
+class _JournalEntry:
+    original: _OriginalFileSnapshot
+    expected: _ExpectedFileState
+
+
+class TaskMutationJournal:
+    """Tracks filesystem mutations made while handling one task."""
+
+    def __init__(self, workspace: Path, *, max_diff_chars: int = 12_000) -> None:
+        self.workspace = resolve_workspace(workspace)
+        self.max_diff_chars = max_diff_chars
+        self._entries: dict[str, _JournalEntry] = {}
+
+    def begin_task(self) -> None:
+        self.reset_task()
+
+    def reset_task(self) -> None:
+        self._entries.clear()
+
+    def prepare_mutation(self, path: Path) -> _OriginalFileSnapshot:
+        target = path.resolve()
+        relative = target.relative_to(self.workspace).as_posix()
+        existing = self._entries.get(relative)
+        if existing is not None:
+            return existing.original
+        if target.exists():
+            if not target.is_file():
+                raise WorkspaceError(f"Path is not a file: {relative}")
+            stat = target.stat()
+            return _OriginalFileSnapshot(
+                existed=True,
+                content=target.read_bytes(),
+                mode=stat.st_mode & 0o7777,
+                had_git_worktree_change=self._git_path_is_changed(relative),
+            )
+        return _OriginalFileSnapshot(
+            existed=False,
+            content=None,
+            mode=None,
+            had_git_worktree_change=False,
+        )
+
+    def record_successful_mutation(self, path: Path, original: _OriginalFileSnapshot) -> None:
+        target = path.resolve()
+        relative = target.relative_to(self.workspace).as_posix()
+        if not target.is_file():
+            raise WorkspaceError(f"Path is not a file: {relative}")
+        stat = target.stat()
+        content = target.read_bytes()
+        expected = _ExpectedFileState(
+            digest=hashlib.sha256(content).hexdigest(),
+            mode=stat.st_mode & 0o7777,
+            content=content,
+        )
+        self._entries.setdefault(relative, _JournalEntry(original=original, expected=expected)).expected = expected
+
+    def summary(self) -> dict[str, object]:
+        entries = list(self._entries.items())
+        git_available = any(entry.original.had_git_worktree_change is not None for _, entry in entries)
+        return {
+            "changed_files": [path for path, _ in entries],
+            "created_files": [path for path, entry in entries if not entry.original.existed],
+            "preexisting_git_worktree_changes": [
+                path for path, entry in entries if entry.original.had_git_worktree_change
+            ],
+            "git_available": git_available,
+        }
+
+    def compact_summary(self) -> str:
+        summary = self.summary()
+        changed = ", ".join(summary["changed_files"]) or "none"
+        created = ", ".join(summary["created_files"]) or "none"
+        git_changed = ", ".join(summary["preexisting_git_worktree_changes"]) or "none"
+        git_state = "available" if summary["git_available"] else "unavailable"
+        return (
+            f"changed_files: {changed}\ncreated_files: {created}\n"
+            f"preexisting_git_worktree_changes: {git_changed}\ngit: {git_state}"
+        )
+
+    def unified_diff(self, *, max_chars: int | None = None) -> str:
+        limit = self.max_diff_chars if max_chars is None else max_chars
+        parts: list[str] = []
+        for relative, entry in self._entries.items():
+            current = entry.expected.content
+            before = entry.original.content if entry.original.existed else b""
+            try:
+                before_text = before.decode("utf-8").splitlines(keepends=True)
+                current_text = current.decode("utf-8").splitlines(keepends=True)
+            except UnicodeDecodeError:
+                if before != current:
+                    parts.append(f"Binary files differ: {relative}")
+                continue
+            parts.extend(
+                difflib.unified_diff(
+                    before_text,
+                    current_text,
+                    fromfile=f"a/{relative}",
+                    tofile=f"b/{relative}",
+                )
+            )
+        result = "".join(parts)
+        if len(result) <= limit:
+            return result
+        notice = "\n... HANS-only diff truncated.\n"
+        return result[: max(0, limit - len(notice))] + notice
+
+    def undo(self) -> dict[str, list[str]]:
+        conflicts: list[str] = []
+        for relative, entry in self._entries.items():
+            target = self.workspace / relative
+            if not self._matches_expected(target, entry.expected):
+                conflicts.append(relative)
+        if conflicts:
+            return {"restored": [], "removed": [], "conflicts": conflicts}
+
+        restored: list[str] = []
+        removed: list[str] = []
+        for relative, entry in self._entries.items():
+            target = self.workspace / relative
+            if entry.original.existed:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(entry.original.content or b"")
+                os.chmod(target, entry.original.mode or 0)
+                restored.append(relative)
+            else:
+                target.unlink()
+                removed.append(relative)
+        return {"restored": restored, "removed": removed, "conflicts": []}
+
+    def _matches_expected(self, target: Path, expected: _ExpectedFileState) -> bool:
+        try:
+            target.resolve().relative_to(self.workspace)
+        except (OSError, ValueError):
+            return False
+        if target.is_symlink() or not target.is_file():
+            return False
+        stat = target.stat()
+        return (
+            hashlib.sha256(target.read_bytes()).hexdigest() == expected.digest
+            and (stat.st_mode & 0o7777) == expected.mode
+        )
+
+    def _git_path_is_changed(self, relative: str) -> bool | None:
+        try:
+            inside = subprocess.run(
+                ["git", "-C", str(self.workspace), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if inside.returncode != 0 or inside.stdout.strip() != "true":
+                return None
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.workspace),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--",
+                    relative,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if status.returncode != 0 or len(status.stdout) > 8_192:
+                return None
+            return bool(status.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+
+def _prepare_journal_mutation(journal: object | None, target: Path) -> object | None:
+    if journal is None:
+        return None
+    prepare = getattr(journal, "prepare_mutation", None)
+    return prepare(target) if callable(prepare) else None
+
+
+def _record_journal_mutation(journal: object | None, target: Path, original: object | None) -> None:
+    if journal is None:
+        return
+    record = getattr(journal, "record_successful_mutation", None)
+    if callable(record):
+        record(target, original)
 
 
 def resolve_workspace(path: str | Path | None = None) -> Path:
@@ -145,7 +355,7 @@ def make_read_file_tool(workspace: Path):
     return read_file
 
 
-def make_write_file_tool(workspace: Path):
+def make_write_file_tool(workspace: Path, journal: object | None = None):
     @function_tool
     async def write_file(path: str, content: str) -> str:
         """Create or replace a UTF-8 text file inside the workspace.
@@ -156,10 +366,12 @@ def make_write_file_tool(workspace: Path):
         """
         try:
             target = resolve_workspace_path(workspace, path)
+            original = _prepare_journal_mutation(journal, target)
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.parent.resolve().is_relative_to(workspace):
                 return f"Error writing {path!r}: Path is outside the workspace"
             target.write_text(content, encoding="utf-8")
+            _record_journal_mutation(journal, target, original)
             return f"Wrote {path} ({len(content.encode('utf-8'))} bytes)"
         except (OSError, UnicodeError, WorkspaceError) as exc:
             return f"Error writing {path!r}: {exc}"
@@ -321,7 +533,7 @@ def make_search_files_tool(workspace: Path):
     return search_files
 
 
-def make_replace_in_file_tool(workspace: Path):
+def make_replace_in_file_tool(workspace: Path, journal: object | None = None):
     @function_tool
     async def replace_in_file(path: str, old_text: str, new_text: str) -> str:
         """Replace exactly one literal text occurrence in an existing UTF-8 workspace file.
@@ -337,6 +549,7 @@ def make_replace_in_file_tool(workspace: Path):
             target = resolve_workspace_path(workspace, path)
             if not target.is_file():
                 return f"Error replacing {path!r}: file does not exist"
+            original = _prepare_journal_mutation(journal, target)
             source_stat = target.stat()
             text = target.read_text(encoding="utf-8")
             occurrences = text.count(old_text)
@@ -362,6 +575,7 @@ def make_replace_in_file_tool(workspace: Path):
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
+            _record_journal_mutation(journal, target, original)
             return f"Replaced text in {path}"
         except (OSError, UnicodeError, WorkspaceError) as exc:
             return f"Error replacing {path!r}: {exc}"

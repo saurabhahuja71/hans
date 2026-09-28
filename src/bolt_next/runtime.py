@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from agents.run_config import RunConfig
 from bolt_next.agent import create_agent
 from bolt_next.context_budget import fit_model_input
 from bolt_next.errors import ConfigurationError, FailureCategory
+from bolt_next.workspace import TaskMutationJournal, resolve_workspace
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
@@ -24,6 +26,10 @@ from bolt_next.events import (
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    TaskChangeSummary,
+    TaskDiff,
+    TaskUndoRefused,
+    TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -184,7 +190,8 @@ class HansRuntime:
         # error is then rendered as a normal request failure instead of a
         # Python traceback before the user sees HANS.
         self._agent = agent
-        self._workspace = workspace
+        self._workspace = resolve_workspace(workspace or os.environ.get("BOLT_WORKSPACE"))
+        self._journal = TaskMutationJournal(self._workspace)
         self._session = session if session is not None else SQLiteSession("hans-tui")
         self._owns_session = session is None
         self._runner = runner
@@ -207,10 +214,31 @@ class HansRuntime:
             self._session.close()
             self._session = None
 
+    def task_diff(self, *, max_chars: int | None = None) -> TaskDiff:
+        return TaskDiff(self._journal.unified_diff(max_chars=max_chars))
+
+    def undo_task(self) -> TaskUndoSucceeded | TaskUndoRefused:
+        outcome = self._journal.undo()
+        conflicts = tuple(outcome["conflicts"])
+        if conflicts:
+            return TaskUndoRefused(conflicts)
+        restored = tuple(outcome["restored"])
+        removed = tuple(outcome["removed"])
+        if restored or removed:
+            self._evidence = None
+        return TaskUndoSucceeded(restored, removed)
+
+    def _task_change_summary(self) -> TaskChangeSummary | None:
+        summary = self._journal.summary()
+        if not summary["changed_files"]:
+            return None
+        return TaskChangeSummary(self._journal.compact_summary())
+
     async def submit(self, message: str) -> AsyncIterator[HansEvent]:
         if self._active_result is not None:
             raise RuntimeError("a request is already active")
         self._cancel_requested = False
+        self._journal.begin_task()
         self._tool_calls = {}
         self._evidence = None
         self._assistant_text = []
@@ -218,7 +246,7 @@ class HansRuntime:
         yield RequestStarted(message)
         try:
             if self._agent is None:
-                self._agent = create_agent(self._workspace)
+                self._agent = create_agent(self._workspace, journal=self._journal)
             result = self._runner.run_streamed(
                 self._agent,
                 message,
@@ -239,19 +267,34 @@ class HansRuntime:
                     yield event
             if self._cancel_requested:
                 yield RequestCancelled()
+                summary = self._task_change_summary()
+                if summary is not None:
+                    yield summary
             else:
                 yield AssistantMessageComplete("".join(self._assistant_text))
                 yield RequestCompleted(self._evidence)
+                summary = self._task_change_summary()
+                if summary is not None:
+                    yield summary
                 yield ConnectionChanged(True)
         except asyncio.CancelledError:
             self.cancel_active()
             yield RequestCancelled()
+            summary = self._task_change_summary()
+            if summary is not None:
+                yield summary
         except Exception as exc:
             if self._cancel_requested:
                 yield RequestCancelled()
+                summary = self._task_change_summary()
+                if summary is not None:
+                    yield summary
             else:
                 category, detail, debug_message = _failure_details(exc)
                 yield RequestFailed(category, detail, debug_message)
+                summary = self._task_change_summary()
+                if summary is not None:
+                    yield summary
                 yield ConnectionChanged(False)
         finally:
             self._active_result = None

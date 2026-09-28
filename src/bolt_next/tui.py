@@ -15,6 +15,10 @@ from bolt_next.events import (
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    TaskChangeSummary,
+    TaskDiff,
+    TaskUndoRefused,
+    TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -27,7 +31,8 @@ from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import Editor, Transcript, is_exit_command, layout_rows, visible_transcript
 
 
-FOOTER = "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
+FOOTER = "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q exit"
+TASK_DIFF_MAX_CHARS = 4_000
 
 
 def debug_enabled() -> bool:
@@ -197,6 +202,34 @@ class _Display:
                     ),
                     flush=True,
                 )
+        elif isinstance(event, TaskChangeSummary):
+            if self.transcript is not None:
+                self.transcript.tool_started(f"changes: {event.summary}")
+            else:
+                print(f"\nchanges: {event.summary}", flush=True)
+        elif isinstance(event, TaskDiff):
+            diff = event.diff or "(no HANS task changes)"
+            if self.transcript is not None:
+                self.transcript.tool_started(f"task diff\n{diff}")
+            else:
+                print(f"\ntask diff\n{diff}", flush=True)
+        elif isinstance(event, TaskUndoSucceeded):
+            details = []
+            if event.restored_files:
+                details.append("restored: " + ", ".join(event.restored_files))
+            if event.removed_files:
+                details.append("removed: " + ", ".join(event.removed_files))
+            label = "undo completed" + (f" ({'; '.join(details)})" if details else " (no task changes)")
+            if self.transcript is not None:
+                self.transcript.tool_finished(label, ok=True)
+            else:
+                print(f"\n✓ {label}", flush=True)
+        elif isinstance(event, TaskUndoRefused):
+            conflicts = ", ".join(event.conflicting_files) or "task changes"
+            if self.transcript is not None:
+                self.transcript.error("undo refused", f"conflicts: {conflicts}")
+            else:
+                print(f"\n✗ undo refused: conflicts: {conflicts}", flush=True)
         elif isinstance(event, ConnectionChanged) and self.on_connection is not None:
             self.on_connection(event.connected)
         elif isinstance(event, AssistantMessageComplete):
@@ -300,6 +333,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
     transcript = Transcript()
     editor = Editor()
     state = {"connected": False, "task": None, "cancel": False}
+    state["display"] = _Display(transcript, lambda connected: state.__setitem__("connected", connected))
 
     def request_cancel(*_args) -> None:
         state["cancel"] = True
@@ -331,9 +365,8 @@ async def _run_curses(runtime: HansRuntime) -> None:
         stdscr.refresh()
 
     async def run_prompt(prompt: str) -> None:
-        display = _Display(transcript, lambda connected: state.__setitem__("connected", connected))
         try:
-            await _run_turn(runtime, prompt, display)
+            await _run_turn(runtime, prompt, state["display"])
         except asyncio.CancelledError:
             runtime.cancel_active()
             raise
@@ -374,6 +407,12 @@ async def _run_curses(runtime: HansRuntime) -> None:
                     elif name == "ctrl-q":
                         request_cancel()
                         return
+                    continue
+                if name == "ctrl-g":
+                    state["display"].event(runtime.task_diff(max_chars=TASK_DIFF_MAX_CHARS))
+                    continue
+                if name == "ctrl-z":
+                    state["display"].event(runtime.undo_task())
                     continue
                 submitted = editor.on_key(name)
                 if submitted is None:
@@ -467,6 +506,10 @@ def _key_name(key) -> str | None:
         return "ctrl-c"
     if key in {4, "\x04"}:
         return "ctrl-d"
+    if key in {7, "\x07"}:
+        return "ctrl-g"
+    if key in {26, "\x1a"}:
+        return "ctrl-z"
     if key in {17, "\x11"}:
         return "ctrl-q"
     if key in {"\n", "\r", 10}:

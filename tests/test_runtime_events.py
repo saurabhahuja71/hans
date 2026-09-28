@@ -17,6 +17,10 @@ from bolt_next.events import (
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    TaskChangeSummary,
+    TaskDiff,
+    TaskUndoRefused,
+    TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -25,6 +29,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
+import bolt_next.runtime as runtime_module
 from bolt_next.runtime import HansRuntime
 from bolt_next.workspace import (
     make_list_directory_tool,
@@ -222,6 +227,46 @@ def test_successful_replacement_invalidates_prior_verification_evidence(tmp_path
     assert (tmp_path / "fixed.txt").read_text(encoding="utf-8") == "after"
     completed = next(event for event in events if isinstance(event, RequestCompleted))
     assert completed.evidence is None
+    runtime.close()
+
+
+def test_runtime_reports_journal_changes_and_exposes_safe_undo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("write_file", {"path": "task.txt", "content": "changed"}, call_id="write-1")]),
+            ModelStep(
+                output=[function_call("run_command", {"command": "printf VERIFIED", "purpose": "verify"}, call_id="verify-1")]
+            ),
+            ModelStep(output=[assistant_message("Changed and verified.")]),
+        ]
+    )
+
+    def fake_create_agent(workspace: Path, *, journal: object) -> Agent:
+        return Agent(
+            name="journal test agent",
+            instructions="Use the provided tools.",
+            model=model,
+            tools=[make_write_file_tool(workspace, journal), make_run_command_tool(workspace)],
+        )
+
+    monkeypatch.setattr(runtime_module, "create_agent", fake_create_agent)
+    runtime = HansRuntime(workspace=str(tmp_path), session=SQLiteSession("runtime-journal"))
+
+    events = run(collect(runtime, "Change and verify."))
+
+    summary = next(event for event in events if isinstance(event, TaskChangeSummary))
+    assert "changed_files: task.txt" in summary.summary
+    diff = runtime.task_diff(max_chars=100)
+    assert isinstance(diff, TaskDiff)
+    assert "+++ b/task.txt" in diff.diff
+    completed = next(event for event in events if isinstance(event, RequestCompleted))
+    assert completed.evidence is not None and completed.evidence.success
+    assert runtime.undo_task() == TaskUndoSucceeded((), ("task.txt",))
+    assert not (tmp_path / "task.txt").exists()
+    assert runtime._evidence is None
+    assert runtime.undo_task() == TaskUndoRefused(("task.txt",))
     runtime.close()
 
 

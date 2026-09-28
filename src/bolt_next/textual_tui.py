@@ -25,6 +25,10 @@ from bolt_next.events import (
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    TaskChangeSummary,
+    TaskDiff,
+    TaskUndoRefused,
+    TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -40,6 +44,10 @@ class Runtime(Protocol):
     def submit(self, message: str) -> AsyncIterator[HansEvent]: ...
 
     def cancel_active(self) -> None: ...
+
+    def task_diff(self, *, max_chars: int | None = None) -> TaskDiff: ...
+
+    def undo_task(self) -> TaskUndoSucceeded | TaskUndoRefused: ...
 
     def close(self) -> None: ...
 
@@ -97,12 +105,15 @@ class HansTextualApp(App[None]):
     MAX_TRANSCRIPT_ROWS = 300
     MAX_TOOL_ROWS = 100
     MAX_TOOL_OUTPUT_CHARS = 4_000
+    MAX_TASK_DIFF_CHARS = 4_000
 
     BINDINGS = [
         Binding("enter", "submit_or_exit", "send", show=False, priority=True),
         Binding("shift+enter", "insert_newline", "newline", show=False, priority=True),
         Binding("ctrl+d", "submit_or_exit", "send", show=False),
         Binding("ctrl+c", "cancel_active", "cancel", show=False),
+        Binding("ctrl+g", "show_task_diff", "diff", show=False),
+        Binding("ctrl+z", "undo_task", "undo", show=False),
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
@@ -129,7 +140,10 @@ class HansTextualApp(App[None]):
         yield VerticalScroll(id="transcript")
         yield VerticalScroll(Static("tools", classes="tool"), id="tool-area")
         yield Static("ready", id="status")
-        yield Static("Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit", id="controls")
+        yield Static(
+            "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q exit",
+            id="controls",
+        )
         yield TextArea("", id="composer")
 
     def on_mount(self) -> None:
@@ -139,6 +153,8 @@ class HansTextualApp(App[None]):
         actions = {
             "ctrl+d": self.action_submit_or_exit,
             "ctrl+c": self.action_cancel_active,
+            "ctrl+g": self.action_show_task_diff,
+            "ctrl+z": self.action_undo_task,
             "ctrl+q": self.action_exit_app,
         }
         action = actions.get(event.key)
@@ -345,6 +361,25 @@ class HansTextualApp(App[None]):
             await self._append_transcript(f"✗ {title}\n{event.message}", "error")
             if self._debug_enabled() and event.debug_message:
                 await self._append_transcript(f"debug ({event.category}): {event.debug_message}", "debug")
+        elif isinstance(event, TaskChangeSummary):
+            await self._append_transcript(f"changes: {event.summary}", "tool")
+        elif isinstance(event, TaskDiff):
+            diff = event.diff or "(no HANS task changes)"
+            await self._append_transcript(f"task diff\n{diff}", "tool")
+        elif isinstance(event, TaskUndoSucceeded):
+            details = ["undo completed"]
+            if event.restored_files:
+                details.append("restored: " + ", ".join(event.restored_files))
+            if event.removed_files:
+                details.append("removed: " + ", ".join(event.removed_files))
+            if len(details) == 1:
+                details[0] += " (no task changes)"
+            self._set_status("undo completed")
+            await self._append_transcript("\n".join(details), "tool")
+        elif isinstance(event, TaskUndoRefused):
+            conflicts = ", ".join(event.conflicting_files) or "task changes"
+            self._set_status("undo refused")
+            await self._append_transcript(f"✗ undo refused\nconflicts: {conflicts}", "error")
         elif isinstance(event, ConnectionChanged):
             self.query_one("#hans-header", Static).update(self._header_text(event.connected))
 
@@ -371,11 +406,23 @@ class HansTextualApp(App[None]):
         else:
             self.query_one("#composer", TextArea).text = ""
 
+    def action_show_task_diff(self) -> None:
+        if not self._request_active:
+            self._render_task_event(self.runtime.task_diff(max_chars=self.MAX_TASK_DIFF_CHARS))
+
+    def action_undo_task(self) -> None:
+        if not self._request_active:
+            self._render_task_event(self.runtime.undo_task())
+
     def action_exit_app(self) -> None:
         if self._request_active:
             self.runtime.cancel_active()
         self._close_runtime()
         self.exit()
+
+    @work(exclusive=False)
+    async def _render_task_event(self, event: TaskDiff | TaskUndoSucceeded | TaskUndoRefused) -> None:
+        await self._render_event(event)
 
     @work(exclusive=True)
     async def _submit(self, prompt: str) -> None:

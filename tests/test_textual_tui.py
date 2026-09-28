@@ -15,6 +15,10 @@ from bolt_next.events import (
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    TaskChangeSummary,
+    TaskDiff,
+    TaskUndoRefused,
+    TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -33,6 +37,10 @@ class FakeRuntime:
         self.prompts: list[str] = []
         self.cancelled = 0
         self.closed = 0
+        self.task_diff_calls: list[int | None] = []
+        self.undo_calls = 0
+        self.diff_event = TaskDiff("--- a/task.txt\n+++ b/task.txt\n+updated")
+        self.undo_event: TaskUndoSucceeded | TaskUndoRefused = TaskUndoSucceeded((), ())
 
     async def submit(self, message: str) -> AsyncIterator[object]:
         self.prompts.append(message)
@@ -42,6 +50,14 @@ class FakeRuntime:
 
     def cancel_active(self) -> None:
         self.cancelled += 1
+
+    def task_diff(self, *, max_chars: int | None = None) -> TaskDiff:
+        self.task_diff_calls.append(max_chars)
+        return self.diff_event
+
+    def undo_task(self) -> TaskUndoSucceeded | TaskUndoRefused:
+        self.undo_calls += 1
+        return self.undo_event
 
     def close(self) -> None:
         self.closed += 1
@@ -59,9 +75,7 @@ def test_textual_shell_submits_on_enter_and_inserts_newlines_with_shift_enter(tm
             assert "HANS" in rendered(app.query_one("#hans-header", Static))
             assert isinstance(app.query_one("#transcript"), VerticalScroll)
             assert isinstance(app.query_one("#tool-area"), VerticalScroll)
-            assert "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit" == rendered(
-                app.query_one("#controls", Static)
-            )
+            assert "Ctrl-G diff · Ctrl-Z undo" in rendered(app.query_one("#controls", Static))
             composer = app.query_one("#composer", TextArea)
 
             await pilot.press("h", "i", "enter")
@@ -162,6 +176,40 @@ def test_textual_shell_renders_events_without_duplicate_assistant_or_tool_rows(t
             assert "exit 0" in tool_b
             assert "completed" == rendered(app.query_one("#status", Static))
             assert "connected" in rendered(app.query_one("#hans-header", Static))
+
+    asyncio.run(scenario())
+
+
+def test_textual_renders_task_events_and_idle_diff_undo_controls(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.undo_event = TaskUndoSucceeded(("existing.py",), ("new.py",))
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(TaskChangeSummary("changed_files: existing.py, new.py"))
+            await app._render_event(TaskDiff("--- a/existing.py\n+++ b/existing.py\n+updated"))
+            await app._render_event(TaskUndoRefused(("changed.py",)))
+            await pilot.press("ctrl+g", "ctrl+z")
+            await pilot.pause()
+
+            transcript = app.query_one("#transcript", VerticalScroll)
+            text = "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
+            assert "changes: changed_files: existing.py, new.py" in text
+            assert "task diff" in text
+            assert "+++ b/existing.py" in text
+            assert "undo refused" in text
+            assert "conflicts: changed.py" in text
+            assert "undo completed" in text
+            assert "restored: existing.py" in text
+            assert "removed: new.py" in text
+            assert runtime.task_diff_calls == [app.MAX_TASK_DIFF_CHARS]
+            assert runtime.undo_calls == 1
+
+            app._request_active = True
+            await pilot.press("ctrl+g", "ctrl+z")
+            await pilot.pause()
+            assert runtime.task_diff_calls == [app.MAX_TASK_DIFF_CHARS]
+            assert runtime.undo_calls == 1
 
     asyncio.run(scenario())
 

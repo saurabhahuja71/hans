@@ -1,9 +1,11 @@
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from bolt_next.context_budget import estimate_tokens, tool_result_token_budget
 from bolt_next.workspace import (
+    TaskMutationJournal,
     WorkspaceError,
     _bounded_lines,
     make_list_directory_tool,
@@ -276,3 +278,72 @@ def test_symlink_outside_workspace_rejected(tmp_path: Path) -> None:
     (tmp_path / "link.txt").symlink_to(outside)
     with pytest.raises(WorkspaceError):
         resolve_workspace_path(tmp_path, "link.txt")
+
+
+def test_mutation_journal_tracks_original_once_across_write_and_replace(tmp_path: Path) -> None:
+    target = tmp_path / "main.py"
+    target.write_bytes(b"before\nold\n")
+    target.chmod(0o751)
+    journal = TaskMutationJournal(tmp_path)
+
+    assert "Wrote main.py" in invoke(
+        make_write_file_tool(tmp_path, journal), '{"path":"main.py","content":"intermediate\\nold\\n"}'
+    )
+    assert invoke(
+        make_replace_in_file_tool(tmp_path, journal),
+        '{"path":"main.py","old_text":"old","new_text":"new"}',
+    ) == "Replaced text in main.py"
+
+    assert journal.summary() == {
+        "changed_files": ["main.py"],
+        "created_files": [],
+        "preexisting_git_worktree_changes": [],
+        "git_available": False,
+    }
+    assert "-before\n" in journal.unified_diff()
+    assert "+intermediate\n" in journal.unified_diff()
+    assert "+new\n" in journal.unified_diff()
+    assert journal.undo() == {"restored": ["main.py"], "removed": [], "conflicts": []}
+    assert target.read_bytes() == b"before\nold\n"
+    assert target.stat().st_mode & 0o7777 == 0o751
+
+
+def test_mutation_journal_removes_created_files_and_resets(tmp_path: Path) -> None:
+    journal = TaskMutationJournal(tmp_path)
+    assert "Wrote nested/new.txt" in invoke(
+        make_write_file_tool(tmp_path, journal), '{"path":"nested/new.txt","content":"created"}'
+    )
+    assert journal.summary()["created_files"] == ["nested/new.txt"]
+    assert journal.undo() == {"restored": [], "removed": ["nested/new.txt"], "conflicts": []}
+    assert not (tmp_path / "nested" / "new.txt").exists()
+
+    journal.begin_task()
+    assert journal.summary()["changed_files"] == []
+
+
+def test_mutation_journal_refuses_undo_after_external_change(tmp_path: Path) -> None:
+    journal = TaskMutationJournal(tmp_path)
+    tool = make_write_file_tool(tmp_path, journal)
+    invoke(tool, '{"path":"note.txt","content":"by HANS"}')
+    (tmp_path / "note.txt").write_text("external", encoding="utf-8")
+
+    assert journal.undo() == {"restored": [], "removed": [], "conflicts": ["note.txt"]}
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "external"
+
+
+def test_mutation_journal_reports_git_state_and_bounds_hans_only_diff(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "tracked-later.txt").write_text("original\n", encoding="utf-8")
+    journal = TaskMutationJournal(tmp_path, max_diff_chars=90)
+    invoke(
+        make_write_file_tool(tmp_path, journal),
+        json.dumps({"path": "tracked-later.txt", "content": "changed " + "x" * 1_000}),
+    )
+
+    summary = journal.summary()
+    assert summary["git_available"] is True
+    assert summary["preexisting_git_worktree_changes"] == ["tracked-later.txt"]
+    diff = journal.unified_diff()
+    assert len(diff) <= 90
+    assert "HANS-only diff truncated" in diff
+    assert diff.startswith("--- a/tracked-later.txt")

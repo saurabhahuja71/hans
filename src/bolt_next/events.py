@@ -100,6 +100,27 @@ class ConnectionChanged:
     connected: bool
 
 
+@dataclass(frozen=True, slots=True)
+class TaskChangeSummary:
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDiff:
+    diff: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskUndoSucceeded:
+    restored_files: tuple[str, ...]
+    removed_files: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskUndoRefused:
+    conflicting_files: tuple[str, ...]
+
+
 HansEvent = (
     UserMessageSubmitted
     | AssistantMessageDelta
@@ -115,4 +136,8 @@ HansEvent = (
     | VerificationPassed
     | VerificationFailed
     | ConnectionChanged
+    | TaskChangeSummary
+    | TaskDiff
+    | TaskUndoSucceeded
+    | TaskUndoRefused
 )

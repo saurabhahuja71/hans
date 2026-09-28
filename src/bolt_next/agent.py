@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 from bolt_next.context_budget import completion_token_reserve
 from bolt_next.errors import ConfigurationError
 from bolt_next.workspace import (
+    TaskMutationJournal,
     make_list_directory_tool,
     make_read_file_tool,
     make_replace_in_file_tool,
@@ -92,7 +93,7 @@ def _configured_max_retries() -> int:
     return retries
 
 
-def create_agent(workspace: str | Path | None = None) -> Agent:
+def create_agent(workspace: str | Path | None = None, *, journal: TaskMutationJournal | None = None) -> Agent:
     """Build the Hans agent using the configured OpenAI-compatible endpoint."""
     base_url = _configured_value("BOLT_MODEL_BASE_URL", required=True)
     api_key = _configured_value("BOLT_MODEL_API_KEY", required=True)
@@ -123,8 +124,8 @@ def create_agent(workspace: str | Path | None = None) -> Agent:
             make_list_directory_tool(root),
             make_search_files_tool(root),
             make_read_file_tool(root),
-            make_replace_in_file_tool(root),
-            make_write_file_tool(root),
+            make_replace_in_file_tool(root, journal),
+            make_write_file_tool(root, journal),
             make_run_command_tool(root),
         ],
     )

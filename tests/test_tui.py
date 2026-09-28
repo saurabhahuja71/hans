@@ -7,6 +7,10 @@ from bolt_next.events import (
     AssistantMessageDelta,
     RequestCompleted,
     RequestFailed,
+    TaskChangeSummary,
+    TaskDiff,
+    TaskUndoRefused,
+    TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -63,7 +67,7 @@ def test_one_pasted_block_is_one_message_and_then_stop() -> None:
 
 
 def test_footer_lists_the_real_controls() -> None:
-    assert FOOTER == "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-Q exit"
+    assert FOOTER == "Enter send · Shift+Enter newline · Ctrl-D send · Ctrl-C cancel · Ctrl-G diff · Ctrl-Z undo · Ctrl-Q exit"
 
 
 def test_header_is_compact(tmp_path: Path, monkeypatch) -> None:
@@ -207,6 +211,8 @@ def test_terminal_key_decoder_maps_submit_newline_and_cancellation_controls() ->
     assert decoder.feed("\x1b[13;2u") == ["shift-enter"]
     assert decoder.feed("\x03") == ["ctrl-c"]
     assert decoder.feed("\x04") == ["ctrl-d"]
+    assert decoder.feed("\x07") == ["ctrl-g"]
+    assert decoder.feed("\x1a") == ["ctrl-z"]
     assert decoder.feed("\x11") == ["ctrl-q"]
 
 
@@ -297,6 +303,25 @@ def test_display_consumes_semantic_tool_and_verification_events() -> None:
     display.event(AssistantMessageDelta("Fixed it."))
     display.event(RequestCompleted(None))
     assert transcript.pieces[-1].text == "completed (verification not established)"
+
+
+def test_display_consumes_task_change_events_without_runtime_details() -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+
+    display.event(TaskChangeSummary("changed_files: existing.py, new.py"))
+    display.event(TaskDiff("--- a/existing.py\n+++ b/existing.py\n+updated"))
+    display.event(TaskUndoSucceeded(("existing.py",), ("new.py",)))
+    display.event(TaskUndoRefused(("changed.py",)))
+
+    rendered = "\n".join(transcript.render(120))
+    assert "changes: changed_files: existing.py, new.py" in rendered
+    assert "task diff" in rendered
+    assert "+++ b/existing.py" in rendered
+    assert "undo completed (restored: existing.py; removed: new.py)" in rendered
+    assert "undo refused" in rendered
+    assert "conflicts: changed.py" in rendered
+    assert "SDK" not in rendered
 
 
 def test_verification_status_and_completion_require_tool_evidence() -> None:
