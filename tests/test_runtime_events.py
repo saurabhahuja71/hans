@@ -58,6 +58,22 @@ def make_agent(model: ScriptedModel, workspace: Path) -> Agent:
     )
 
 
+def test_missing_model_configuration_is_rendered_as_request_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("BOLT_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("BOLT_MODEL_API_KEY", raising=False)
+    runtime = HansRuntime(session=SQLiteSession("runtime-missing-config"), workspace=str(tmp_path))
+
+    events = run(collect(runtime, "Say hello."))
+
+    failure = next(event for event in events if isinstance(event, RequestFailed))
+    assert failure.category == "configuration"
+    assert failure.message == "Set BOLT_MODEL_BASE_URL and BOLT_MODEL_API_KEY before starting Hans"
+    assert events[-1] == ConnectionChanged(False)
+    runtime.close()
+
+
 def test_scripted_model_submission_emits_semantic_lifecycle_and_connection(tmp_path: Path) -> None:
     model = ScriptedModel([ModelStep(output=[assistant_message("hello from HANS")])])
     runtime = HansRuntime(agent=make_agent(model, tmp_path), session=SQLiteSession("runtime-answer"))

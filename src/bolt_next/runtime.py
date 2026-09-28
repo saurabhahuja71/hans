@@ -98,6 +98,8 @@ def _verification_evidence(command: str, output: str) -> VerificationEvidence:
 def _failure_details(exc: BaseException) -> tuple[str, str, str]:
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else "request failed"
     lowered = text.lower()
+    if "set bolt_model_base_url" in lowered or "set bolt_model_api_key" in lowered:
+        return "configuration", text, text
     if "context" in lowered or "exceed_context" in lowered:
         return (
             "context",
@@ -121,7 +123,12 @@ class HansRuntime:
         runner: Any = Runner,
     ) -> None:
         set_tracing_disabled(True)
-        self._agent = agent if agent is not None else create_agent(workspace)
+        # Build the agent on the first request so the terminal UI can still
+        # open when model configuration is missing.  The resulting startup
+        # error is then rendered as a normal request failure instead of a
+        # Python traceback before the user sees HANS.
+        self._agent = agent
+        self._workspace = workspace
         self._session = session if session is not None else SQLiteSession("hans-tui")
         self._owns_session = session is None
         self._runner = runner
@@ -151,6 +158,8 @@ class HansRuntime:
         yield UserMessageSubmitted(message)
         yield RequestStarted(message)
         try:
+            if self._agent is None:
+                self._agent = create_agent(self._workspace)
             result = self._runner.run_streamed(
                 self._agent,
                 message,
