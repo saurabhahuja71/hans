@@ -4,6 +4,8 @@ import asyncio
 import os
 import shlex
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from agents import function_tool
@@ -163,6 +165,180 @@ def make_write_file_tool(workspace: Path):
     return write_file
 
 
+def _bounded_lines(lines: list[str], *, max_results: int | None = None) -> str:
+    budget = tool_result_token_budget()
+    limited = lines if max_results is None else lines[:max_results]
+    if not limited:
+        return ""
+    shown: list[str] = []
+    for index, line in enumerate(limited):
+        candidate = "\n".join([*shown, line])
+        remaining = len(limited) - index - 1
+        if not remaining and estimate_tokens(candidate) <= budget:
+            return candidate
+        notice = f"... {remaining} result(s) omitted to fit the tool result budget."
+        rendered = f"{candidate}\n{notice}" if candidate else notice
+        if estimate_tokens(rendered) > budget:
+            break
+        shown.append(line)
+    omitted = len(limited) - len(shown)
+    notice = f"... {omitted} result(s) omitted to fit the tool result budget."
+    result = "\n".join(shown)
+    return f"{result}\n{notice}" if result else notice
+
+
+_SEARCH_IGNORED_DIRECTORIES = {".git", ".hans-tmp", "__pycache__"}
+
+
+def _search_match_line(path: Path, line_number: int, line: str) -> str:
+    prefix = f"{path}:{line_number}: "
+    suffix = " ... [matching line truncated]"
+    maximum_line_length = max(0, tool_result_token_budget() * 3 - len(prefix) - len(suffix))
+    if len(line) <= maximum_line_length:
+        return prefix + line
+    return prefix + line[:maximum_line_length] + suffix
+
+
+def _search_candidates(workspace: Path, target: Path):
+    try:
+        if any(part in _SEARCH_IGNORED_DIRECTORIES for part in target.relative_to(workspace).parts):
+            return
+    except ValueError:
+        return
+    if target.is_file():
+        yield target
+        return
+    for candidate in sorted(target.iterdir(), key=lambda entry: entry.name):
+        try:
+            candidate.resolve().relative_to(workspace)
+        except (OSError, ValueError):
+            continue
+        if candidate.is_symlink() and candidate.is_dir():
+            continue
+        if candidate.is_dir():
+            if candidate.name not in _SEARCH_IGNORED_DIRECTORIES:
+                yield from _search_candidates(workspace, candidate)
+        elif candidate.is_file():
+            yield candidate
+
+
+def make_list_directory_tool(workspace: Path):
+    @function_tool
+    async def list_directory(path: str = ".") -> str:
+        """List direct workspace-directory entries in sorted order.
+
+        Args:
+            path: A relative directory path from the workspace root.
+        """
+        try:
+            target = resolve_workspace_path(workspace, path)
+            if not target.is_dir():
+                return f"Error listing {path!r}: directory does not exist"
+            entries = sorted(entry.name for entry in target.iterdir())
+            return _bounded_lines(entries)
+        except (OSError, WorkspaceError) as exc:
+            return f"Error listing {path!r}: {exc}"
+
+    return list_directory
+
+
+def make_search_files_tool(workspace: Path):
+    @function_tool
+    async def search_files(query: str, path: str = ".", max_results: int = 50) -> str:
+        """Search UTF-8 text files in the workspace and return matching path:line text.
+
+        Binary and unreadable files are skipped. Results are sorted and constrained by both
+        max_results and the tool result context budget.
+
+        Args:
+            query: Literal text to find. It must not be empty.
+            path: A relative file or directory path from the workspace root.
+            max_results: Maximum matching lines to return, from 1 through 100.
+        """
+        if not query:
+            return "Error searching: query must be a non-empty string"
+        if max_results < 1 or max_results > 100:
+            return "Error searching: max_results must be between 1 and 100"
+        try:
+            target = resolve_workspace_path(workspace, path)
+            if not target.exists():
+                return f"Error searching {path!r}: path does not exist"
+            matches: list[str] = []
+            for candidate in _search_candidates(workspace, target):
+                try:
+                    relative = candidate.relative_to(workspace)
+                    file_matches: list[str] = []
+                    binary = False
+                    with candidate.open(encoding="utf-8") as source:
+                        for line_number, line in enumerate(source, start=1):
+                            if "\x00" in line:
+                                binary = True
+                                break
+                            line = line.rstrip("\r\n")
+                            if query in line and len(matches) + len(file_matches) < max_results:
+                                file_matches.append(_search_match_line(relative, line_number, line))
+                    if binary:
+                        continue
+                    matches.extend(file_matches)
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                if len(matches) >= max_results:
+                    return _bounded_lines(matches, max_results=max_results)
+            return _bounded_lines(matches, max_results=max_results)
+        except (OSError, WorkspaceError) as exc:
+            return f"Error searching {path!r}: {exc}"
+
+    return search_files
+
+
+def make_replace_in_file_tool(workspace: Path):
+    @function_tool
+    async def replace_in_file(path: str, old_text: str, new_text: str) -> str:
+        """Replace exactly one literal text occurrence in an existing UTF-8 workspace file.
+
+        Args:
+            path: A relative file path from the workspace root.
+            old_text: Existing text that must occur exactly once.
+            new_text: Replacement text.
+        """
+        if not old_text:
+            return "Error replacing: old_text must be a non-empty string"
+        try:
+            target = resolve_workspace_path(workspace, path)
+            if not target.is_file():
+                return f"Error replacing {path!r}: file does not exist"
+            source_stat = target.stat()
+            text = target.read_text(encoding="utf-8")
+            occurrences = text.count(old_text)
+            if occurrences != 1:
+                return f"Error replacing {path!r}: old_text must occur exactly once (found {occurrences})"
+            replacement = text.replace(old_text, new_text, 1)
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", delete=False
+                ) as temporary:
+                    temporary.write(replacement)
+                    temporary_path = Path(temporary.name)
+                os.chmod(temporary_path, source_stat.st_mode)
+                os.utime(
+                    temporary_path,
+                    ns=(
+                        temporary_path.stat().st_atime_ns,
+                        max(time.time_ns(), source_stat.st_mtime_ns + 1_000_000_000),
+                    ),
+                )
+                os.replace(temporary_path, target)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            return f"Replaced text in {path}"
+        except (OSError, UnicodeError, WorkspaceError) as exc:
+            return f"Error replacing {path!r}: {exc}"
+
+    return replace_in_file
+
+
 # Characters that only have meaning in a shell. run_command never invokes one.
 _SHELL_META = set("|;&<>$`(){}[]*?~!#\\")
 _SHELL_PROGRAMS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "csh", "tcsh"}
@@ -210,7 +386,15 @@ def command_environment(workspace: Path) -> dict[str, str]:
 
 
 def reject_shell_syntax(command: str) -> str | None:
-    if any(char in _SHELL_META or char in "\n\r" for char in command):
+    for argument in command.split():
+        if argument == "./...":
+            continue
+        if any(char in _SHELL_META for char in argument):
+            return (
+                "Error: run_command executes a direct argv command, not a shell. "
+                "Pipes, redirects, &&, ||, globs, and other shell syntax are not supported."
+            )
+    if "\n" in command or "\r" in command:
         return (
             "Error: run_command executes a direct argv command, not a shell. "
             "Pipes, redirects, &&, ||, globs, and other shell syntax are not supported."

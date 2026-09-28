@@ -161,9 +161,9 @@ class HansTextualApp(App[None]):
 
     @staticmethod
     def _tool_stage(name: str, verification_failed: bool) -> str:
-        if name == "read_file":
+        if name in {"list_directory", "search_files", "read_file"}:
             return "investigating"
-        if name == "write_file":
+        if name in {"replace_in_file", "write_file"}:
             return "correcting" if verification_failed else "acting"
         if name == "run_command":
             return "verifying"

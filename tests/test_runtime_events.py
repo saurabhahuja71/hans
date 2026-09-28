@@ -25,7 +25,14 @@ from bolt_next.events import (
     VerificationPassed,
 )
 from bolt_next.runtime import HansRuntime
-from bolt_next.workspace import make_read_file_tool, make_run_command_tool, make_write_file_tool
+from bolt_next.workspace import (
+    make_list_directory_tool,
+    make_read_file_tool,
+    make_replace_in_file_tool,
+    make_run_command_tool,
+    make_search_files_tool,
+    make_write_file_tool,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +58,10 @@ def make_agent(model: ScriptedModel, workspace: Path) -> Agent:
         instructions="Use the provided tools.",
         model=model,
         tools=[
+            make_list_directory_tool(workspace),
+            make_search_files_tool(workspace),
             make_read_file_tool(workspace),
+            make_replace_in_file_tool(workspace),
             make_write_file_tool(workspace),
             make_run_command_tool(workspace),
         ],
@@ -148,6 +158,35 @@ def test_failed_verification_then_successful_write_invalidates_evidence(tmp_path
     assert not failed.evidence.success
     assert ToolCompleted("write-1", "write_file", "fixed.txt", True) in events
     assert (tmp_path / "fixed.txt").read_text(encoding="utf-8") == "fixed"
+    completed = next(event for event in events if isinstance(event, RequestCompleted))
+    assert completed.evidence is None
+    runtime.close()
+
+
+def test_successful_replacement_invalidates_prior_verification_evidence(tmp_path: Path) -> None:
+    (tmp_path / "fixed.txt").write_text("before", encoding="utf-8")
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("run_command", {"command": "printf VERIFIED"}, call_id="verify-1")]),
+            ModelStep(
+                output=[
+                    function_call(
+                        "replace_in_file",
+                        {"path": "fixed.txt", "old_text": "before", "new_text": "after"},
+                        call_id="replace-1",
+                    )
+                ]
+            ),
+            ModelStep(output=[assistant_message("Changed after verification.")]),
+        ]
+    )
+    runtime = HansRuntime(agent=make_agent(model, tmp_path), session=SQLiteSession("runtime-replace-invalidate"))
+
+    events = run(collect(runtime, "Verify and then update the file."))
+
+    assert ToolStarted("replace-1", "replace_in_file", "fixed.txt") in events
+    assert ToolCompleted("replace-1", "replace_in_file", "fixed.txt", True) in events
+    assert (tmp_path / "fixed.txt").read_text(encoding="utf-8") == "after"
     completed = next(event for event in events if isinstance(event, RequestCompleted))
     assert completed.evidence is None
     runtime.close()

@@ -254,12 +254,18 @@ def test_tool_stages_follow_semantic_verification_state(tmp_path: Path) -> None:
             await app._render_event(RequestStarted("inspect"))
             await app._render_event(ToolStarted("read", "read_file", "README.md"))
             assert rendered(app.query_one("#status", Static)) == "investigating"
+            await app._render_event(ToolStarted("list", "list_directory", "src"))
+            assert rendered(app.query_one("#status", Static)) == "investigating"
+            await app._render_event(ToolStarted("search", "search_files", "src: needle"))
+            assert rendered(app.query_one("#status", Static)) == "investigating"
 
             await app._render_event(ToolStarted("write", "write_file", "notes.txt"))
             assert rendered(app.query_one("#status", Static)) == "acting"
+            await app._render_event(ToolStarted("replace", "replace_in_file", "notes.txt"))
+            assert rendered(app.query_one("#status", Static)) == "acting"
 
             await app._render_event(VerificationFailed("verify", evidence))
-            await app._render_event(ToolStarted("correct", "write_file", "notes.txt"))
+            await app._render_event(ToolStarted("correct", "replace_in_file", "notes.txt"))
             assert rendered(app.query_one("#status", Static)) == "correcting"
 
             await app._render_event(ToolStarted("test", "run_command", "pytest -q"))

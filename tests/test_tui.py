@@ -282,7 +282,13 @@ def test_display_consumes_semantic_tool_and_verification_events() -> None:
     display.event(VerificationFailed("verify-1", evidence))
 
     assert transcript.pieces[-1].text == "verification failed"
+    display.event(ToolStarted("list-1", "list_directory", "src"))
+    assert transcript.pieces[-1].text == "investigating"
+    display.event(ToolStarted("search-1", "search_files", "src: needle"))
+    assert transcript.pieces[-1].text == "investigating"
     display.event(ToolStarted("write-1", "write_file", "main.py"))
+    assert transcript.pieces[-1].text == "correcting"
+    display.event(ToolStarted("replace-1", "replace_in_file", "main.py"))
     assert transcript.pieces[-1].text == "correcting"
     display.event(ToolOutput("write-1", "Wrote main.py (5 bytes)"))
     display.event(ToolCompleted("write-1", "write_file", "main.py", True))

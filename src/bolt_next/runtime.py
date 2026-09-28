@@ -62,8 +62,10 @@ def _tool_detail(name: str, arguments: Any) -> str:
         if start and int(start) > 1:
             return f"{detail}:{start}"
         return detail
-    if name == "write_file":
+    if name in {"list_directory", "write_file", "replace_in_file"}:
         return str(arguments.get("path") or "")
+    if name == "search_files":
+        return f"{arguments.get('path') or '.'}: {arguments.get('query') or ''}".rstrip()
     if name == "run_command":
         return str(arguments.get("command") or "")
     return ""
@@ -286,7 +288,7 @@ class HansRuntime:
                 events.append(VerificationFailed(call_id, evidence))
             return tuple(events)
         success = not rendered_output.startswith("Error:")
-        if call.name == "write_file" and success:
+        if call.name in {"write_file", "replace_in_file"} and success:
             self._evidence = None
         events.append(ToolCompleted(call_id, call.name, call.detail, success))
         return tuple(events)

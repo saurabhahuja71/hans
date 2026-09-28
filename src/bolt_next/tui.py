@@ -104,9 +104,9 @@ class _Display:
         self._verification_failed = False
 
     def _tool_stage(self, name: str) -> str:
-        if name == "read_file":
+        if name in {"list_directory", "search_files", "read_file"}:
             return "investigating"
-        if name == "write_file":
+        if name in {"replace_in_file", "write_file"}:
             return "correcting" if self._verification_failed else "acting"
         if name == "run_command":
             return "verifying"

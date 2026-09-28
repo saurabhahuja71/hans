@@ -8,8 +8,11 @@ from openai import AsyncOpenAI
 from bolt_next.context_budget import completion_token_reserve
 from bolt_next.errors import ConfigurationError
 from bolt_next.workspace import (
+    make_list_directory_tool,
     make_read_file_tool,
+    make_replace_in_file_tool,
     make_run_command_tool,
+    make_search_files_tool,
     make_write_file_tool,
     resolve_workspace,
 )
@@ -28,10 +31,11 @@ STAGE_4_INSTRUCTIONS = (
     "when appropriate and confirm that the requested behavior is satisfied. Never claim that a "
     "test or command passed unless a tool result shows it passed. Tool results are the authoritative "
     "evidence; do not replace them with guesses or model-generated summaries. If verification is "
-    "not possible, say explicitly that it could not be performed. Use read_file to inspect files, "
-    "write_file to create or replace files, and run_command to run a direct command in the "
-    "workspace. When read_file reports remaining_ranges, request the next start_line instead of "
-    "assuming the rest of the file."
+    "not possible, say explicitly that it could not be performed. Use list_directory and search_files "
+    "to discover relevant files, read_file to inspect them, replace_in_file for a precise one-location "
+    "edit, write_file only to create or replace an entire file, and run_command to run a direct command "
+    "in the workspace. Do not invent custom patch syntax. When read_file reports remaining_ranges, "
+    "request the next start_line instead of assuming the rest of the file."
 )
 
 
@@ -115,7 +119,10 @@ def create_agent(workspace: str | Path | None = None) -> Agent:
         model=model,
         model_settings=_model_settings(),
         tools=[
+            make_list_directory_tool(root),
+            make_search_files_tool(root),
             make_read_file_tool(root),
+            make_replace_in_file_tool(root),
             make_write_file_tool(root),
             make_run_command_tool(root),
         ],
