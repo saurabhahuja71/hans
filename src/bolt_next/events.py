@@ -37,6 +37,7 @@ class ToolStarted:
     call_id: str
     name: str
     detail: str
+    purpose: str = "inspect"
 
 
 @dataclass(frozen=True, slots=True)

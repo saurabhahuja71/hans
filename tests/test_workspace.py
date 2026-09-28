@@ -211,11 +211,17 @@ def test_replace_in_file_rejects_symlink_outside_workspace(tmp_path: Path) -> No
     assert outside.read_text(encoding="utf-8") == "old"
 
 
-def test_run_command_returns_stdout(tmp_path: Path) -> None:
+def test_run_command_returns_stdout_and_defaults_to_inspect(tmp_path: Path) -> None:
     tool = make_run_command_tool(tmp_path)
     result = invoke(tool, '{"command":"printf HELLO_HANS"}')
     assert "exit_code=0" in result
     assert "HELLO_HANS" in result
+
+
+def test_run_command_rejects_an_invalid_purpose(tmp_path: Path) -> None:
+    result = invoke(make_run_command_tool(tmp_path), '{"command":"printf HELLO_HANS","purpose":"plan"}')
+
+    assert result == "Error: purpose must be either 'inspect' or 'verify'"
 
 
 def test_run_command_allows_literal_go_package_pattern_without_running_go() -> None:

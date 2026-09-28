@@ -96,6 +96,7 @@ class HansTextualApp(App[None]):
 
     MAX_TRANSCRIPT_ROWS = 300
     MAX_TOOL_ROWS = 100
+    MAX_TOOL_OUTPUT_CHARS = 4_000
 
     BINDINGS = [
         Binding("enter", "submit_or_exit", "send", show=False, priority=True),
@@ -116,6 +117,7 @@ class HansTextualApp(App[None]):
         self._assistant_flush_scheduled = False
         self._tool_widgets: dict[str, Static] = {}
         self._tool_text: dict[str, str] = {}
+        self._tool_purposes: dict[str, str] = {}
         self._completed_tool_rows: deque[str] = deque()
         self._transcript_rows: deque[Static] = deque()
         self._verification_failed = False
@@ -160,14 +162,20 @@ class HansTextualApp(App[None]):
         self.query_one("#status", Static).update(text)
 
     @staticmethod
-    def _tool_stage(name: str, verification_failed: bool) -> str:
+    def _tool_stage(name: str, verification_failed: bool, purpose: str = "inspect") -> str:
         if name in {"list_directory", "search_files", "read_file"}:
             return "investigating"
         if name in {"replace_in_file", "write_file"}:
             return "correcting" if verification_failed else "acting"
         if name == "run_command":
-            return "verifying"
+            return "verifying" if purpose == "verify" else "investigating"
         return "acting"
+
+    def _display_tool_output(self, output: str) -> str:
+        if len(output) <= self.MAX_TOOL_OUTPUT_CHARS:
+            return output
+        omitted = len(output) - self.MAX_TOOL_OUTPUT_CHARS
+        return f"{output[:self.MAX_TOOL_OUTPUT_CHARS]}\n… display truncated ({omitted} characters omitted)"
 
     @staticmethod
     def _failure_title(category: str) -> str:
@@ -256,6 +264,7 @@ class HansTextualApp(App[None]):
             call_id = self._completed_tool_rows.popleft()
             widget = self._tool_widgets.pop(call_id, None)
             self._tool_text.pop(call_id, None)
+            self._tool_purposes.pop(call_id, None)
             if widget is not None:
                 await widget.remove()
 
@@ -284,12 +293,13 @@ class HansTextualApp(App[None]):
             widget = await self._tool_widget(event.call_id)
             text = f"◇ {event.name}  {event.detail}".rstrip()
             self._tool_text[event.call_id] = text
+            self._tool_purposes[event.call_id] = event.purpose
             widget.update(text)
-            self._set_status(self._tool_stage(event.name, self._verification_failed))
+            self._set_status(self._tool_stage(event.name, self._verification_failed, event.purpose))
         elif isinstance(event, ToolOutput):
             widget = await self._tool_widget(event.call_id)
             text = self._tool_text.get(event.call_id, f"◇ tool {event.call_id}")
-            text = f"{text}\n{event.output}".rstrip()
+            text = f"{text}\n{self._display_tool_output(event.output)}".rstrip()
             self._tool_text[event.call_id] = text
             widget.update(text)
         elif isinstance(event, ToolCompleted):
@@ -300,9 +310,10 @@ class HansTextualApp(App[None]):
             text = f"{text}\n{mark} {event.name}  {event.detail}{suffix}".rstrip()
             self._tool_text[event.call_id] = text
             widget.update(text)
+            purpose = self._tool_purposes.get(event.call_id, "inspect")
             self._completed_tool_rows.append(event.call_id)
             await self._trim_completed_tools()
-            stage = self._tool_stage(event.name, self._verification_failed)
+            stage = self._tool_stage(event.name, self._verification_failed, purpose)
             self._set_status(stage if event.success else f"tool failed: {event.name}")
         elif isinstance(event, VerificationStarted):
             self._set_status(f"verifying: {event.command}")

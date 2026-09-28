@@ -102,14 +102,15 @@ class _Display:
         self.on_connection = on_connection
         self._started = False
         self._verification_failed = False
+        self._tool_purposes: dict[str, str] = {}
 
-    def _tool_stage(self, name: str) -> str:
+    def _tool_stage(self, name: str, purpose: str = "inspect") -> str:
         if name in {"list_directory", "search_files", "read_file"}:
             return "investigating"
         if name in {"replace_in_file", "write_file"}:
             return "correcting" if self._verification_failed else "acting"
         if name == "run_command":
-            return "verifying"
+            return "verifying" if purpose == "verify" else "investigating"
         return "acting"
 
     def event(self, event) -> None:
@@ -125,9 +126,10 @@ class _Display:
             self._text(event.delta)
         elif isinstance(event, ToolStarted):
             label = f"{event.name}  {event.detail}".rstrip()
+            self._tool_purposes[event.call_id] = event.purpose
             if self.transcript is not None:
                 self.transcript.tool_started(label)
-                self.transcript.stage(self._tool_stage(event.name))
+                self.transcript.stage(self._tool_stage(event.name, event.purpose))
                 if self.debug:
                     self.transcript.debug(
                         f"[tool_started] call_id={event.call_id} name={event.name} detail={event.detail}"
@@ -147,8 +149,9 @@ class _Display:
                     print(f"\n[tool_output] call_id={event.call_id}\n{event.output}", flush=True)
         elif isinstance(event, ToolCompleted):
             label = event.detail or event.name
+            purpose = self._tool_purposes.pop(event.call_id, "inspect")
             if self.transcript is not None:
-                self.transcript.stage(self._tool_stage(event.name))
+                self.transcript.stage(self._tool_stage(event.name, purpose))
                 self.transcript.tool_finished(label, ok=event.success)
             elif not self.debug:
                 print(format_tool_result(event.name, event.success, event.exit_code), flush=True)

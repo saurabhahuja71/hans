@@ -23,6 +23,7 @@ from bolt_next.events import (
     UserMessageSubmitted,
     VerificationFailed,
     VerificationPassed,
+    VerificationStarted,
 )
 from bolt_next.runtime import HansRuntime
 from bolt_next.workspace import (
@@ -119,7 +120,9 @@ def test_scripted_tool_events_preserve_authoritative_output_and_verification(tmp
     original_output = "exit_code=0\nstdout:\nVERIFIEDstderr:\n"
     model = ScriptedModel(
         [
-            ModelStep(output=[function_call("run_command", {"command": "printf VERIFIED"}, call_id="verify-1")]),
+            ModelStep(
+                output=[function_call("run_command", {"command": "printf VERIFIED", "purpose": "verify"}, call_id="verify-1")]
+            ),
             ModelStep(output=[assistant_message("Verification passed.")]),
         ]
     )
@@ -130,7 +133,7 @@ def test_scripted_tool_events_preserve_authoritative_output_and_verification(tmp
     tool_output = next(event for event in events if isinstance(event, ToolOutput))
     assert tool_output.call_id == "verify-1"
     assert tool_output.output == original_output
-    assert ToolStarted("verify-1", "run_command", "printf VERIFIED") in events
+    assert ToolStarted("verify-1", "run_command", "printf VERIFIED", "verify") in events
     assert ToolCompleted("verify-1", "run_command", "printf VERIFIED", True, 0) in events
     passed = next(event for event in events if isinstance(event, VerificationPassed))
     assert passed.evidence.command == "printf VERIFIED"
@@ -141,10 +144,38 @@ def test_scripted_tool_events_preserve_authoritative_output_and_verification(tmp
     runtime.close()
 
 
+def test_inspection_command_does_not_replace_verification_evidence(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelStep(
+                output=[function_call("run_command", {"command": "printf VERIFIED", "purpose": "verify"}, call_id="verify-1")]
+            ),
+            ModelStep(output=[function_call("run_command", {"command": "printf INSPECTED"}, call_id="inspect-1")]),
+            ModelStep(output=[assistant_message("Verified and inspected.")]),
+        ]
+    )
+    runtime = HansRuntime(agent=make_agent(model, tmp_path), session=SQLiteSession("runtime-inspect"))
+
+    events = run(collect(runtime, "Verify and inspect the project."))
+
+    assert ToolStarted("verify-1", "run_command", "printf VERIFIED", "verify") in events
+    assert ToolStarted("inspect-1", "run_command", "printf INSPECTED", "inspect") in events
+    assert ToolCompleted("inspect-1", "run_command", "printf INSPECTED", True, 0) in events
+    assert not any(
+        isinstance(event, (VerificationStarted, VerificationPassed, VerificationFailed)) and event.call_id == "inspect-1"
+        for event in events
+    )
+    completed = next(event for event in events if isinstance(event, RequestCompleted))
+    assert completed.evidence is not None
+    assert completed.evidence.command == "printf VERIFIED"
+    assert completed.evidence.success
+    runtime.close()
+
+
 def test_failed_verification_then_successful_write_invalidates_evidence(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
-            ModelStep(output=[function_call("run_command", {"command": "false"}, call_id="verify-1")]),
+            ModelStep(output=[function_call("run_command", {"command": "false", "purpose": "verify"}, call_id="verify-1")]),
             ModelStep(output=[function_call("write_file", {"path": "fixed.txt", "content": "fixed"}, call_id="write-1")]),
             ModelStep(output=[assistant_message("Fixed but not reverified.")]),
         ]
@@ -167,7 +198,9 @@ def test_successful_replacement_invalidates_prior_verification_evidence(tmp_path
     (tmp_path / "fixed.txt").write_text("before", encoding="utf-8")
     model = ScriptedModel(
         [
-            ModelStep(output=[function_call("run_command", {"command": "printf VERIFIED"}, call_id="verify-1")]),
+            ModelStep(
+                output=[function_call("run_command", {"command": "printf VERIFIED", "purpose": "verify"}, call_id="verify-1")]
+            ),
             ModelStep(
                 output=[
                     function_call(
@@ -317,14 +350,18 @@ def test_cancel_active_interrupts_a_noncooperative_stream_and_allows_next_reques
 def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:
     runtime = HansRuntime(agent=object(), session=object(), runner=object())
 
-    def called(call_id: str, provider_id: str, command: str):
+    def called(call_id: str, provider_id: str, command: str, purpose: str = "verify"):
         return SimpleNamespace(
             type="run_item_stream_event",
             name="tool_called",
             item=SimpleNamespace(
                 call_id=call_id,
                 tool_name="run_command",
-                raw_item={"id": provider_id, "call_id": call_id, "arguments": {"command": command}},
+                raw_item={
+                    "id": provider_id,
+                    "call_id": call_id,
+                    "arguments": {"command": command, "purpose": purpose},
+                },
             ),
         )
 
@@ -335,10 +372,10 @@ def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:
             item=SimpleNamespace(call_id=call_id, output=value, raw_item={"id": provider_id, "call_id": call_id}),
         )
 
-    assert ToolStarted("call-a", "run_command", "printf A") in runtime.translate_stream_event(
+    assert ToolStarted("call-a", "run_command", "printf A", "verify") in runtime.translate_stream_event(
         called("call-a", "provider-a", "printf A")
     )
-    assert ToolStarted("call-b", "run_command", "printf B") in runtime.translate_stream_event(
+    assert ToolStarted("call-b", "run_command", "printf B", "verify") in runtime.translate_stream_event(
         called("call-b", "provider-b", "printf B")
     )
     b_events = tuple(runtime.translate_stream_event(output("call-b", "provider-output-b", "exit_code=0\nstdout:\nB\n")))

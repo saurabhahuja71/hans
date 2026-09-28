@@ -275,13 +275,15 @@ def test_display_consumes_semantic_tool_and_verification_events() -> None:
     command = "pytest -q"
     evidence = VerificationEvidence(command, 1, True, True, False, "2026-09-26T00:00:00+00:00")
 
-    display.event(ToolStarted("verify-1", "run_command", command))
+    display.event(ToolStarted("verify-1", "run_command", command, "verify"))
     display.event(VerificationStarted("verify-1", command))
     display.event(ToolOutput("verify-1", "authoritative tool output"))
     display.event(ToolCompleted("verify-1", "run_command", command, False, 1))
     display.event(VerificationFailed("verify-1", evidence))
 
     assert transcript.pieces[-1].text == "verification failed"
+    display.event(ToolStarted("inspect-1", "run_command", "git status"))
+    assert transcript.pieces[-1].text == "investigating"
     display.event(ToolStarted("list-1", "list_directory", "src"))
     assert transcript.pieces[-1].text == "investigating"
     display.event(ToolStarted("search-1", "search_files", "src: needle"))

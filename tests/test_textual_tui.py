@@ -134,7 +134,7 @@ def test_textual_shell_renders_events_without_duplicate_assistant_or_tool_rows(t
                 AssistantMessageDelta(" there"),
                 AssistantMessageComplete("Hello there"),
                 ToolStarted("call-a", "read_file", "a.py"),
-                ToolStarted("call-b", "run_command", "pytest -q"),
+                ToolStarted("call-b", "run_command", "pytest -q", "verify"),
                 ToolOutput("call-b", "tests passed"),
                 ToolOutput("call-a", "source"),
                 ToolCompleted("call-b", "run_command", "pytest -q", True, 0),
@@ -162,6 +162,26 @@ def test_textual_shell_renders_events_without_duplicate_assistant_or_tool_rows(t
             assert "exit 0" in tool_b
             assert "completed" == rendered(app.query_one("#status", Static))
             assert "connected" in rendered(app.query_one("#hans-header", Static))
+
+    asyncio.run(scenario())
+
+
+def test_tool_output_display_is_bounded_without_mutating_event_output(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        app.MAX_TOOL_OUTPUT_CHARS = 8
+        output = "abcdefghijk"
+        event = ToolOutput("long", output)
+        async with app.run_test() as pilot:
+            await app._render_event(ToolStarted("long", "run_command", "pytest -q", "verify"))
+            await app._render_event(event)
+            await pilot.pause()
+
+            rendered_output = rendered(app._tool_widgets["long"])
+            assert event.output == output
+            assert "abcdefgh" in rendered_output
+            assert "display truncated (3 characters omitted)" in rendered_output
+            assert "ijk" not in rendered_output
 
     asyncio.run(scenario())
 
@@ -268,7 +288,9 @@ def test_tool_stages_follow_semantic_verification_state(tmp_path: Path) -> None:
             await app._render_event(ToolStarted("correct", "replace_in_file", "notes.txt"))
             assert rendered(app.query_one("#status", Static)) == "correcting"
 
-            await app._render_event(ToolStarted("test", "run_command", "pytest -q"))
+            await app._render_event(ToolStarted("inspect", "run_command", "git status"))
+            assert rendered(app.query_one("#status", Static)) == "investigating"
+            await app._render_event(ToolStarted("test", "run_command", "pytest -q", "verify"))
             assert rendered(app.query_one("#status", Static)) == "verifying"
             await app._render_event(ToolCompleted("test", "run_command", "pytest -q", False, 1))
             assert rendered(app.query_one("#status", Static)) == "tool failed: run_command"

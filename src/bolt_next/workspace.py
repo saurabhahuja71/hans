@@ -452,17 +452,21 @@ def reject_workspace_escape(workspace: Path, args: list[str]) -> str | None:
 
 def make_run_command_tool(workspace: Path):
     @function_tool
-    async def run_command(command: str) -> str:
+    async def run_command(command: str, purpose: str = "inspect") -> str:
         """Run one direct command in the workspace and return its exit code and output.
 
         The command is split into argv and executed without a shell. Pipes, redirects,
         &&, ||, globs, and substitution are rejected. The working directory is the
         workspace. The command does not receive API keys or the rest of the process
-        environment.
+        environment. purpose must be `inspect` for investigation or `verify` for a
+        command intended to validate requested behavior.
 
         Args:
             command: Program and arguments, for example `go test ./...`.
+            purpose: `inspect` or `verify`; defaults to `inspect`.
         """
+        if purpose not in {"inspect", "verify"}:
+            return "Error: purpose must be either 'inspect' or 'verify'"
         if not command or not command.strip() or "\x00" in command:
             return "Error: command must be a non-empty string"
         shell_error = reject_shell_syntax(command)

@@ -91,3 +91,9 @@ def test_main_dispatches_upgrade_aliases(monkeypatch: pytest.MonkeyPatch, comman
 def test_main_reports_invalid_usage(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["other"]) == 2
     assert capsys.readouterr().err == "usage: hans [upgrade|update]\n"
+
+
+def test_phase_six_release_uses_next_minor_version() -> None:
+    project = (Path(__file__).parents[1] / "pyproject.toml").read_text()
+
+    assert 'version = "0.3.0"' in project

@@ -151,3 +151,14 @@ def test_max_completion_is_capped_to_context_reserve(monkeypatch: pytest.MonkeyP
     settings = agent_module._model_settings()
 
     assert settings.extra_args == {"max_completion_tokens": 4096}
+
+
+def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> None:
+    instructions = agent_module.STAGE_4_INSTRUCTIONS
+
+    assert "read-only" in instructions
+    assert "Clarify material ambiguity" in instructions
+    assert "purpose=inspect" in instructions
+    assert "purpose=verify" in instructions
+    assert "environment, dependency, configuration, or tool failures" in instructions
+    assert "verification evidence" in instructions

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import subprocess
@@ -9,6 +10,7 @@ import pytest
 from agents import Agent, Runner, SQLiteSession, set_tracing_disabled
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
 
+from bolt_next.agent import STAGE_4_INSTRUCTIONS
 from bolt_next.workspace import (
     make_list_directory_tool,
     make_read_file_tool,
@@ -38,10 +40,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def make_agent(model: ScriptedModel, workspace: Path) -> Agent:
+def make_agent(
+    model: ScriptedModel, workspace: Path, *, instructions: str = "Use read_file when asked to inspect a file."
+) -> Agent:
     return Agent(
         name="HANS test agent",
-        instructions="Use read_file when asked to inspect a file.",
+        instructions=instructions,
         model=model,
         tools=[
             make_list_directory_tool(workspace),
@@ -89,7 +93,13 @@ def test_discovery_search_targeted_replace_and_verification_workflow(tmp_path: P
                     )
                 ]
             ),
-            ModelStep(output=[function_call("run_command", {"command": "printf VERIFIED"}, call_id="verify-1")]),
+            ModelStep(
+                output=[
+                    function_call(
+                        "run_command", {"command": "printf VERIFIED", "purpose": "verify"}, call_id="verify-1"
+                    )
+                ]
+            ),
             ModelStep(output=[assistant_message("Targeted replacement verified.")]),
         ]
     )
@@ -121,7 +131,10 @@ def make_python_repository(root: Path, *, user_changes: bool) -> dict[str, Path]
     (root / "pyproject.toml").write_text(
         "[project]\nname = 'sample-service'\nversion = '0.1.0'\n", encoding="utf-8"
     )
-    (root / "README.md").write_text("# Sample service\nFeature: next_value\n", encoding="utf-8")
+    (root / "README.md").write_text(
+        "# Sample service\nFeature: next_value\n\n## Development\npython -m pytest -q tests/test_service.py\n",
+        encoding="utf-8",
+    )
     (root / ".gitignore").write_text(".hans-tmp/\n__pycache__/\n", encoding="utf-8")
     math_ops = source / "math_ops.py"
     math_ops.write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
@@ -161,6 +174,7 @@ def test_scripted_agent_repairs_a_git_python_repository_without_touching_user_ch
 ) -> None:
     monkeypatch.setenv("PATH", f"/tmp/hans-python312/bin:{os.environ['PATH']}")
     paths = make_python_repository(tmp_path, user_changes=True)
+    focused_test_before = paths["focused_test"].read_bytes()
     model = ScriptedModel(
         [
             ModelStep(output=[function_call("list_directory", {"path": "."}, call_id="list-1")]),
@@ -168,13 +182,17 @@ def test_scripted_agent_repairs_a_git_python_repository_without_touching_user_ch
             ModelStep(output=[function_call("search_files", {"query": "next_value", "path": "src"}, call_id="search-1")]),
             ModelStep(output=[function_call("read_file", {"path": "src/math_ops.py"}, call_id="read-math")]),
             ModelStep(output=[function_call("read_file", {"path": "src/service.py"}, call_id="read-service")]),
-            ModelStep(output=[function_call("run_command", {"command": "git status --short"}, call_id="status-before")]),
-            ModelStep(output=[function_call("run_command", {"command": "git diff"}, call_id="diff-before")]),
+            ModelStep(output=[function_call(
+                    "run_command", {"command": "git status --short", "purpose": "inspect"}, call_id="status-before"
+                )]),
+            ModelStep(output=[function_call("run_command", {"command": "git diff", "purpose": "inspect"}, call_id="diff-before")]),
             ModelStep(output=[function_call("replace_in_file", {"path": "src/math_ops.py", "old_text": "return left - right", "new_text": "return left + right"}, call_id="replace-math")]),
             ModelStep(output=[function_call("replace_in_file", {"path": "src/service.py", "old_text": "add(value, -1)", "new_text": "add(value, 1)"}, call_id="replace-callsite")]),
-            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py"}, call_id="pytest")]),
-            ModelStep(output=[function_call("run_command", {"command": "git diff --check"}, call_id="diff-check")]),
-            ModelStep(output=[function_call("run_command", {"command": "git status --short"}, call_id="status-after")]),
+            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py", "purpose": "verify"}, call_id="pytest")]),
+            ModelStep(output=[function_call("run_command", {"command": "git diff --check", "purpose": "verify"}, call_id="diff-check")]),
+            ModelStep(output=[function_call(
+                    "run_command", {"command": "git status --short", "purpose": "inspect"}, call_id="status-after"
+                )]),
             ModelStep(output=[assistant_message("The focused repair is verified without touching user work.")]),
         ]
     )
@@ -186,7 +204,10 @@ def test_scripted_agent_repairs_a_git_python_repository_without_touching_user_ch
 
     assert result.final_output == "The focused repair is verified without touching user work."
     assert paths["math_ops"].read_text(encoding="utf-8") == "def add(left, right):\n    return left + right\n"
-    assert paths["service"].read_text(encoding="utf-8").endswith("return add(value, 1)\n")
+    service_tree = ast.parse(paths["service"].read_text(encoding="utf-8"))
+    next_value = next(node for node in service_tree.body if isinstance(node, ast.FunctionDef) and node.name == "next_value")
+    assert [argument.arg for argument in next_value.args.args] == ["value"]
+    assert paths["focused_test"].read_bytes() == focused_test_before
     assert paths["notes"].read_text(encoding="utf-8") == "tracked user edit\n"
     assert paths["scratch"].read_text(encoding="utf-8") == "untracked user work\n"
     status = git(tmp_path, "status", "--short")
@@ -220,9 +241,11 @@ def test_scripted_agent_discovers_an_unfamiliar_repository_without_changes(tmp_p
     )
     session = SQLiteSession("sdk-read-only-discovery-test")
 
-    result = run(Runner.run(make_agent(model, tmp_path), "Find the next_value feature without changing files.", session=session))
+    agent = make_agent(model, tmp_path, instructions=STAGE_4_INSTRUCTIONS)
+    result = run(Runner.run(agent, "Find the next_value feature without changing files.", session=session))
 
     after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and ".git" not in path.parts}
+    assert agent.instructions == STAGE_4_INSTRUCTIONS
     assert result.final_output.endswith("src/service.py.")
     assert before == after
     assert git(tmp_path, "status", "--short") == ""
@@ -236,7 +259,7 @@ def test_write_then_run_command_reaches_next_model_turn(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             ModelStep(output=[function_call("write_file", {"path": "main.go", "content": "package main\n"}, call_id="write-1")]),
-            ModelStep(output=[function_call("run_command", {"command": "printf HELLO_HANS"}, call_id="run-1")]),
+            ModelStep(output=[function_call("run_command", {"command": "printf HELLO_HANS", "purpose": "verify"}, call_id="run-1")]),
             ModelStep(output=[assistant_message("Verified output HELLO_HANS.")]),
         ]
     )
@@ -265,13 +288,13 @@ def test_failed_verification_reaches_focused_source_and_callsite_repair(
     )
     model = ScriptedModel(
         [
-            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py"}, call_id="failed-test")]),
+            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py", "purpose": "verify"}, call_id="failed-test")]),
             ModelStep(output=[function_call("search_files", {"query": "return left - right", "path": "src"}, call_id="search-source")]),
             ModelStep(output=[function_call("read_file", {"path": "src/math_ops.py"}, call_id="read-source")]),
             ModelStep(output=[function_call("read_file", {"path": "src/service.py"}, call_id="read-callsite")]),
             ModelStep(output=[function_call("replace_in_file", {"path": "src/math_ops.py", "old_text": "return left - right", "new_text": "return left + right"}, call_id="repair-source")]),
             ModelStep(output=[function_call("replace_in_file", {"path": "src/service.py", "old_text": "add(value, 2)", "new_text": "add(value, 1)"}, call_id="repair-callsite")]),
-            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py"}, call_id="retest")]),
+            ModelStep(output=[function_call("run_command", {"command": "python -m pytest -q tests/test_service.py", "purpose": "verify"}, call_id="retest")]),
             ModelStep(output=[assistant_message("The failed focused test was repaired and now passes.")]),
         ]
     )
@@ -290,6 +313,62 @@ def test_failed_verification_reaches_focused_source_and_callsite_repair(
     assert "Replaced text in src/service.py" in repr(model.calls[6].input)
     assert "exit_code=0" in repr(model.calls[7].input)
     assert "1 passed" in repr(model.calls[7].input)
+    session.close()
+
+
+def test_scripted_agent_runs_a_readme_documented_verification_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", f"/tmp/hans-python312/bin:{os.environ['PATH']}")
+    make_python_repository(tmp_path, user_changes=False)
+    command = "python -m pytest -q tests/test_service.py"
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_file", {"path": "README.md"}, call_id="read-readme")]),
+            ModelStep(
+                output=[
+                    function_call("run_command", {"command": command, "purpose": "verify"}, call_id="verify")
+                ]
+            ),
+            ModelStep(output=[assistant_message("The documented verification command passed.")]),
+        ]
+    )
+    session = SQLiteSession("sdk-readme-verification-test")
+
+    result = run(Runner.run(make_agent(model, tmp_path), "Run the documented test command.", session=session))
+
+    assert command in repr(model.calls[1].input)
+    assert "1 passed" in repr(model.calls[2].input)
+    assert result.final_output == "The documented verification command passed."
+    session.close()
+
+
+def test_scripted_environment_verification_failure_does_not_change_source(tmp_path: Path) -> None:
+    paths = make_python_repository(tmp_path, user_changes=False)
+    source_before = {path: path.read_bytes() for path in (tmp_path / "src").rglob("*") if path.is_file()}
+    model = ScriptedModel(
+        [
+            ModelStep(
+                output=[
+                    function_call(
+                        "run_command",
+                        {"command": "missing-hans-verifier", "purpose": "verify"},
+                        call_id="missing-verifier",
+                    )
+                ]
+            ),
+            ModelStep(output=[assistant_message("Verification could not run because its tool is unavailable.")]),
+        ]
+    )
+    session = SQLiteSession("sdk-environment-verification-failure-test")
+
+    result = run(Runner.run(make_agent(model, tmp_path), "Verify without changing source if the tool fails.", session=session))
+
+    source_after = {path: path.read_bytes() for path in (tmp_path / "src").rglob("*") if path.is_file()}
+    assert "Error: command not found: missing-hans-verifier" in repr(model.calls[1].input)
+    assert source_after == source_before
+    assert paths["focused_test"].read_text(encoding="utf-8").endswith("assert next_value(2) == 3\n")
+    assert result.final_output == "Verification could not run because its tool is unavailable."
     session.close()
 
 

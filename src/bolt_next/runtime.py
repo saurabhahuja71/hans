@@ -39,6 +39,7 @@ from bolt_next.events import (
 class _ToolCall:
     name: str
     detail: str
+    purpose: str = "inspect"
 
 
 def run_config() -> RunConfig:
@@ -75,6 +76,20 @@ def _call_arguments(raw_item: Any) -> Any:
     if isinstance(raw_item, dict):
         return raw_item.get("arguments")
     return getattr(raw_item, "arguments", None)
+
+
+def _tool_purpose(name: str, arguments: Any) -> str:
+    if name != "run_command":
+        return "inspect"
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return "inspect"
+    if not isinstance(arguments, dict):
+        return "inspect"
+    purpose = arguments.get("purpose")
+    return purpose if purpose in {"inspect", "verify"} else "inspect"
 
 
 def _exit_code(output: str) -> int | None:
@@ -259,10 +274,12 @@ class HansRuntime:
             tool_name = getattr(item, "tool_name", None)
             if not isinstance(call_id, str) or not call_id or not isinstance(tool_name, str) or not tool_name:
                 return ()
-            detail = _tool_detail(tool_name, _call_arguments(getattr(item, "raw_item", None)))
-            self._tool_calls[call_id] = _ToolCall(tool_name, detail)
-            started: list[HansEvent] = [ToolStarted(call_id, tool_name, detail)]
-            if tool_name == "run_command":
+            arguments = _call_arguments(getattr(item, "raw_item", None))
+            detail = _tool_detail(tool_name, arguments)
+            purpose = _tool_purpose(tool_name, arguments)
+            self._tool_calls[call_id] = _ToolCall(tool_name, detail, purpose)
+            started: list[HansEvent] = [ToolStarted(call_id, tool_name, detail, purpose)]
+            if tool_name == "run_command" and purpose == "verify":
                 started.append(VerificationStarted(call_id, detail))
             return tuple(started)
         if name != "tool_output":
@@ -278,14 +295,15 @@ class HansRuntime:
             return tuple(events)
         if call.name == "run_command":
             evidence = _verification_evidence(call.detail, rendered_output)
-            self._evidence = evidence
             events.append(
                 ToolCompleted(call_id, call.name, call.detail, evidence.success, evidence.exit_code)
             )
-            if evidence.success:
-                events.append(VerificationPassed(call_id, evidence))
-            else:
-                events.append(VerificationFailed(call_id, evidence))
+            if call.purpose == "verify":
+                self._evidence = evidence
+                if evidence.success:
+                    events.append(VerificationPassed(call_id, evidence))
+                else:
+                    events.append(VerificationFailed(call_id, evidence))
             return tuple(events)
         success = not rendered_output.startswith("Error:")
         if call.name in {"write_file", "replace_in_file"} and success:
