@@ -87,6 +87,11 @@ Python 3.12 or newer is required. This installs `hans` into `~/.local/bin`:
 curl -LsSf https://raw.githubusercontent.com/saurabhahuja71/hans/main/install.sh | bash
 ```
 
+The installer accepts `python3.12` or newer even when `python3` points to an older
+system Python. If [uv](https://docs.astral.sh/uv/) is installed, it automatically
+downloads a private Python 3.12 when no suitable interpreter is available. Otherwise,
+install Python 3.12+ (or uv) and rerun the command.
+
 If `~/.local/bin` is not on `PATH`, the script prints the one `export` to add. Behind the corporate proxy, export `https_proxy` before running the command. The model URL and API key are still set in the shell; the installer does not embed them.
 
 ## Fresh installation

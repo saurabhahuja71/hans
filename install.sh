@@ -14,7 +14,9 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
 
 PY=""
-for candidate in python3.12 python3; do
+# Do not assume that `python3` points at the newest Python installed on the
+# machine; on several Linux distributions it still points at an older release.
+for candidate in python3.{12..99} python3; do
     if command -v "$candidate" >/dev/null 2>&1; then
         if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)'; then
             PY="$candidate"
@@ -22,7 +24,12 @@ for candidate in python3.12 python3; do
         fi
     fi
 done
-[[ -n "$PY" ]] || die "Python 3.12 or newer is required"
+if [[ -z "$PY" ]] && command -v uv >/dev/null 2>&1; then
+    info "Python 3.12+ was not found; installing a private Python 3.12 with uv"
+    uv python install 3.12
+    PY="$(uv python find 3.12)"
+fi
+[[ -n "$PY" ]] || die "Python 3.12 or newer is required. Install Python 3.12+ or uv, then run this command again"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
