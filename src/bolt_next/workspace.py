@@ -786,6 +786,12 @@ def command_environment(workspace: Path) -> dict[str, str]:
 
 def reject_shell_syntax(command: str) -> str | None:
     for argument in command.split():
+        if "~" in argument:
+            return (
+                "Error: run_command does not expand `~` and only runs direct workspace commands. "
+                "Use list_directory, search_files, or read_file with the literal `~/...` path; "
+                "HANS will request explicit approval for external access."
+            )
         if argument == "./...":
             continue
         if any(char in _SHELL_META for char in argument):
@@ -825,10 +831,12 @@ def make_run_command_tool(workspace: Path, *, context_tokens: int | None = None)
         """Run one direct command in the workspace and return its exit code and output.
 
         The command is split into argv and executed without a shell. Pipes, redirects,
-        &&, ||, globs, and substitution are rejected. The working directory is the
-        workspace. The command does not receive API keys or the rest of the process
-        environment. purpose must be `inspect` for investigation or `verify` for a
-        command intended to validate requested behavior.
+        &&, ||, globs, substitution, and `~` expansion are rejected. The working
+        directory is the workspace. Use list_directory, search_files, or read_file for
+        filesystem discovery or inspection, including external paths. The command does
+        not receive API keys or the rest of the process environment. purpose must be
+        `inspect` for investigation or `verify` for a command intended to validate
+        requested behavior.
 
         Args:
             command: Program and arguments, for example `go test ./...`.

@@ -129,8 +129,10 @@ STAGE_4_INSTRUCTIONS = (
     "cannot run, say why. Final responses must be concise and state changes, verification evidence, "
     "and remaining limits. Use list_directory and search_files to discover files, read_file to inspect "
     "them, replace_in_file for one precise edit, write_file only to create or replace an entire file, "
-    "and run_command for a direct workspace command. Any filesystem path that resolves outside the workspace "
-    "requires explicit approval for that exact tool call. Do not invent patch syntax. When read_file "
+    "and run_command only for a direct workspace command. Never use run_command to list, find, or inspect "
+    "filesystem paths: use list_directory, search_files, or read_file instead, including for a literal ~/ path. "
+    "Any filesystem path that resolves outside the workspace requires explicit approval for that exact tool call. "
+    "Do not invent patch syntax. When read_file "
     "reports remaining_ranges, request the next start_line instead of assuming the rest of the file."
 )
 

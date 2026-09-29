@@ -20,12 +20,15 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.2**.
+branding are HANS. Current release: **0.7.3**.
 
-## What 0.7.2 provides
+## What 0.7.3 provides
 
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
+- Filesystem discovery and inspection use `list_directory`, `search_files`, and `read_file`; a literal
+  `~/...` path is routed through the existing explicit external-path approval. `run_command` remains a
+  direct, workspace-confined command runner and does not expand shell syntax or home paths.
 - `/clear` clears the active SDK `SQLiteSession` conversation history while preserving workspace
   files and local HANS controls.
 - A local, secret-free configured model catalog: `/models` shows configured profiles and

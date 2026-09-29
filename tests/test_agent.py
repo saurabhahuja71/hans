@@ -226,3 +226,5 @@ def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> Non
     assert "purpose=verify" in instructions
     assert "environment, dependency, configuration, or tool failures" in instructions
     assert "verification evidence" in instructions
+    assert "Never use run_command to list, find, or inspect" in instructions
+    assert "including for a literal ~/ path" in instructions

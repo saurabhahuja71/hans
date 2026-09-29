@@ -381,6 +381,17 @@ def test_run_command_rejects_shell_syntax(tmp_path: Path, command: str) -> None:
     assert "exit_code" not in result
 
 
+def test_run_command_routes_home_paths_to_approved_filesystem_tools(tmp_path: Path) -> None:
+    tool = make_run_command_tool(tmp_path)
+
+    result = invoke(tool, json.dumps({"command": "find ~/Desktop -maxdepth 1"}))
+
+    assert "does not expand `~`" in result
+    assert "list_directory, search_files, or read_file" in result
+    assert "explicit approval for external access" in result
+    assert "exit_code" not in result
+
+
 def test_run_command_rejects_parent_path(tmp_path: Path) -> None:
     tool = make_run_command_tool(tmp_path)
     result = invoke(tool, '{"command":"ls .."}')
