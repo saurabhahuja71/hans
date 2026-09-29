@@ -29,6 +29,9 @@ from bolt_next.events import (
     TaskDiff,
     TaskUndoRefused,
     TaskUndoSucceeded,
+    ToolApprovalDisplay,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -64,6 +67,292 @@ def run(coro):
 
 async def collect(runtime: HansRuntime, message: str):
     return [event async for event in runtime.submit(message)]
+
+
+async def collect_approval_resolution(
+    runtime: HansRuntime, request_id: str, call_id: str, approved: bool
+):
+    return [event async for event in runtime.resolve_tool_approval(request_id, call_id, approved)]
+
+
+class _ApprovalState:
+    def __init__(self) -> None:
+        self.approved: list[object] = []
+        self.rejected: list[object] = []
+
+    def approve(self, item: object) -> None:
+        self.approved.append(item)
+
+    def reject(self, item: object) -> None:
+        self.rejected.append(item)
+
+
+class _PausedApprovalResult:
+    def __init__(self, item: object | tuple[object, ...], state: _ApprovalState) -> None:
+        self.interruptions = item if isinstance(item, tuple) else (item,)
+        self._state = state
+        self.to_state_calls = 0
+
+    def cancel(self) -> None:
+        pass
+
+    def to_state(self) -> _ApprovalState:
+        self.to_state_calls += 1
+        return self._state
+
+    async def stream_events(self):
+        return
+        yield None
+
+
+class _FinishedResult:
+    def cancel(self) -> None:
+        pass
+
+    async def stream_events(self):
+        return
+        yield None
+
+
+class _ApprovalRunner:
+    def __init__(self, *results: object) -> None:
+        self._results = list(results)
+        self.calls: list[tuple[object, object]] = []
+
+    def run_streamed(self, agent: object, input_or_state: object, **_kwargs: object) -> object:
+        self.calls.append((agent, input_or_state))
+        return self._results.pop(0)
+
+
+@pytest.mark.parametrize("approved", (True, False))
+def test_native_tool_approval_decision_resumes_the_saved_sdk_state(approved: bool) -> None:
+    item = SimpleNamespace(
+        tool_name="write_file",
+        call_id="sdk-call-id",
+        raw_item=SimpleNamespace(arguments={"path": "task.txt", "content": "sk-secret-content"}),
+    )
+    state = _ApprovalState()
+    paused_result = _PausedApprovalResult(item, state)
+    runner = _ApprovalRunner(paused_result, _FinishedResult())
+    agent = SimpleNamespace(tools=())
+    runtime = HansRuntime(agent=agent, session=object(), runner=runner, interactive=lambda: True)
+
+    paused_events = run(collect(runtime, "Change the file."))
+
+    request = next(event for event in paused_events if isinstance(event, ToolApprovalRequested))
+    assert request.request_id == "request-1"
+    assert request.call_id == item.call_id
+    assert request.tool_name == "write_file"
+    assert request.category == "write"
+    assert request.display == ToolApprovalDisplay((("path", "task.txt"),))
+    assert "content" not in repr(request)
+    assert "sk-secret-content" not in repr(request)
+    assert paused_result.to_state_calls == 1
+    assert state.approved == []
+    assert state.rejected == []
+    assert not any(isinstance(event, RequestCompleted) for event in paused_events)
+    assert run(collect_approval_resolution(runtime, "request-stale", request.call_id, approved)) == [
+        RuntimeControlRejected("The approval request is stale or does not match the active request.")
+    ]
+    assert run(collect_approval_resolution(runtime, request.request_id, "call-stale", approved)) == [
+        RuntimeControlRejected("The approval request is stale or does not match the active request.")
+    ]
+    assert state.approved == []
+    assert state.rejected == []
+
+    resolved_events = run(collect_approval_resolution(runtime, request.request_id, request.call_id, approved))
+
+    assert resolved_events[0] == ToolApprovalResolved(request.request_id, request.call_id, approved)
+    assert (state.approved, state.rejected) == (([item], []) if approved else ([], [item]))
+    assert runner.calls[1] == (agent, state)
+    assert any(isinstance(event, RequestCompleted) for event in resolved_events)
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_fields"),
+    (
+        ("write_file", {"path": "task.txt", "content": "private"}, (("path", "task.txt"),)),
+        ("replace_in_file", {"path": "task.txt", "old": "private"}, (("path", "task.txt"),)),
+        ("read_file", {"path": "task.txt", "start_line": 4, "end_line": 8}, (("path", "task.txt"), ("range", "4-8"))),
+        ("list_directory", {"path": "src"}, (("path", "src"),)),
+        ("search_files", {"path": "src", "query": "token=private"}, (("path", "src"), ("query", "token=[REDACTED]"))),
+        ("run_command", {"command": "API_TOKEN=private pytest -q", "purpose": "other"}, (("command", "API_TOKEN=[REDACTED] pytest -q"), ("purpose", "inspect"))),
+    ),
+)
+def test_tool_approval_requests_expose_only_bounded_redacted_semantic_display_data(
+    tool_name: str, arguments: dict[str, object], expected_fields: tuple[tuple[str, str], ...]
+) -> None:
+    item = SimpleNamespace(
+        tool_name=tool_name,
+        raw_item=SimpleNamespace(call_id=f"call-{tool_name}", arguments=arguments),
+    )
+    state = _ApprovalState()
+    runtime = HansRuntime(
+        agent=SimpleNamespace(tools=()),
+        session=object(),
+        runner=_ApprovalRunner(_PausedApprovalResult(item, state)),
+        interactive=lambda: True,
+    )
+
+    request = next(event for event in run(collect(runtime, "Proceed.")) if isinstance(event, ToolApprovalRequested))
+
+    assert request.call_id == f"call-{tool_name}"
+    assert request.display == ToolApprovalDisplay(expected_fields)
+    assert "private" not in repr(request)
+    runtime.close()
+
+
+def test_tool_approval_display_bounds_command_values() -> None:
+    command = "x" * 300
+    item = SimpleNamespace(
+        tool_name="run_command",
+        raw_item=SimpleNamespace(call_id="call-long", arguments={"command": command, "purpose": "verify"}),
+    )
+    runtime = HansRuntime(
+        agent=SimpleNamespace(tools=()),
+        session=object(),
+        runner=_ApprovalRunner(_PausedApprovalResult(item, _ApprovalState())),
+        interactive=lambda: True,
+    )
+
+    request = next(event for event in run(collect(runtime, "Proceed.")) if isinstance(event, ToolApprovalRequested))
+
+    assert request.display.fields[-1] == ("purpose", "verify")
+    assert len(request.display.fields[0][1]) == 240
+    assert request.display.fields[0][1].endswith("…")
+    runtime.close()
+
+
+def test_noninteractive_tool_approval_rejects_with_the_native_sdk_signature() -> None:
+    item = SimpleNamespace(tool_name="run_command", call_id="sdk-call-id")
+    state = _ApprovalState()
+    runner = _ApprovalRunner(_PausedApprovalResult(item, state), _FinishedResult())
+    agent = SimpleNamespace(tools=())
+    runtime = HansRuntime(agent=agent, session=object(), runner=runner, interactive=lambda: False)
+
+    events = run(collect(runtime, "Run the command."))
+
+    assert state.rejected == [item]
+    assert runner.calls[1] == (agent, state)
+    assert not any(isinstance(event, ToolApprovalRequested) for event in events)
+    assert any(isinstance(event, RequestCompleted) for event in events)
+    runtime.close()
+
+
+def test_cancelled_paused_approval_cannot_mutate_or_resume_the_sdk_state() -> None:
+    item = SimpleNamespace(tool_name="write_file", call_id="sdk-call-id")
+    state = _ApprovalState()
+    runner = _ApprovalRunner(_PausedApprovalResult(item, state), _FinishedResult())
+    runtime = HansRuntime(agent=SimpleNamespace(tools=()), session=object(), runner=runner, interactive=lambda: True)
+
+    paused_events = run(collect(runtime, "Change the file."))
+    request = next(event for event in paused_events if isinstance(event, ToolApprovalRequested))
+
+    assert runtime.cancel_active() == RequestCancelled()
+    assert run(collect_approval_resolution(runtime, request.request_id, request.call_id, True)) == [
+        RuntimeControlRejected("The approval request is no longer active.")
+    ]
+    assert state.approved == []
+    assert state.rejected == []
+    assert len(runner.calls) == 1
+    runtime.close()
+
+
+def test_closed_paused_approval_cannot_mutate_or_resume_the_sdk_state() -> None:
+    item = SimpleNamespace(tool_name="write_file", call_id="sdk-call-id")
+    state = _ApprovalState()
+    runner = _ApprovalRunner(_PausedApprovalResult(item, state), _FinishedResult())
+    runtime = HansRuntime(agent=SimpleNamespace(tools=()), session=object(), runner=runner, interactive=lambda: True)
+
+    paused_events = run(collect(runtime, "Change the file."))
+    request = next(event for event in paused_events if isinstance(event, ToolApprovalRequested))
+    runtime.close()
+
+    assert run(collect_approval_resolution(runtime, request.request_id, request.call_id, False)) == [
+        RuntimeControlRejected("The approval request is no longer active.")
+    ]
+    assert state.approved == []
+    assert state.rejected == []
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("context", ("model", "session"))
+def test_paused_approval_cannot_resume_after_model_or_session_changes(context: str) -> None:
+    item = SimpleNamespace(tool_name="write_file", call_id="sdk-call-id")
+    state = _ApprovalState()
+    runner = _ApprovalRunner(_PausedApprovalResult(item, state), _FinishedResult())
+    runtime = HansRuntime(
+        agent=SimpleNamespace(tools=()), session=object(), runner=runner, interactive=lambda: True
+    )
+
+    paused_events = run(collect(runtime, "Change the file."))
+    request = next(event for event in paused_events if isinstance(event, ToolApprovalRequested))
+    if context == "model":
+        runtime._agent = SimpleNamespace(tools=())
+        runtime._model_generation += 1
+    else:
+        runtime._session = object()
+        runtime._session_generation += 1
+
+    assert run(collect_approval_resolution(runtime, request.request_id, request.call_id, True)) == [
+        RuntimeControlRejected("The approval request is stale or does not match the active request.")
+    ]
+    assert state.approved == []
+    assert state.rejected == []
+    assert len(runner.calls) == 1
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("first_approved", "second_approved"),
+    ((True, True), (True, False), (False, True), (False, False)),
+)
+def test_sequential_tool_approvals_use_one_saved_sdk_state_and_resume_once(
+    first_approved: bool, second_approved: bool
+) -> None:
+    first_item = SimpleNamespace(tool_name="write_file", call_id="sdk-call-one")
+    second_item = SimpleNamespace(tool_name="run_command", call_id="sdk-call-two")
+    state = _ApprovalState()
+    paused_result = _PausedApprovalResult((first_item, second_item), state)
+    runner = _ApprovalRunner(paused_result, _FinishedResult())
+    agent = SimpleNamespace(tools=())
+    runtime = HansRuntime(agent=agent, session=object(), runner=runner, interactive=lambda: True)
+
+    paused_events = run(collect(runtime, "Change the file and verify it."))
+    first_request = next(event for event in paused_events if isinstance(event, ToolApprovalRequested))
+    first_resolution = run(
+        collect_approval_resolution(runtime, first_request.request_id, first_request.call_id, first_approved)
+    )
+    second_request = next(event for event in first_resolution if isinstance(event, ToolApprovalRequested))
+
+    assert second_request.request_id == first_request.request_id
+    assert second_request.call_id != first_request.call_id
+    assert first_resolution[:2] == [
+        ToolApprovalResolved(first_request.request_id, first_request.call_id, first_approved),
+        second_request,
+    ]
+    assert paused_result.to_state_calls == 1
+    assert (state.approved, state.rejected) == (([first_item], []) if first_approved else ([], [first_item]))
+    assert len(runner.calls) == 1
+    assert run(
+        collect_approval_resolution(runtime, first_request.request_id, first_request.call_id, first_approved)
+    ) == [RuntimeControlRejected("The approval request is stale or does not match the active request.")]
+    assert len(runner.calls) == 1
+
+    final_events = run(
+        collect_approval_resolution(runtime, second_request.request_id, second_request.call_id, second_approved)
+    )
+
+    assert final_events[0] == ToolApprovalResolved(
+        second_request.request_id, second_request.call_id, second_approved
+    )
+    assert state.approved == [item for item, approved in ((first_item, first_approved), (second_item, second_approved)) if approved]
+    assert state.rejected == [item for item, approved in ((first_item, first_approved), (second_item, second_approved)) if not approved]
+    assert runner.calls[1] == (agent, state)
+    assert len(runner.calls) == 2
+    assert any(isinstance(event, RequestCompleted) for event in final_events)
+    runtime.close()
 
 
 def make_agent(model: ScriptedModel, workspace: Path) -> Agent:
@@ -488,7 +777,7 @@ def test_permission_policy_blocks_every_workspace_tool_and_allow_restores_execut
     )
     runtime = HansRuntime(agent=make_agent(model, tmp_path), session=SQLiteSession(f"permission-{tool_name}"))
 
-    assert runtime.set_permission(category, False) == PermissionPolicyChanged(category, False)
+    assert runtime.set_permission(category, "deny") == PermissionPolicyChanged(category, "deny")
     denied_events = run(collect(runtime, "Try the tool."))
     assert ToolOutput("denied", f"Permission denied: {category} operations are disabled.") in denied_events
     assert any(
@@ -496,7 +785,7 @@ def test_permission_policy_blocks_every_workspace_tool_and_allow_restores_execut
     )
     assert_denied(tmp_path)
 
-    assert runtime.set_permission(category, True) == PermissionPolicyChanged(category, True)
+    assert runtime.set_permission(category, "allow") == PermissionPolicyChanged(category, "allow")
     allowed_events = run(collect(runtime, "Try the tool again."))
     assert any(
         isinstance(event, ToolCompleted) and event.call_id == "allowed" and event.success for event in allowed_events
@@ -539,11 +828,11 @@ def test_clear_session_history_removes_sdk_history_and_preserves_runtime_control
         runtime_module.create_agent = original_create_agent
     assert session_items(session)
     assert "task.txt" in runtime.task_diff().diff
-    assert runtime.set_permission("write", False) == PermissionPolicyChanged("write", False)
+    assert runtime.set_permission("write", "deny") == PermissionPolicyChanged("write", "deny")
 
     assert run(runtime.clear_session_history()) == SessionCleared()
     assert session_items(session) == []
-    assert runtime.get_control_status() == RuntimeControlStatus(True, False, True)
+    assert runtime.get_control_status() == RuntimeControlStatus("allow", "deny", "allow")
     assert "task.txt" in runtime.task_diff().diff
     follow_up_events = run(collect(runtime, "What was the remembered value?"))
 
@@ -576,11 +865,11 @@ def test_controls_reject_while_active_and_work_after_cancellation() -> None:
         runtime = HansRuntime(agent=object(), session=session, runner=_Runner())
         task = asyncio.create_task(collect(runtime, "Wait."))
         await asyncio.sleep(0.01)
-        busy_permission = runtime.set_permission("write", False)
+        busy_permission = runtime.set_permission("write", "deny")
         busy_clear = await runtime.clear_session_history()
         runtime.cancel_active()
         events = await asyncio.wait_for(task, timeout=1)
-        idle_permission = runtime.set_permission("write", False)
+        idle_permission = runtime.set_permission("write", "deny")
         idle_clear = await runtime.clear_session_history()
         session.close()
         return busy_permission, busy_clear, events, idle_permission, idle_clear
@@ -589,7 +878,7 @@ def test_controls_reject_while_active_and_work_after_cancellation() -> None:
     assert busy_permission == RuntimeControlRejected("Permission changes are available when HANS is idle.")
     assert busy_clear == RuntimeControlRejected("Cannot clear the session while HANS is busy.")
     assert any(isinstance(event, RequestCancelled) for event in events)
-    assert idle_permission == PermissionPolicyChanged("write", False)
+    assert idle_permission == PermissionPolicyChanged("write", "deny")
     assert idle_clear == SessionCleared()
 
 

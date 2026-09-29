@@ -60,9 +60,13 @@ def task_summary_has_hans_changes(summary: str) -> bool:
     return False
 
 
-def footer_text(state: str, *, request_active: bool, has_task_changes: bool) -> str:
+def footer_text(
+    state: str, *, request_active: bool, has_task_changes: bool, approval_pending: bool = False
+) -> str:
     """Return compact controls for the current semantic task state."""
     stage = state.partition("·")[0].strip() or "IDLE"
+    if approval_pending:
+        return "? APPROVAL REQUIRED · y approve · n deny · Ctrl-C cancel · Ctrl-Q quit"
     if request_active:
         return f"◉ {stage} · Ctrl-C cancel · Ctrl-Q quit"
     if stage == "COMPLETE":
@@ -78,11 +82,18 @@ def footer_text(state: str, *, request_active: bool, has_task_changes: bool) -> 
     return "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
 
 
+def format_approval_request(tool_name: str, category: str, fields: tuple[tuple[str, str], ...]) -> str:
+    details = "\n".join(f"{name}: {value}" for name, value in fields)
+    prompt = f"APPROVAL REQUIRED\nApprove {tool_name} ({category})? y / n"
+    return f"{prompt}\n{details}" if details else prompt
+
+
 @dataclass
 class Piece:
     kind: str
     text: str
     detail: str = ""
+    fields: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -133,6 +144,10 @@ class Transcript:
     def verification(self, command: str, *, ok: bool) -> None:
         marker = "passed" if ok else "failed"
         self.pieces.append(Piece("verification", command, marker))
+
+    def approval(self, tool_name: str, category: str, fields: tuple[tuple[str, str], ...]) -> None:
+        self._drop_status()
+        self.pieces.append(Piece("approval", tool_name, category, fields))
 
     def change(self, text: str, *, title: str = "CHANGES") -> None:
         self._drop_status()
@@ -190,6 +205,8 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
     if piece.kind == "verification":
         mark = "✓" if piece.detail == "passed" else "✗"
         return _wrap(f"VERIFICATION\n{mark} {piece.text} {piece.detail}", width, "  ")
+    if piece.kind == "approval":
+        return _wrap(format_approval_request(piece.text, piece.detail, piece.fields), width, "  ")
     if piece.kind == "change":
         return _wrap(f"{piece.detail}\n{piece.text}", width, "  ")
     if piece.kind == "diff":
@@ -354,7 +371,7 @@ class TodoList:
 class LocalControl:
     kind: str
     category: str | None = None
-    allowed: bool | None = None
+    policy: str | None = None
     mode: str | None = None
     model_id: str | None = None
 
@@ -456,13 +473,13 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
         if not values:
             return LocalCommand(True, control=LocalControl("permissions_status"))
         if len(values) != 2:
-            return LocalCommand(True, "Usage: /permissions [read|write|execute] [allow|deny]")
+            return LocalCommand(True, "Usage: /permissions [read|write|execute] [allow|deny|ask]")
         category, value = values
         if category not in {"read", "write", "execute"}:
             return LocalCommand(True, f"Unknown permission: {category}")
-        if value not in {"allow", "deny"}:
-            return LocalCommand(True, "Expected allow or deny.")
-        return LocalCommand(True, control=LocalControl("set_permission", category, value == "allow"))
+        if value not in {"allow", "deny", "ask"}:
+            return LocalCommand(True, "Expected allow, deny, or ask.")
+        return LocalCommand(True, control=LocalControl("set_permission", category=category, policy=value))
     if normalized_command == "/clear":
         if argument:
             return LocalCommand(True, "Usage: /clear")

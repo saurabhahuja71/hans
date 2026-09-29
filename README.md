@@ -20,9 +20,9 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.5.2**.
+branding are HANS. Current release: **0.6.0**.
 
-## What 0.5.2 provides
+## What 0.6.0 provides
 
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
@@ -34,7 +34,9 @@ branding are HANS. Current release: **0.5.2**.
   history is never copied or silently reused. Failed switches leave the active model and session
   unchanged.
 - `/mode` validates a session-scoped reasoning override against declared model capabilities and
-  applies it only to later requests. `/compact` and approval/ask permissions remain unimplemented.
+  applies it only to later requests. `/compact` remains unimplemented.
+- The `ask` permission policy pauses eligible tools for an explicit terminal approval. Approval prompts
+  show bounded, redacted tool details rather than tool payloads.
 
 ## Configuration
 
@@ -245,9 +247,9 @@ environment with toolchain, locale, certificate, temporary-directory, and worksp
 keys and the rest of the process environment are not copied or printed.
 
 This is not a complete sandbox. The process still runs as the same user. A tool such as `go` can
-read its own `GOROOT` or module cache outside the workspace. There is no seccomp profile, mount
-namespace, or approval prompt. The boundary is argv checking plus a reduced environment. There is
-no `run_shell`.
+read its own `GOROOT` or module cache outside the workspace. There is no seccomp profile or mount
+namespace. An approval prompt is a human control, not a security boundary; the boundary is argv
+checking plus a reduced environment. There is no `run_shell`.
 
 ## Development
 
@@ -264,5 +266,4 @@ controls, and HTTPS-only upgrade dispatch. Unit tests do not establish live-prov
 
 ## What is not in this version
 
-A human approval step before `run_command` is not implemented. Session history is in memory and
-ends when the process exits.
+`/compact` is not implemented. Session history is in memory and ends when the process exits.

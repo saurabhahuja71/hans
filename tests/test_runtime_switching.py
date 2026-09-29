@@ -170,14 +170,14 @@ def test_failed_switch_is_atomic_and_old_runtime_can_still_submit(
         session_factory=session_factory,
     )
     try:
-        assert runtime.set_permission("write", False) == PermissionPolicyChanged("write", False)
+        assert runtime.set_permission("write", "deny") == PermissionPolicyChanged("write", "deny")
         before_filter = runtime._context_filter
         rejected = runtime.select_model("large")
         assert rejected == RuntimeControlRejected("Unable to start the selected model.")
         assert runtime._agent is old_agent
         assert runtime._session is old_session
         assert runtime._context_filter is before_filter
-        assert runtime.get_control_status().write_allowed is False
+        assert runtime.get_control_status().write_policy == "deny"
 
         events = run(collect(runtime, "Can the old runtime answer?"))
         assert any(getattr(event, "text", None) == "old runtime still works" for event in events)
@@ -259,7 +259,7 @@ def test_permission_policy_wraps_target_tools_after_switch(monkeypatch: pytest.M
     old_session = SQLiteSession("switch-permissions-old")
     runtime = HansRuntime(workspace=str(tmp_path), session=old_session, agent_factory=factory)
     try:
-        assert runtime.set_permission("write", False) == PermissionPolicyChanged("write", False)
+        assert runtime.set_permission("write", "deny") == PermissionPolicyChanged("write", "deny")
         assert isinstance(runtime.select_model("large"), ModelChanged)
 
         events = run(collect(runtime, "Try writing."))

@@ -124,9 +124,9 @@ class TaskUndoRefused:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeControlStatus:
-    read_allowed: bool
-    write_allowed: bool
-    execute_allowed: bool
+    read_policy: str
+    write_policy: str
+    execute_policy: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +159,28 @@ class ReasoningModeChanged:
 @dataclass(frozen=True, slots=True)
 class PermissionPolicyChanged:
     category: str
-    allowed: bool
+    policy: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolApprovalDisplay:
+    fields: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolApprovalRequested:
+    request_id: str
+    call_id: str
+    tool_name: str
+    category: str
+    display: ToolApprovalDisplay
+
+
+@dataclass(frozen=True, slots=True)
+class ToolApprovalResolved:
+    request_id: str
+    call_id: str
+    approved: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +218,8 @@ HansEvent = (
     | ReasoningModeStatus
     | ReasoningModeChanged
     | PermissionPolicyChanged
+    | ToolApprovalRequested
+    | ToolApprovalResolved
     | SessionCleared
     | RuntimeControlRejected
 )

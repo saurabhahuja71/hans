@@ -21,6 +21,9 @@ from bolt_next.events import (
     TaskDiff,
     TaskUndoRefused,
     TaskUndoSucceeded,
+    ToolApprovalDisplay,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -110,6 +113,41 @@ def test_footer_text_uses_semantic_task_context(
     assert (
         footer_text(state, request_active=request_active, has_task_changes=has_task_changes)
         == expected
+    )
+
+
+def test_curses_display_renders_tool_approval_and_approval_controls() -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+
+    display.event(
+        ToolApprovalRequested(
+            "request-1", "call-1", "write_file", "write", ToolApprovalDisplay((("path", "task.txt"),))
+        )
+    )
+
+    assert display.approval_pending == ("request-1", "call-1")
+    assert display.request_active is True
+    assert display.state == "APPROVAL REQUIRED"
+    display.event(
+        ToolApprovalRequested(
+            "request-1", "call-2", "run_command", "execute", ToolApprovalDisplay((("command", "pytest -q"),))
+        )
+    )
+    assert display.approval_pending == ("request-1", "call-2")
+    display.event(ToolApprovalResolved("request-1", "call-1", True))
+    assert display.approval_pending == ("request-1", "call-2")
+    rendered = "\n".join(transcript.render(120))
+    assert "  APPROVAL REQUIRED\n  Approve write_file (write)? y / n\n  path: task.txt" in rendered
+    assert "private write content" not in rendered
+    assert (
+        footer_text(
+            display.state,
+            request_active=display.request_active,
+            has_task_changes=display.has_task_changes,
+            approval_pending=True,
+        )
+        == "? APPROVAL REQUIRED · y approve · n deny · Ctrl-C cancel · Ctrl-Q quit"
     )
 
 
@@ -426,7 +464,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
 
     assert status.control is not None and status.control.kind == "permissions_status"
     assert changed.control is not None
-    assert (changed.control.kind, changed.control.category, changed.control.allowed) == ("set_permission", "write", False)
+    assert (changed.control.kind, changed.control.category, changed.control.policy) == ("set_permission", "write", "deny")
     assert clear.control is not None and clear.control.kind == "clear_session"
     assert model_status.control is not None and model_status.control.kind == "model_status"
     assert reasoning_status.control is not None and reasoning_status.control.kind == "reasoning_mode_status"
@@ -438,15 +476,15 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert unknown_model.control is not None
     assert (unknown_model.control.kind, unknown_model.control.model_id) == ("select_model", "missing")
     assert handle_local_command("/permissions foo allow", todos).text == "Unknown permission: foo"
-    assert handle_local_command("/permissions write maybe", todos).text == "Expected allow or deny."
+    assert handle_local_command("/permissions write maybe", todos).text == "Expected allow, deny, or ask."
     assert handle_local_command("/permissions write", todos).text == (
-        "Usage: /permissions [read|write|execute] [allow|deny]"
+        "Usage: /permissions [read|write|execute] [allow|deny|ask]"
     )
     assert handle_local_command("/clear now", todos).text == "Usage: /clear"
 
     class Runtime:
         def __init__(self) -> None:
-            self.permissions = {"read": True, "write": True, "execute": True}
+            self.permissions = {"read": "allow", "write": "allow", "execute": "allow"}
             self.calls: list[tuple[object, ...]] = []
             self.models = (
                 ModelInfo(
@@ -471,12 +509,16 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
 
         def get_control_status(self) -> RuntimeControlStatus:
             self.calls.append(("status",))
-            return RuntimeControlStatus(**{f"{name}_allowed": allowed for name, allowed in self.permissions.items()})
+            return RuntimeControlStatus(
+                read_policy=self.permissions["read"],
+                write_policy=self.permissions["write"],
+                execute_policy=self.permissions["execute"],
+            )
 
-        def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged:
-            self.calls.append(("permission", category, allowed))
-            self.permissions[category] = allowed
-            return PermissionPolicyChanged(category, allowed)
+        def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged:
+            self.calls.append(("permission", category, policy))
+            self.permissions[category] = policy
+            return PermissionPolicyChanged(category, policy)
 
         async def clear_session_history(self) -> SessionCleared:
             self.calls.append(("clear",))
@@ -538,7 +580,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     rendered = "\n".join(transcript.render(120))
     assert runtime.calls == [
         ("status",),
-        ("permission", "write", False),
+        ("permission", "write", "deny"),
         ("clear",),
         ("model_status",),
         ("reasoning_mode_status",),

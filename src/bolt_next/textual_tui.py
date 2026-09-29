@@ -39,6 +39,8 @@ from bolt_next.events import (
     TaskDiff,
     TaskUndoRefused,
     TaskUndoSucceeded,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -53,6 +55,7 @@ from bolt_next.tui_screen import (
     TodoList,
     display_bounded,
     footer_text,
+    format_approval_request,
     format_change_summary,
     format_model_changed,
     format_model_status,
@@ -67,7 +70,11 @@ from bolt_next.tui_screen import (
 class Runtime(Protocol):
     def submit(self, message: str) -> AsyncIterator[HansEvent]: ...
 
-    def cancel_active(self) -> None: ...
+    def cancel_active(self) -> RequestCancelled | None: ...
+
+    def resolve_tool_approval(
+        self, request_id: str, call_id: str, approved: bool
+    ) -> AsyncIterator[HansEvent]: ...
 
     def task_diff(self, *, max_chars: int | None = None) -> TaskDiff: ...
 
@@ -75,7 +82,7 @@ class Runtime(Protocol):
 
     def get_control_status(self) -> RuntimeControlStatus: ...
 
-    def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged | RuntimeControlRejected: ...
+    def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged | RuntimeControlRejected: ...
 
     async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected: ...
 
@@ -183,6 +190,13 @@ class ThemeScreen(ModalScreen[None]):
 
     def action_close(self) -> None:
         self.dismiss()
+
+
+class ComposerTextArea(TextArea):
+    def on_key(self, event: Key) -> None:
+        handler = getattr(self.app, "_handle_approval_key", None)
+        if handler is not None and handler(event):
+            return
 
 
 class HansTextualApp(App[None]):
@@ -314,6 +328,8 @@ class HansTextualApp(App[None]):
         self._transcript_rows: deque[Static] = deque()
         self._verification_failed = False
         self._request_active = False
+        self._approval_pending: tuple[str, str] | None = None
+        self._approval_resolving = False
         self._has_task_changes = False
         self._state = "IDLE"
         self._closed = False
@@ -323,7 +339,7 @@ class HansTextualApp(App[None]):
         yield VerticalScroll(id="transcript")
         yield Static(self._state, id="state-line", markup=False)
         yield Static(self._footer_text(), id="footer", markup=False)
-        yield TextArea("", id="composer")
+        yield ComposerTextArea("", id="composer")
 
     def on_mount(self) -> None:
         self._register_themes()
@@ -368,7 +384,26 @@ class HansTextualApp(App[None]):
         rows = min(self.MAX_COMPOSER_ROWS, max(1, event.text_area.text.count("\n") + 1))
         event.text_area.styles.height = rows + 2
 
+    def _handle_approval_key(self, event: Key) -> bool:
+        if self._approval_pending is None and not self._approval_resolving:
+            return False
+        event.stop()
+        event.prevent_default()
+        if event.key in {"y", "n"} and self._approval_pending is not None and not self._approval_resolving:
+            request_id, call_id = self._approval_pending
+            self._approval_pending = None
+            self._approval_resolving = True
+            self._set_state("RESUMING", "approval resolved")
+            self._resolve_approval(request_id, call_id, event.key == "y")
+        elif event.key == "ctrl+c":
+            self.action_cancel_active()
+        elif event.key == "ctrl+q":
+            self.action_exit_app()
+        return True
+
     def on_key(self, event: Key) -> None:
+        if self._handle_approval_key(event):
+            return
         if event.key == "ctrl+y" and isinstance(self.screen, DetailScreen):
             event.stop()
             event.prevent_default()
@@ -409,6 +444,7 @@ class HansTextualApp(App[None]):
             self._state,
             request_active=self._request_active,
             has_task_changes=self._has_task_changes,
+            approval_pending=bool(self._approval_pending),
         )
 
     def _update_footer(self) -> None:
@@ -637,6 +673,16 @@ class HansTextualApp(App[None]):
             elif self._assistant_widget is not None:
                 self._update_assistant(f"HANS\n{final_text}")
             self._assistant_text = final_text
+        elif isinstance(event, ToolApprovalRequested):
+            self._approval_pending = (event.request_id, event.call_id)
+            self._request_active = True
+            self._set_state("APPROVAL REQUIRED")
+            await self._append_transcript(
+                format_approval_request(event.tool_name, event.category, event.display.fields), "change"
+            )
+        elif isinstance(event, ToolApprovalResolved):
+            if self._approval_pending == (event.request_id, event.call_id):
+                self._approval_pending = None
         elif isinstance(event, ToolStarted):
             self._tool_names[event.call_id] = event.name
             self._tool_details[event.call_id] = self._compact(event.detail, self.MAX_TOOL_DETAIL_CHARS)
@@ -684,6 +730,7 @@ class HansTextualApp(App[None]):
         elif isinstance(event, RequestCompleted):
             await self._flush_assistant_deltas()
             self._request_active = False
+            self._approval_pending = None
             if event.evidence is None:
                 result = "COMPLETE\nVerification not established"
                 result_class = "final"
@@ -704,11 +751,13 @@ class HansTextualApp(App[None]):
         elif isinstance(event, RequestCancelled):
             await self._flush_assistant_deltas()
             self._request_active = False
+            self._approval_pending = None
             self._set_state("CANCELLED")
             await self._append_transcript("CANCELLED\nThe request was stopped. You can send another prompt.", "error")
         elif isinstance(event, RequestFailed):
             await self._flush_assistant_deltas()
             self._request_active = False
+            self._approval_pending = None
             title = self._failure_title(event.category)
             self._set_state("FAILED", title)
             await self._append_transcript(f"ERROR\n✗ {title}\n{event.message}", "error")
@@ -741,11 +790,11 @@ class HansTextualApp(App[None]):
         elif isinstance(event, RuntimeControlStatus):
             lines = ["Permissions"]
             lines.extend(
-                f"{name:<10} {'✓ allow' if allowed else '✗ deny'}"
-                for name, allowed in (
-                    ("read", event.read_allowed),
-                    ("write", event.write_allowed),
-                    ("execute", event.execute_allowed),
+                f"{name:<10} {policy}"
+                for name, policy in (
+                    ("read", event.read_policy),
+                    ("write", event.write_policy),
+                    ("execute", event.execute_policy),
                 )
             )
             await self._append_transcript("\n".join(lines), "change")
@@ -773,9 +822,8 @@ class HansTextualApp(App[None]):
         elif isinstance(event, ReasoningModeChanged):
             await self._append_transcript(format_reasoning_mode_changed(event.mode), "change")
         elif isinstance(event, PermissionPolicyChanged):
-            value = "allow" if event.allowed else "deny"
             await self._append_transcript(
-                f"PERMISSIONS\n✓ {event.category} permission set to {value}.", "change"
+                f"PERMISSIONS\n✓ {event.category} permission set to {event.policy}.", "change"
             )
         elif isinstance(event, SessionCleared):
             await self._append_transcript(
@@ -789,6 +837,8 @@ class HansTextualApp(App[None]):
             self.query_one("#hans-header", Static).update(self._header_text())
 
     def action_submit_or_exit(self) -> None:
+        if self._approval_pending is not None or self._approval_resolving:
+            return
         composer = self.query_one("#composer", TextArea)
         prompt = composer.text
         if not prompt.strip() or is_exit_command(prompt):
@@ -814,12 +864,16 @@ class HansTextualApp(App[None]):
         self._submit(prompt)
 
     def action_insert_newline(self) -> None:
-        self.query_one("#composer", TextArea).insert("\n")
+        if self._approval_pending is None and not self._approval_resolving:
+            self.query_one("#composer", TextArea).insert("\n")
 
     def action_cancel_active(self) -> None:
         if self._request_active:
-            self.runtime.cancel_active()
-            self._set_state("CANCELLED", "cancellation requested")
+            event = self.runtime.cancel_active()
+            if event is not None:
+                self._render_runtime_event(event)
+            else:
+                self._set_state("CANCELLED", "cancellation requested")
         else:
             self.query_one("#composer", TextArea).text = ""
 
@@ -860,11 +914,15 @@ class HansTextualApp(App[None]):
     async def _render_task_event(self, event: TaskDiff | TaskUndoSucceeded | TaskUndoRefused) -> None:
         await self._render_event(event)
 
+    @work(exclusive=False)
+    async def _render_runtime_event(self, event: HansEvent) -> None:
+        await self._render_event(event)
+
     async def _dispatch_control(self, control: LocalControl) -> None:
         if control.kind == "permissions_status":
             event = self.runtime.get_control_status()
         elif control.kind == "set_permission":
-            event = self.runtime.set_permission(control.category or "", bool(control.allowed))
+            event = self.runtime.set_permission(control.category or "", control.policy or "")
         elif control.kind == "clear_session":
             event = await self.runtime.clear_session_history()
         elif control.kind == "model_status":
@@ -886,7 +944,19 @@ class HansTextualApp(App[None]):
             async for event in self.runtime.submit(prompt):
                 await self._render_event(event)
         finally:
-            self._request_active = False
+            if self._approval_pending is None:
+                self._request_active = False
+            self._update_footer()
+
+    @work(group="tool-approval", exclusive=True)
+    async def _resolve_approval(self, request_id: str, call_id: str, approved: bool) -> None:
+        try:
+            async for event in self.runtime.resolve_tool_approval(request_id, call_id, approved):
+                await self._render_event(event)
+        finally:
+            self._approval_resolving = False
+            if self._approval_pending is None:
+                self._request_active = False
             self._update_footer()
 
     def _close_runtime(self) -> None:

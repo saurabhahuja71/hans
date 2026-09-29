@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import pytest
 from textual.containers import VerticalScroll
 from textual.widgets import Static, TextArea
 
@@ -27,6 +28,9 @@ from bolt_next.events import (
     TaskDiff,
     TaskUndoRefused,
     TaskUndoSucceeded,
+    ToolApprovalDisplay,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -48,7 +52,7 @@ class FakeRuntime:
         self.closed = 0
         self.task_diff_calls: list[int | None] = []
         self.undo_calls = 0
-        self.permissions = {"read": True, "write": True, "execute": True}
+        self.permissions = {"read": "allow", "write": "allow", "execute": "allow"}
         self.control_calls: list[tuple[object, ...]] = []
         self.models = (
             ModelInfo(
@@ -72,6 +76,11 @@ class FakeRuntime:
         self.reasoning_mode: str | None = None
         self.diff_event = TaskDiff("--- a/task.txt\n+++ b/task.txt\n+updated")
         self.undo_event: TaskUndoSucceeded | TaskUndoRefused = TaskUndoSucceeded((), ())
+        self.approval_calls: list[tuple[str, str, bool]] = []
+        self.approval_events: list[object] = []
+        self.approval_event_batches: list[list[object]] = []
+        self.approval_started = asyncio.Event()
+        self.approval_release = asyncio.Event()
 
     async def submit(self, message: str) -> AsyncIterator[object]:
         self.prompts.append(message)
@@ -81,6 +90,16 @@ class FakeRuntime:
 
     def cancel_active(self) -> None:
         self.cancelled += 1
+
+    async def resolve_tool_approval(
+        self, request_id: str, call_id: str, approved: bool
+    ) -> AsyncIterator[object]:
+        self.approval_calls.append((request_id, call_id, approved))
+        self.approval_started.set()
+        await self.approval_release.wait()
+        events = self.approval_event_batches.pop(0) if self.approval_event_batches else self.approval_events
+        for event in events:
+            yield event
 
     def task_diff(self, *, max_chars: int | None = None) -> TaskDiff:
         self.task_diff_calls.append(max_chars)
@@ -92,15 +111,15 @@ class FakeRuntime:
 
     def get_control_status(self) -> RuntimeControlStatus:
         return RuntimeControlStatus(
-            read_allowed=self.permissions["read"],
-            write_allowed=self.permissions["write"],
-            execute_allowed=self.permissions["execute"],
+            read_policy=self.permissions["read"],
+            write_policy=self.permissions["write"],
+            execute_policy=self.permissions["execute"],
         )
 
-    def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged:
-        self.control_calls.append(("permission", category, allowed))
-        self.permissions[category] = allowed
-        return PermissionPolicyChanged(category, allowed)
+    def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged:
+        self.control_calls.append(("permission", category, policy))
+        self.permissions[category] = policy
+        return PermissionPolicyChanged(category, policy)
 
     async def clear_session_history(self) -> SessionCleared:
         self.control_calls.append(("clear", None, None))
@@ -199,6 +218,94 @@ def test_empty_exit_and_ctrl_q_do_not_submit(tmp_path: Path) -> None:
     asyncio.run(scenario(tuple("exit") + ("enter",)))
     asyncio.run(scenario(tuple("quit") + ("enter",)))
     asyncio.run(scenario(("ctrl+q",)))
+
+
+def approval_event(
+    request_id: str, call_id: str, tool_name: str, category: str, fields: tuple[tuple[str, str], ...] = ()
+) -> ToolApprovalRequested:
+    return ToolApprovalRequested(request_id, call_id, tool_name, category, ToolApprovalDisplay(fields))
+
+
+@pytest.mark.parametrize(("key", "approved"), (("y", True), ("n", False)))
+def test_textual_resolves_tool_approval_without_leaving_a_stale_prompt(
+    tmp_path: Path, key: str, approved: bool
+) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.approval_events = [ToolApprovalResolved("request-1", "call-1", approved), RequestCompleted(None)]
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(
+                approval_event("request-1", "call-1", "write_file", "write", (("path", "task.txt"),))
+            )
+            assert app._approval_pending == ("request-1", "call-1")
+            assert rendered(app.query_one("#footer", Static)).startswith("? APPROVAL REQUIRED")
+            assert "path: task.txt" in transcript_text(app)
+            assert "private content" not in transcript_text(app)
+
+            await pilot.press(key)
+            await asyncio.wait_for(runtime.approval_started.wait(), timeout=1)
+
+            assert runtime.approval_calls == [("request-1", "call-1", approved)]
+            assert app._approval_pending is None
+            assert app._approval_resolving is True
+            assert rendered(app.query_one("#state-line", Static)).startswith("RESUMING")
+            assert rendered(app.query_one("#footer", Static)).startswith("◉ RESUMING")
+            await pilot.press(*"blocked", "ctrl+d")
+            assert app.query_one("#composer", TextArea).text == ""
+            assert runtime.prompts == []
+
+            runtime.approval_release.set()
+            await pilot.pause()
+            await pilot.pause()
+            assert app._approval_resolving is False
+            assert app._request_active is False
+            assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
+
+    asyncio.run(scenario())
+
+
+def test_textual_replaces_a_resolved_approval_with_the_next_semantic_request(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.approval_event_batches = [
+            [
+                ToolApprovalResolved("request-1", "call-1", True),
+                approval_event("request-1", "call-2", "run_command", "execute", (("command", "pytest -q"),)),
+            ],
+            [ToolApprovalResolved("request-1", "call-2", False), RequestCompleted(None)],
+        ]
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(approval_event("request-1", "call-1", "write_file", "write"))
+            await pilot.press("y")
+            await asyncio.wait_for(runtime.approval_started.wait(), timeout=1)
+            runtime.approval_release.set()
+            await pilot.pause()
+            await pilot.pause()
+
+            assert runtime.approval_calls == [("request-1", "call-1", True)]
+            assert app._approval_pending == ("request-1", "call-2")
+            assert app._approval_resolving is False
+            assert app._request_active is True
+            assert rendered(app.query_one("#footer", Static)).startswith("? APPROVAL REQUIRED")
+            await pilot.press(*"blocked", "ctrl+d")
+            assert app.query_one("#composer", TextArea).text == ""
+            assert runtime.prompts == []
+
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.pause()
+            assert runtime.approval_calls == [
+                ("request-1", "call-1", True),
+                ("request-1", "call-2", False),
+            ]
+            assert app._approval_pending is None
+            assert app._approval_resolving is False
+            assert app._request_active is False
+            assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
+
+    asyncio.run(scenario())
 
 
 def test_textual_renders_inline_stable_tools_without_normal_raw_output(tmp_path: Path) -> None:
@@ -564,9 +671,9 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             await submit(pilot, "/todo list")
             await submit(pilot, "/unknown")
             assert runtime.prompts == []
-            assert runtime.permissions == {"read": True, "write": False, "execute": True}
+            assert runtime.permissions == {"read": "allow", "write": "deny", "execute": "allow"}
             assert runtime.control_calls == [
-                ("permission", "write", False),
+                ("permission", "write", "deny"),
                 ("clear", None, None),
             ]
             text = transcript_text(app)
@@ -578,7 +685,7 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             assert "TODO\n  #2 survive clear" in text
             assert app._theme_name == "light"
             assert app.theme == "hans-light"
-            assert "Permissions\nread       ✓ allow\nwrite      ✓ allow\nexecute    ✓ allow" in text
+            assert "Permissions\nread       allow\nwrite      allow\nexecute    allow" in text
             assert "write permission set to deny." in text
             assert "Conversation history cleared." in text
             assert "Workspace and local HANS state preserved." in text
@@ -594,7 +701,7 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             await submit(pilot, "/mode high extra")
             assert runtime.prompts == []
             assert runtime.control_calls == [
-                ("permission", "write", False),
+                ("permission", "write", "deny"),
                 ("clear", None, None),
                 ("model_status",),
                 ("reasoning_mode_status",),

@@ -32,25 +32,43 @@ _TOOL_PERMISSION_GROUPS = {
 }
 
 
-def apply_tool_permission_policy(agent: Agent, is_allowed: Callable[[str], bool]) -> None:
-    """Apply a runtime-owned permission policy to the HANS workspace tools."""
+def apply_tool_permission_policy(agent: Agent, get_policy: Callable[[str], str]) -> None:
+    """Install runtime-owned dynamic policy hooks on HANS workspace tools."""
     for tool in getattr(agent, "tools", ()):
         category = _TOOL_PERMISSION_GROUPS.get(getattr(tool, "name", ""))
         if category is None:
             continue
-        original_invoke = getattr(tool, "on_invoke_tool", None)
-        if not callable(original_invoke):
-            continue
+        original_invoke = getattr(tool, "_hans_original_invoke", None)
+        if original_invoke is None:
+            original_invoke = getattr(tool, "on_invoke_tool", None)
+            if not callable(original_invoke):
+                continue
+            setattr(tool, "_hans_original_invoke", original_invoke)
+            setattr(tool, "_hans_original_needs_approval", getattr(tool, "needs_approval", False))
 
-        async def invoke(context, arguments, *, category=category, original_invoke=original_invoke):
-            if not is_allowed(category):
-                return f"Permission denied: {category} operations are disabled."
-            result = original_invoke(context, arguments)
-            if inspect.isawaitable(result):
-                return await result
-            return result
+            async def invoke(context, arguments, *, tool=tool, category=category):
+                if getattr(tool, "_hans_get_policy")(category) == "deny":
+                    return f"Permission denied: {category} operations are disabled."
+                result = getattr(tool, "_hans_original_invoke")(context, arguments)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
 
-        tool.on_invoke_tool = invoke
+            async def needs_approval(context, arguments, call_id, *, tool=tool, category=category):
+                policy = getattr(tool, "_hans_get_policy")(category)
+                if policy == "ask":
+                    return True
+                if policy == "deny":
+                    return False
+                original = getattr(tool, "_hans_original_needs_approval")
+                if isinstance(original, bool):
+                    return original
+                result = original(context, arguments, call_id)
+                return bool(await result) if inspect.isawaitable(result) else bool(result)
+
+            tool.on_invoke_tool = invoke
+            tool.needs_approval = needs_approval
+        setattr(tool, "_hans_get_policy", get_policy)
 
 
 STAGE_4_INSTRUCTIONS = (

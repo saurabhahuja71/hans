@@ -27,6 +27,8 @@ from bolt_next.events import (
     TaskDiff,
     TaskUndoRefused,
     TaskUndoSucceeded,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
     ToolCompleted,
     ToolOutput,
     ToolStarted,
@@ -44,6 +46,7 @@ from bolt_next.tui_screen import (
     copy_osc52,
     display_bounded,
     footer_text,
+    format_approval_request,
     format_change_summary,
     format_model_changed,
     format_model_status,
@@ -147,6 +150,7 @@ class _Display:
         self.state = "IDLE"
         self.request_active = False
         self.has_task_changes = False
+        self.approval_pending: tuple[str, str] | None = None
         self._started = False
         self._verification_failed = False
         self._tool_purposes: dict[str, str] = {}
@@ -204,6 +208,17 @@ class _Display:
             self._set_state("INVESTIGATING")
         elif isinstance(event, AssistantMessageDelta):
             self._text(event.delta)
+        elif isinstance(event, ToolApprovalRequested):
+            self.approval_pending = (event.request_id, event.call_id)
+            self.request_active = True
+            self._set_state("APPROVAL REQUIRED")
+            if self.transcript is not None:
+                self.transcript.approval(event.tool_name, event.category, event.display.fields)
+            else:
+                print("\n" + format_approval_request(event.tool_name, event.category, event.display.fields), flush=True)
+        elif isinstance(event, ToolApprovalResolved):
+            if self.approval_pending == (event.request_id, event.call_id):
+                self.approval_pending = None
         elif isinstance(event, ToolStarted):
             label = f"{event.name}  {self._compact(event.detail)}".rstrip()
             self._tool_purposes[event.call_id] = event.purpose
@@ -255,6 +270,7 @@ class _Display:
             self._set_state("CORRECTING", event.evidence.command)
         elif isinstance(event, RequestCompleted):
             self.request_active = False
+            self.approval_pending = None
             if self.transcript is not None:
                 self.transcript.completed(event.evidence)
             self._set_state("FAILED" if event.evidence is not None and not event.evidence.success else "COMPLETE")
@@ -262,6 +278,7 @@ class _Display:
                 print(flush=True)
         elif isinstance(event, RequestCancelled):
             self.request_active = False
+            self.approval_pending = None
             if self.transcript is not None:
                 self.transcript.cancelled()
             self._set_state("CANCELLED")
@@ -269,6 +286,7 @@ class _Display:
                 print("\ninterrupted", flush=True)
         elif isinstance(event, RequestFailed):
             self.request_active = False
+            self.approval_pending = None
             titles = {
                 "configuration": "configuration failed",
                 "authentication": "authentication failed",
@@ -328,11 +346,11 @@ class _Display:
             text = "\n".join(
                 ["Permissions"]
                 + [
-                    f"{name:<10} {'✓ allow' if allowed else '✗ deny'}"
-                    for name, allowed in (
-                        ("read", event.read_allowed),
-                        ("write", event.write_allowed),
-                        ("execute", event.execute_allowed),
+                    f"{name:<10} {policy}"
+                    for name, policy in (
+                        ("read", event.read_policy),
+                        ("write", event.write_policy),
+                        ("execute", event.execute_policy),
                     )
                 ]
             )
@@ -374,8 +392,7 @@ class _Display:
             else:
                 print(f"\n{text}", flush=True)
         elif isinstance(event, PermissionPolicyChanged):
-            value = "allow" if event.allowed else "deny"
-            text = f"✓ {event.category} permission set to {value}."
+            text = f"✓ {event.category} permission set to {event.policy}."
             if self.transcript is not None:
                 self.transcript.change(text, title="PERMISSIONS")
             else:
@@ -437,7 +454,7 @@ async def _dispatch_control(runtime: HansRuntime, control: LocalControl, display
     if control.kind == "permissions_status":
         event = runtime.get_control_status()
     elif control.kind == "set_permission":
-        event = runtime.set_permission(control.category or "", bool(control.allowed))
+        event = runtime.set_permission(control.category or "", control.policy or "")
     elif control.kind == "clear_session":
         event = await runtime.clear_session_history()
     elif control.kind == "model_status":
@@ -560,6 +577,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
         "connected": False,
         "model": _startup_model_name(runtime),
         "task": None,
+        "resolving_approval": False,
         "cancel": False,
         "detail": None,
         "theme": "terminal",
@@ -575,8 +593,11 @@ async def _run_curses(runtime: HansRuntime) -> None:
 
     def request_cancel(*_args) -> None:
         state["cancel"] = True
-        state["display"]._set_state("CANCELLED", "cancellation requested")
-        runtime.cancel_active()
+        cancelled = runtime.cancel_active()
+        if cancelled is not None:
+            state["display"].event(cancelled)
+        else:
+            state["display"]._set_state("CANCELLED", "cancellation requested")
 
     previous_int = signal.signal(signal.SIGINT, request_cancel)
     previous_stop = signal.signal(signal.SIGTSTP, signal.SIG_IGN)
@@ -613,6 +634,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
             display.state,
             request_active=display.request_active,
             has_task_changes=display.has_task_changes,
+            approval_pending=bool(display.approval_pending),
         )
         stdscr.addnstr(footer_at + 1, 0, status_footer, width - 1)
         for offset, line in enumerate(editor.display_lines()):
@@ -627,6 +649,10 @@ async def _run_curses(runtime: HansRuntime) -> None:
         except asyncio.CancelledError:
             runtime.cancel_active()
             raise
+
+    async def resolve_approval(request_id: str, call_id: str, approved: bool) -> None:
+        async for event in runtime.resolve_tool_approval(request_id, call_id, approved):
+            state["display"].event(event)
 
     async def dispatch_local(local) -> None:
         if local.control is not None:
@@ -664,6 +690,28 @@ async def _run_curses(runtime: HansRuntime) -> None:
         return True
 
     async def handle_input(name: str) -> bool:
+        display = state["display"]
+        if display.approval_pending is not None or state["resolving_approval"]:
+            if (
+                name in {"char:y", "char:n"}
+                and display.approval_pending is not None
+                and not state["resolving_approval"]
+            ):
+                request_id, call_id = display.approval_pending
+                display.approval_pending = None
+                display._set_state("RESUMING", "approval resolved")
+                state["resolving_approval"] = True
+                state["task"] = asyncio.create_task(
+                    resolve_approval(request_id, call_id, name == "char:y")
+                )
+                return False
+            if name == "ctrl-c":
+                request_cancel()
+                return False
+            if name == "ctrl-q":
+                request_cancel()
+                return True
+            return False
         if state["detail"] is not None:
             if name == "ctrl-q":
                 return True
@@ -740,6 +788,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
                     state["cancel"] = False
                 if state["task"] is not None and state["task"].done():
                     state["task"] = None
+                    state["resolving_approval"] = False
                 try:
                     key = stdscr.get_wch()
                 except curses.error:

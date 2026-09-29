@@ -6,10 +6,11 @@ import asyncio
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, is_dataclass, replace
+from uuid import uuid4
 from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Callable, Iterable
-from uuid import uuid4
 
 from agents import Runner, SQLiteSession, set_tracing_disabled
 from agents.model_settings import Reasoning
@@ -48,6 +49,9 @@ from bolt_next.events import (
     TaskUndoSucceeded,
     ToolCompleted,
     ToolOutput,
+    ToolApprovalDisplay,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
     ToolStarted,
     UserMessageSubmitted,
     VerificationEvidence,
@@ -64,18 +68,51 @@ class _ToolCall:
     purpose: str = "inspect"
 
 
+@dataclass(slots=True)
+class _PendingApproval:
+    request_id: str
+    call_id: str
+    item: Any
+    state: Any
+    tool_name: str
+    category: str
+    display: ToolApprovalDisplay
+    request_generation: int
+    agent: Any
+    session: Any
+    model_generation: int
+    session_generation: int
+
+
+_TOOL_CATEGORIES = {
+    "list_directory": "read",
+    "search_files": "read",
+    "read_file": "read",
+    "write_file": "write",
+    "replace_in_file": "write",
+    "run_command": "execute",
+}
+_APPROVAL_DISPLAY_MAX_CHARS = 240
+_APPROVAL_MAX_LINE = 1_000_000
+_APPROVAL_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)([\"']?(?:api[_-]?key|token|authorization|secret|password)[\"']?\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
+    ),
+    re.compile(
+        r"(?i)(\b[A-Z_][A-Z0-9_]*(?:API[_-]?KEY|TOKEN|AUTHORIZATION|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|\S+)"
+    ),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+)
+
+
 def run_config(context_filter: Callable[[Any], Any] = fit_model_input) -> RunConfig:
     return RunConfig(call_model_input_filter=context_filter, tracing_disabled=True)
 
 
 def _tool_detail(name: str, arguments: Any) -> str:
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            arguments = {}
-    if not isinstance(arguments, dict):
-        return ""
+    arguments = _argument_mapping(arguments)
     if name == "read_file":
         detail = str(arguments.get("path") or "")
         start = arguments.get("start_line") or 0
@@ -94,23 +131,106 @@ def _tool_detail(name: str, arguments: Any) -> str:
     return ""
 
 
-def _call_arguments(raw_item: Any) -> Any:
-    if isinstance(raw_item, dict):
-        return raw_item.get("arguments")
-    return getattr(raw_item, "arguments", None)
+def _member(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _call_arguments(item: Any) -> Any:
+    sources = (item, _member(item, "raw_item"), _member(item, "item"))
+    for source in sources:
+        for name in ("arguments", "params", "input"):
+            value = _member(source, name)
+            if value is not None:
+                return value
+    return None
+
+
+def _argument_mapping(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _approval_call_id(item: Any, request_generation: int, index: int) -> str:
+    sources = (item, _member(item, "raw_item"), _member(item, "item"))
+    for source in sources:
+        for name in ("call_id", "tool_call_id", "id"):
+            candidate = _member(source, name)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+    return f"missing-call-{request_generation}-{index}"
+
+
+def _redact_approval_text(value: str) -> str:
+    for pattern in _APPROVAL_SECRET_PATTERNS:
+        if pattern.groups:
+            value = pattern.sub(r"\1[REDACTED]", value)
+        else:
+            value = pattern.sub("[REDACTED]", value)
+    return value
+
+
+def _bounded_approval_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = _redact_approval_text(" ".join(value.split()))
+    return value if len(value) <= _APPROVAL_DISPLAY_MAX_CHARS else f"{value[:_APPROVAL_DISPLAY_MAX_CHARS - 1]}…"
+
+
+def _safe_path(arguments: dict[str, Any]) -> str:
+    return _bounded_approval_text(arguments.get("path")) or "."
+
+
+def _safe_read_range(arguments: dict[str, Any]) -> str | None:
+    start = arguments.get("start_line", 1)
+    end = arguments.get("end_line", 0)
+    if isinstance(start, bool) or not isinstance(start, int) or not 1 <= start <= _APPROVAL_MAX_LINE:
+        return None
+    if isinstance(end, bool) or not isinstance(end, int) or not 0 <= end <= _APPROVAL_MAX_LINE:
+        return None
+    return f"{start}+" if end == 0 else f"{start}-{end}"
+
+
+def _approval_display(tool_name: str, arguments: Any) -> ToolApprovalDisplay:
+    values = _argument_mapping(arguments)
+    if tool_name in {"write_file", "replace_in_file"}:
+        return ToolApprovalDisplay((("path", _safe_path(values)),))
+    if tool_name == "read_file":
+        fields: list[tuple[str, str]] = [("path", _safe_path(values))]
+        safe_range = _safe_read_range(values)
+        if safe_range is not None:
+            fields.append(("range", safe_range))
+        return ToolApprovalDisplay(tuple(fields))
+    if tool_name == "list_directory":
+        return ToolApprovalDisplay((("path", _safe_path(values)),))
+    if tool_name == "search_files":
+        fields = [("path", _safe_path(values))]
+        query = _bounded_approval_text(values.get("query"))
+        if query:
+            fields.append(("query", query))
+        return ToolApprovalDisplay(tuple(fields))
+    if tool_name == "run_command":
+        fields = []
+        command = _bounded_approval_text(values.get("command"))
+        if command:
+            fields.append(("command", command))
+        fields.append(("purpose", _tool_purpose(tool_name, values)))
+        return ToolApprovalDisplay(tuple(fields))
+    return ToolApprovalDisplay()
 
 
 def _tool_purpose(name: str, arguments: Any) -> str:
     if name != "run_command":
         return "inspect"
-    if isinstance(arguments, str):
-        try:
-            arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            return "inspect"
-    if not isinstance(arguments, dict):
-        return "inspect"
-    purpose = arguments.get("purpose")
+    purpose = _argument_mapping(arguments).get("purpose")
     return purpose if purpose in {"inspect", "verify"} else "inspect"
 
 
@@ -201,6 +321,7 @@ class HansRuntime:
         runner: Any = Runner,
         agent_factory: Callable[..., Any] | None = None,
         session_factory: Callable[[str], Any] | None = None,
+        interactive: Callable[[], bool] | None = None,
     ) -> None:
         set_tracing_disabled(True)
         # Build the agent on the first request so the terminal UI can still
@@ -215,11 +336,16 @@ class HansRuntime:
         self._session = session if session is not None else self._session_factory("hans-tui")
         self._owns_session = session is None
         self._runner = runner
-        self._permissions = {"read": True, "write": True, "execute": True}
+        self._permissions = {"read": "allow", "write": "allow", "execute": "allow"}
+        self._interactive = interactive or (lambda: sys.stdin.isatty() and sys.stdout.isatty())
         self._request_active = False
         self._active_result: Any | None = None
         self._stream_waiter: asyncio.Future[Any] | None = None
         self._cancel_requested = False
+        self._request_generation = 0
+        self._model_generation = 0
+        self._session_generation = 0
+        self._pending_approvals: list[_PendingApproval] = []
         self._tool_calls: dict[str, _ToolCall] = {}
         self._evidence: VerificationEvidence | None = None
         self._assistant_text: list[str] = []
@@ -234,9 +360,9 @@ class HansRuntime:
 
     def get_control_status(self) -> RuntimeControlStatus:
         return RuntimeControlStatus(
-            read_allowed=self._permissions["read"],
-            write_allowed=self._permissions["write"],
-            execute_allowed=self._permissions["execute"],
+            read_policy=self._permissions["read"],
+            write_policy=self._permissions["write"],
+            execute_policy=self._permissions["execute"],
         )
 
     def _active_profile(self) -> ConfiguredModelProfile:
@@ -331,6 +457,8 @@ class HansRuntime:
         self._agent = target_agent
         self._session = target_session
         self._owns_session = True
+        self._model_generation += 1
+        self._session_generation += 1
         self._base_model_settings = target_base_settings
         self._context_filter = target_context_filter
         self._reasoning_mode_override = None
@@ -373,13 +501,16 @@ class HansRuntime:
         self._apply_effective_model_settings()
         return ReasoningModeChanged(normalized_mode)
 
-    def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged | RuntimeControlRejected:
+    def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged | RuntimeControlRejected:
         if category not in self._permissions:
             raise ValueError(f"Unknown permission: {category}")
+        normalized_policy = policy.strip().lower()
+        if normalized_policy not in {"allow", "deny", "ask"}:
+            raise ValueError(f"Unknown permission policy: {policy}")
         if self._request_active:
             return RuntimeControlRejected("Permission changes are available when HANS is idle.")
-        self._permissions[category] = allowed
-        return PermissionPolicyChanged(category, allowed)
+        self._permissions[category] = normalized_policy
+        return PermissionPolicyChanged(category, normalized_policy)
 
     async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected:
         if self._request_active:
@@ -387,19 +518,35 @@ class HansRuntime:
         if self._session is None:
             return RuntimeControlRejected("The session is unavailable.")
         await self._session.clear_session()
+        self._session_generation += 1
         return SessionCleared()
 
-    def _permission_allowed(self, category: str) -> bool:
+    def _permission_allowed(self, category: str) -> str:
         return self._permissions[category]
 
-    def cancel_active(self) -> None:
+    def _invalidate_pending_approvals(self) -> None:
+        self._pending_approvals.clear()
+
+    def cancel_active(self) -> RequestCancelled | None:
+        if not self._request_active:
+            return None
+        was_paused = bool(self._pending_approvals)
         self._cancel_requested = True
+        self._invalidate_pending_approvals()
         if self._active_result is not None:
             self._active_result.cancel()
         if self._stream_waiter is not None:
             self._stream_waiter.cancel()
+        if was_paused:
+            self._active_result = None
+            self._request_active = False
+            return RequestCancelled()
+        return None
 
     def close(self) -> None:
+        self.cancel_active()
+        self._invalidate_pending_approvals()
+        self._session_generation += 1
         if self._owns_session and self._session is not None:
             self._session.close()
             self._session = None
@@ -424,10 +571,134 @@ class HansRuntime:
             return None
         return TaskChangeSummary(self._journal.compact_summary())
 
+    def _record_interruptions(self, result: Any) -> ToolApprovalRequested | None:
+        interruptions = tuple(getattr(result, "interruptions", ()))
+        if not interruptions:
+            return None
+        state = result.to_state()
+        request_id = f"request-{self._request_generation}"
+        pending: list[_PendingApproval] = []
+        for index, item in enumerate(interruptions, start=1):
+            raw_item = _member(item, "raw_item")
+            tool_name = _member(item, "tool_name") or _member(item, "name") or _member(raw_item, "name") or "tool"
+            tool_name = tool_name if isinstance(tool_name, str) and tool_name else "tool"
+            arguments = _call_arguments(item)
+            pending.append(
+                _PendingApproval(
+                    request_id=request_id,
+                    call_id=_approval_call_id(item, self._request_generation, index),
+                    item=item,
+                    state=state,
+                    tool_name=tool_name,
+                    category=_TOOL_CATEGORIES.get(tool_name, "execute"),
+                    display=_approval_display(tool_name, arguments),
+                    request_generation=self._request_generation,
+                    agent=self._agent,
+                    session=self._session,
+                    model_generation=self._model_generation,
+                    session_generation=self._session_generation,
+                )
+            )
+        self._pending_approvals = pending
+        return self._requested_approval_event(pending[0])
+
+    @staticmethod
+    def _requested_approval_event(pending: _PendingApproval) -> ToolApprovalRequested:
+        return ToolApprovalRequested(
+            pending.request_id,
+            pending.call_id,
+            pending.tool_name,
+            pending.category,
+            pending.display,
+        )
+
+    def _approval_context_is_current(self, pending: _PendingApproval) -> bool:
+        return (
+            self._request_active
+            and not self._cancel_requested
+            and pending.request_generation == self._request_generation
+            and pending.agent is self._agent
+            and pending.session is self._session
+            and pending.model_generation == self._model_generation
+            and pending.session_generation == self._session_generation
+        )
+
+    def _approval_is_current(self, pending: _PendingApproval, request_id: str, call_id: str) -> bool:
+        return (
+            bool(self._pending_approvals)
+            and self._pending_approvals[0] is pending
+            and pending.request_id == request_id
+            and pending.call_id == call_id
+            and self._approval_context_is_current(pending)
+        )
+
+    async def _consume_result(self, result: Any) -> AsyncIterator[HansEvent]:
+        while True:
+            self._active_result = result
+            stream = result.stream_events().__aiter__()
+            while True:
+                self._stream_waiter = asyncio.ensure_future(anext(stream))
+                try:
+                    stream_event = await self._stream_waiter
+                except StopAsyncIteration:
+                    break
+                finally:
+                    self._stream_waiter = None
+                for event in self.translate_stream_event(stream_event):
+                    yield event
+            if self._cancel_requested:
+                return
+            approval_event = self._record_interruptions(result)
+            if approval_event is None:
+                return
+            if self._interactive():
+                self._active_result = None
+                yield approval_event
+                return
+            for pending in self._pending_approvals:
+                pending.state.reject(pending.item)
+            state = self._pending_approvals[0].state
+            self._invalidate_pending_approvals()
+            result = self._runner.run_streamed(
+                self._agent,
+                state,
+                session=self._session,
+                run_config=run_config(self._context_filter),
+            )
+
+    async def _terminal_events(self) -> AsyncIterator[HansEvent]:
+        if self._cancel_requested:
+            yield RequestCancelled()
+        else:
+            yield AssistantMessageComplete("".join(self._assistant_text))
+            yield RequestCompleted(self._evidence)
+            yield ConnectionChanged(True)
+        summary = self._task_change_summary()
+        if summary is not None:
+            yield summary
+
+    async def _failure_events(self, exc: BaseException) -> AsyncIterator[HansEvent]:
+        if self._cancel_requested:
+            yield RequestCancelled()
+        else:
+            category, detail, debug_message = _failure_details(exc)
+            yield RequestFailed(category, detail, debug_message)
+            yield ConnectionChanged(False)
+        summary = self._task_change_summary()
+        if summary is not None:
+            yield summary
+
+    def _finish_request(self) -> None:
+        self._active_result = None
+        self._stream_waiter = None
+        self._invalidate_pending_approvals()
+        self._request_active = False
+
     async def submit(self, message: str) -> AsyncIterator[HansEvent]:
         if self._request_active:
             raise RuntimeError("a request is already active")
         self._request_active = True
+        self._request_generation += 1
         try:
             self._cancel_requested = False
             self._journal.begin_task()
@@ -448,52 +719,75 @@ class HansRuntime:
                 session=self._session,
                 run_config=run_config(self._context_filter),
             )
-            self._active_result = result
-            stream = result.stream_events().__aiter__()
-            while True:
-                self._stream_waiter = asyncio.ensure_future(anext(stream))
-                try:
-                    stream_event = await self._stream_waiter
-                except StopAsyncIteration:
-                    break
-                finally:
-                    self._stream_waiter = None
-                for event in self.translate_stream_event(stream_event):
-                    yield event
-            if self._cancel_requested:
-                yield RequestCancelled()
-                summary = self._task_change_summary()
-                if summary is not None:
-                    yield summary
-            else:
-                yield AssistantMessageComplete("".join(self._assistant_text))
-                yield RequestCompleted(self._evidence)
-                summary = self._task_change_summary()
-                if summary is not None:
-                    yield summary
-                yield ConnectionChanged(True)
+            async for event in self._consume_result(result):
+                yield event
+            if self._pending_approvals:
+                return
+            async for event in self._terminal_events():
+                yield event
         except asyncio.CancelledError:
             self.cancel_active()
-            yield RequestCancelled()
-            summary = self._task_change_summary()
-            if summary is not None:
-                yield summary
+            async for event in self._terminal_events():
+                yield event
         except Exception as exc:
-            if self._cancel_requested:
-                yield RequestCancelled()
-                summary = self._task_change_summary()
-                if summary is not None:
-                    yield summary
-            else:
-                category, detail, debug_message = _failure_details(exc)
-                yield RequestFailed(category, detail, debug_message)
-                summary = self._task_change_summary()
-                if summary is not None:
-                    yield summary
-                yield ConnectionChanged(False)
+            async for event in self._failure_events(exc):
+                yield event
         finally:
-            self._active_result = None
-            self._request_active = False
+            if not self._pending_approvals:
+                self._finish_request()
+
+    async def resolve_tool_approval(
+        self, request_id: str, call_id: str, approved: bool
+    ) -> AsyncIterator[HansEvent]:
+        if not self._pending_approvals:
+            yield RuntimeControlRejected("The approval request is no longer active.")
+            return
+        pending = self._pending_approvals[0]
+        if not self._approval_is_current(pending, request_id, call_id):
+            yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+            return
+        try:
+            if approved:
+                pending.state.approve(pending.item)
+            else:
+                pending.state.reject(pending.item)
+            if not self._approval_is_current(pending, request_id, call_id):
+                yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                return
+            self._pending_approvals.pop(0)
+            yield ToolApprovalResolved(pending.request_id, pending.call_id, approved)
+            if self._pending_approvals:
+                next_pending = self._pending_approvals[0]
+                if not self._approval_context_is_current(next_pending):
+                    yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                    return
+                yield self._requested_approval_event(next_pending)
+                return
+            if not self._approval_context_is_current(pending):
+                yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                return
+            result = self._runner.run_streamed(
+                pending.agent,
+                pending.state,
+                session=pending.session,
+                run_config=run_config(self._context_filter),
+            )
+            async for event in self._consume_result(result):
+                yield event
+            if self._pending_approvals:
+                return
+            async for event in self._terminal_events():
+                yield event
+        except asyncio.CancelledError:
+            self.cancel_active()
+            async for event in self._terminal_events():
+                yield event
+        except Exception as exc:
+            async for event in self._failure_events(exc):
+                yield event
+        finally:
+            if not self._pending_approvals:
+                self._finish_request()
 
     def translate_stream_event(self, stream_event: Any) -> Iterable[HansEvent]:
         if getattr(stream_event, "type", None) == "raw_response_event":
