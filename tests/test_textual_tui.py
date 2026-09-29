@@ -11,7 +11,11 @@ from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
+    ModelChanged,
+    ModelStatus,
     PermissionPolicyChanged,
+    ReasoningModeChanged,
+    ReasoningModeStatus,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
@@ -32,6 +36,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
+from bolt_next.model_catalog import ModelInfo
 from bolt_next.textual_tui import DetailScreen, HansTextualApp, TaskDiffScreen, ThemeScreen
 
 
@@ -44,7 +49,27 @@ class FakeRuntime:
         self.task_diff_calls: list[int | None] = []
         self.undo_calls = 0
         self.permissions = {"read": True, "write": True, "execute": True}
-        self.control_calls: list[tuple[str, str | None, bool | None]] = []
+        self.control_calls: list[tuple[object, ...]] = []
+        self.models = (
+            ModelInfo(
+                id="configured-model",
+                display_name="Configured Model",
+                endpoint_profile="configured endpoint",
+                context_tokens=128_000,
+                supported_reasoning_modes=("none", "high"),
+                none_semantics="omit",
+            ),
+            ModelInfo(
+                id="large",
+                display_name="Large Model",
+                endpoint_profile="configured endpoint",
+                context_tokens=256_000,
+                supported_reasoning_modes=("none", "low"),
+                none_semantics="literal",
+            ),
+        )
+        self.model = self.models[0]
+        self.reasoning_mode: str | None = None
         self.diff_event = TaskDiff("--- a/task.txt\n+++ b/task.txt\n+updated")
         self.undo_event: TaskUndoSucceeded | TaskUndoRefused = TaskUndoSucceeded((), ())
 
@@ -80,6 +105,35 @@ class FakeRuntime:
     async def clear_session_history(self) -> SessionCleared:
         self.control_calls.append(("clear", None, None))
         return SessionCleared()
+
+    def get_model_status(self) -> ModelStatus:
+        self.control_calls.append(("model_status",))
+        return ModelStatus(self.model, self.reasoning_mode, self.models)
+
+    def select_model(self, model_id: str) -> ModelChanged | RuntimeControlRejected | None:
+        self.control_calls.append(("select_model", model_id))
+        selected = next((model for model in self.models if model.id == model_id), None)
+        if selected is None:
+            return RuntimeControlRejected("Model selection is unavailable.")
+        if selected.id == self.model.id:
+            return None
+        previous_model_id = self.model.id
+        self.model = selected
+        self.reasoning_mode = None
+        return ModelChanged(previous_model_id, selected, new_session_started=True, reasoning_reset=True)
+
+    def get_reasoning_mode_status(self) -> ReasoningModeStatus:
+        self.control_calls.append(("reasoning_mode_status",))
+        return ReasoningModeStatus(
+            self.reasoning_mode, self.model.supported_reasoning_modes, self.model.none_semantics
+        )
+
+    def set_reasoning_mode(self, mode: str) -> ReasoningModeChanged | RuntimeControlRejected:
+        self.control_calls.append(("reasoning_mode", mode))
+        if mode not in self.model.supported_reasoning_modes:
+            return RuntimeControlRejected(f"Unsupported reasoning mode: {mode}")
+        self.reasoning_mode = mode
+        return ReasoningModeChanged(mode)
 
     def close(self) -> None:
         self.closed += 1
@@ -529,6 +583,47 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             assert "Conversation history cleared." in text
             assert "Workspace and local HANS state preserved." in text
             assert "Unknown command: /unknown" in text
+
+            await submit(pilot, "/models")
+            await submit(pilot, "/mode")
+            await submit(pilot, "/mode HIGH")
+            await submit(pilot, "/mode unsupported")
+            await submit(pilot, "/models use large")
+            await submit(pilot, "/models use does-not-exist")
+            await submit(pilot, "/models use")
+            await submit(pilot, "/mode high extra")
+            assert runtime.prompts == []
+            assert runtime.control_calls == [
+                ("permission", "write", False),
+                ("clear", None, None),
+                ("model_status",),
+                ("reasoning_mode_status",),
+                ("reasoning_mode", "high"),
+                ("reasoning_mode", "unsupported"),
+                ("select_model", "large"),
+                ("select_model", "does-not-exist"),
+            ]
+            text = transcript_text(app)
+            assert (
+                "MODELS\n* Active: Configured Model (configured-model)\nEndpoint: configured endpoint"
+                "\nContext: 128,000 tokens\nReasoning support: none, high"
+                "\nCurrent reasoning: configured default\n- Large Model (large)"
+                "\n  Endpoint: configured endpoint\n  Context: 256,000 tokens"
+                "\n  Reasoning support: none, low"
+            ) in text
+            assert "REASONING MODE\nCurrent: configured default\nSupported: none, high" in text
+            assert "REASONING\n✓ Mode set to high." in text
+            assert "Unsupported reasoning mode: unsupported" in text
+            assert "MODEL\n✓ Switched from configured-model to Large Model (large)." in text
+            assert "✓ New conversation started." in text
+            assert "✓ Reasoning reset to configured default." in text
+            assert "Model selection is unavailable." in text
+            assert "Usage: /models [use <model>]" in text
+            assert "Usage: /mode [mode]" in text
+            assert "configured endpoint" in text
+            assert "http" not in text
+            assert "api_key" not in text
+            assert "model Large Model" in rendered(app.query_one("#hans-header", Static))
 
             await submit(pilot, "/theme light")
             assert app._theme_name == "light"

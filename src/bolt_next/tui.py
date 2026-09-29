@@ -11,7 +11,11 @@ from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
+    ModelChanged,
+    ModelStatus,
     PermissionPolicyChanged,
+    ReasoningModeChanged,
+    ReasoningModeStatus,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
@@ -41,6 +45,10 @@ from bolt_next.tui_screen import (
     display_bounded,
     footer_text,
     format_change_summary,
+    format_model_changed,
+    format_model_status,
+    format_reasoning_mode_changed,
+    format_reasoning_mode_status,
     handle_local_command,
     is_exit_command,
     layout_rows,
@@ -131,10 +139,11 @@ def turn_error_message(
 class _Display:
     """Renders HANS semantic events into a transcript or plain stdout."""
 
-    def __init__(self, transcript: Transcript | None = None, on_connection=None) -> None:
+    def __init__(self, transcript: Transcript | None = None, on_connection=None, on_model=None) -> None:
         self.debug = debug_enabled()
         self.transcript = transcript
         self.on_connection = on_connection
+        self.on_model = on_model
         self.state = "IDLE"
         self.request_active = False
         self.has_task_changes = False
@@ -331,6 +340,39 @@ class _Display:
                 self.transcript.change(text, title="LOCAL")
             else:
                 print(f"\n{text}", flush=True)
+        elif isinstance(event, ModelStatus):
+            if self.on_model is not None:
+                self.on_model(event.model)
+            text = format_model_status(event.model, event.current_reasoning_mode, event.models)
+            if self.transcript is not None:
+                self.transcript.change(text, title="LOCAL")
+            else:
+                print(f"\n{text}", flush=True)
+        elif isinstance(event, ModelChanged):
+            if self.on_model is not None:
+                self.on_model(event.model)
+            text = format_model_changed(
+                event.previous_model_id,
+                event.model,
+                new_session_started=event.new_session_started,
+                reasoning_reset=event.reasoning_reset,
+            )
+            if self.transcript is not None:
+                self.transcript.change(text, title="LOCAL")
+            else:
+                print(f"\n{text}", flush=True)
+        elif isinstance(event, ReasoningModeStatus):
+            text = format_reasoning_mode_status(event.mode, event.available_modes, event.none_semantics)
+            if self.transcript is not None:
+                self.transcript.change(text, title="LOCAL")
+            else:
+                print(f"\n{text}", flush=True)
+        elif isinstance(event, ReasoningModeChanged):
+            text = format_reasoning_mode_changed(event.mode)
+            if self.transcript is not None:
+                self.transcript.change(text, title="LOCAL")
+            else:
+                print(f"\n{text}", flush=True)
         elif isinstance(event, PermissionPolicyChanged):
             value = "allow" if event.allowed else "deny"
             text = f"✓ {event.category} permission set to {value}."
@@ -398,9 +440,18 @@ async def _dispatch_control(runtime: HansRuntime, control: LocalControl, display
         event = runtime.set_permission(control.category or "", bool(control.allowed))
     elif control.kind == "clear_session":
         event = await runtime.clear_session_history()
+    elif control.kind == "model_status":
+        event = runtime.get_model_status()
+    elif control.kind == "select_model":
+        event = runtime.select_model(control.model_id or "")
+    elif control.kind == "reasoning_mode_status":
+        event = runtime.get_reasoning_mode_status()
+    elif control.kind == "set_reasoning_mode":
+        event = runtime.set_reasoning_mode(control.mode or "")
     else:
         return
-    display.event(event)
+    if event is not None:
+        display.event(event)
 
 
 async def serve(read_line, run_turn, handle_local=None) -> None:
@@ -435,6 +486,14 @@ def _model_name() -> str:
     return os.environ.get("BOLT_MODEL", "qwen3.6-27b")
 
 
+def _startup_model_name(runtime: HansRuntime) -> str:
+    try:
+        model = runtime.get_model_status().model
+    except Exception:
+        return _model_name()
+    return str(getattr(model, "display_name", None) or getattr(model, "id", None) or _model_name())
+
+
 def _workspace() -> Path:
     return Path(os.environ.get("BOLT_WORKSPACE") or Path.cwd()).expanduser()
 
@@ -442,10 +501,28 @@ def _workspace() -> Path:
 async def _run_tui() -> None:
     runtime = HansRuntime(os.environ.get("BOLT_WORKSPACE"))
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print(format_header(_model_name(), _workspace(), False), flush=True)
+        header_state = {"model": _startup_model_name(runtime), "connected": False}
+
+        def render_header() -> None:
+            print(
+                format_header(header_state["model"], _workspace(), header_state["connected"]),
+                flush=True,
+            )
+
+        def update_model(model: object) -> None:
+            header_state["model"] = str(
+                getattr(model, "display_name", None) or getattr(model, "id", None) or header_state["model"]
+            )
+            render_header()
+
+        def update_connection(connected: bool) -> None:
+            header_state["connected"] = connected
+            render_header()
+
+        render_header()
         print(FOOTER, flush=True)
 
-        display = _Display()
+        display = _Display(on_connection=update_connection, on_model=update_model)
         todos = TodoList()
 
         async def run_turn(prompt: str) -> None:
@@ -471,7 +548,7 @@ async def _run_tui() -> None:
         return
     from bolt_next.textual_tui import run_textual_tui
 
-    await run_textual_tui(runtime, _model_name(), _workspace())
+    await run_textual_tui(runtime, _startup_model_name(runtime), _workspace())
 
 
 async def _run_curses(runtime: HansRuntime) -> None:
@@ -481,13 +558,20 @@ async def _run_curses(runtime: HansRuntime) -> None:
     editor = Editor()
     state = {
         "connected": False,
+        "model": _startup_model_name(runtime),
         "task": None,
         "cancel": False,
         "detail": None,
         "theme": "terminal",
         "todos": TodoList(),
     }
-    state["display"] = _Display(transcript, lambda connected: state.__setitem__("connected", connected))
+    state["display"] = _Display(
+        transcript,
+        lambda connected: state.__setitem__("connected", connected),
+        lambda model: state.__setitem__(
+            "model", str(getattr(model, "display_name", None) or getattr(model, "id", None) or state["model"])
+        ),
+    )
 
     def request_cancel(*_args) -> None:
         state["cancel"] = True
@@ -513,7 +597,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
             stdscr.addnstr(height - 1, 0, "Up/Down/Page scroll · Esc back", width - 1)
             stdscr.refresh()
             return
-        header = format_header(_model_name(), _workspace(), state["connected"]).splitlines()
+        header = format_header(state["model"], _workspace(), state["connected"]).splitlines()
         header_attr = curses.A_REVERSE if state["theme"] == "high-contrast" else curses.A_NORMAL
         for row, line in enumerate(header[:2]):
             stdscr.addnstr(row, 0, line, width - 1, header_attr)

@@ -355,6 +355,8 @@ class LocalControl:
     kind: str
     category: str | None = None
     allowed: bool | None = None
+    mode: str | None = None
+    model_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -369,6 +371,64 @@ class LocalCommand:
 THEME_NAMES = ("dark", "light", "high-contrast", "terminal")
 
 
+def _model_label(model: object) -> tuple[str, str]:
+    model_id = str(getattr(model, "id", None) or "unknown")
+    name = str(getattr(model, "display_name", None) or model_id)
+    return name, model_id
+
+
+def _model_details(model: object, *, indent: str = "") -> list[str]:
+    endpoint_profile = getattr(model, "endpoint_profile", None)
+    context_tokens = getattr(model, "context_tokens", None)
+    modes = tuple(str(mode) for mode in getattr(model, "supported_reasoning_modes", ()) if str(mode))
+    lines = [f"{indent}Endpoint: {endpoint_profile or 'not declared'}"]
+    if isinstance(context_tokens, int):
+        lines.append(f"{indent}Context: {context_tokens:,} tokens")
+    lines.append(f"{indent}Reasoning support: {', '.join(modes) if modes else 'not declared'}")
+    return lines
+
+
+def format_model_status(
+    model: object, current_reasoning_mode: str | None, models: tuple[object, ...] = ()
+) -> str:
+    active_name, active_id = _model_label(model)
+    catalog = models or (model,)
+    lines = ["MODELS", f"* Active: {active_name} ({active_id})"]
+    lines.extend(_model_details(model))
+    lines.append(f"Current reasoning: {current_reasoning_mode or 'configured default'}")
+    for candidate in catalog:
+        name, model_id = _model_label(candidate)
+        if model_id == active_id:
+            continue
+        lines.append(f"- {name} ({model_id})")
+        lines.extend(_model_details(candidate, indent="  "))
+    return "\n".join(lines)
+
+
+def format_model_changed(
+    previous_model_id: str, model: object, *, new_session_started: bool, reasoning_reset: bool
+) -> str:
+    name, model_id = _model_label(model)
+    lines = ["MODEL", f"✓ Switched from {previous_model_id} to {name} ({model_id})."]
+    if new_session_started:
+        lines.append("✓ New conversation started.")
+        lines.append("Previous conversation history was not reused.")
+    if reasoning_reset:
+        lines.append("✓ Reasoning reset to configured default.")
+    return "\n".join(lines)
+
+
+def format_reasoning_mode_status(mode: str | None, available_modes: tuple[str, ...], none_semantics: str) -> str:
+    del none_semantics
+    current = mode or "configured default"
+    available = ", ".join(available_modes) if available_modes else "not declared"
+    return f"REASONING MODE\nCurrent: {current}\nSupported: {available}"
+
+
+def format_reasoning_mode_changed(mode: str | None) -> str:
+    return f"REASONING\n✓ Mode set to {mode or 'none'}."
+
+
 def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
     """Handle local commands, leaving ordinary prompts untouched."""
     stripped = prompt.strip()
@@ -377,6 +437,20 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
     command, _, argument = stripped.partition(" ")
     normalized_command = command.lower()
     argument = argument.strip()
+    if normalized_command == "/models":
+        values = argument.split()
+        if not values:
+            return LocalCommand(True, control=LocalControl("model_status"))
+        if values[0].lower() == "use" and len(values) == 2:
+            return LocalCommand(True, control=LocalControl("select_model", model_id=values[1].lower()))
+        return LocalCommand(True, "Usage: /models [use <model>]")
+    if normalized_command == "/mode":
+        values = argument.split()
+        if not values:
+            return LocalCommand(True, control=LocalControl("reasoning_mode_status"))
+        if len(values) == 1:
+            return LocalCommand(True, control=LocalControl("set_reasoning_mode", mode=values[0].lower()))
+        return LocalCommand(True, "Usage: /mode [mode]")
     if normalized_command == "/permissions":
         values = argument.lower().split()
         if not values:

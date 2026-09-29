@@ -20,58 +20,66 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.5.1**.
+branding are HANS. Current release: **0.5.2**.
 
-## What 0.5.1 provides
+## What 0.5.2 provides
 
-- A transcript-first Textual UI with a compact header for model, connection, and workspace; inline
-  tool activity; clear lifecycle state; verification and final-result presentation; and a compact,
-  context-aware footer.
-- A bounded, HANS-only diff view (`Ctrl-G`) and task-scoped safe undo (`Ctrl-Z`), with matching
-  essential lifecycle, change, diff, undo, and composer behavior in the curses fallback.
-- Streaming responses, cancellation and recovery, bounded transcript/tool rendering, and semantic
-  state presentation without exposing raw SDK events.
-- Six structured workspace tools, executed only when the SDK emits a tool call:
-  - `list_directory(path)` lists bounded, sorted direct entries with their type.
-  - `search_files(query, path, max_results)` performs bounded literal text search through relevant
-    files.
-  - `read_file(path, start_line, end_line)` reads a UTF-8 file or an explicit bounded line range.
-  - `replace_in_file(path, old_text, new_text)` makes one exact, single-occurrence replacement.
-  - `write_file(path, content)` creates or replaces a UTF-8 file inside the workspace.
-  - `run_command(command, purpose)` runs one direct command with the workspace as its working
-    directory.
+- Runtime-enforced, session-scoped read, write, and execute permissions through the local
+  `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
+- `/clear` clears the active SDK `SQLiteSession` conversation history while preserving workspace
+  files and local HANS controls.
+- A local, secret-free configured model catalog: `/models` shows configured profiles and
+  `/models use <id>` changes only to an explicit profile while idle.
+- A model switch atomically prepares the new model stack and starts a fresh conversation; prior
+  history is never copied or silently reused. Failed switches leave the active model and session
+  unchanged.
+- `/mode` validates a session-scoped reasoning override against declared model capabilities and
+  applies it only to later requests. `/compact` and approval/ask permissions remain unimplemented.
 
 ## Configuration
 
-Set the required endpoint and credentials before starting HANS:
+HANS uses locally configured model profiles; it does not discover models from a remote service.
+Set `BOLT_MODEL_PROFILES` to a comma-separated list of profile IDs. IDs are normalized to lowercase
+and must match `[a-z][a-z0-9-]*`. `BOLT_MODEL_ACTIVE_PROFILE` selects one configured profile; when
+it is unset, HANS uses the first profile.
 
-```bash
-export BOLT_MODEL_BASE_URL="https://your-endpoint.example/v1"
-export BOLT_MODEL_API_KEY="your-api-key"
-export BOLT_MODEL="qwen3.6-27b"              # optional; this is the default
-export BOLT_WORKSPACE="$PWD"                  # optional; defaults to the current directory
-```
+For a profile ID, replace hyphens with underscores and uppercase it to form the variable prefix:
+`BOLT_MODEL_PROFILE_<UPPERCASE_ID_HYPHENS_AS_UNDERSCORES>_`. Each profile requires these suffixes:
 
-`BOLT_MODEL_BASE_URL` must identify an OpenAI-compatible Chat Completions endpoint. HANS does not
-contain provider-specific branches; the displayed model and provider connection state are data from
-the configured runtime.
+| Suffix | Behavior |
+| --- | --- |
+| `MODEL` | Model name sent by the runtime. |
+| `BASE_URL` | Chat Completions endpoint for that locally configured profile. |
+| `API_KEY` | Credential for that profile; it is never shown in the UI. |
 
-Leave reasoning configuration unset unless the configured endpoint explicitly supports and requires
-it. For example, an endpoint that requires tool calls without reasoning can use:
+The following suffixes are optional:
 
-```bash
-export BOLT_MODEL_REASONING_EFFORT=none
-```
+| Suffix | Behavior |
+| --- | --- |
+| `DISPLAY_NAME` | Safe human-readable name shown by `/models`; defaults to the profile ID. |
+| `ENDPOINT_PROFILE` | Safe endpoint label shown by `/models`; use this rather than the base URL. |
+| `CONTEXT_TOKENS` | Context limit used by HANS's conservative request guard; defaults to `16384` and must be at least `1024`. |
+| `MAX_COMPLETION_TOKENS` | Optional positive completion limit, capped to the available completion reserve. |
+| `REASONING_MODES` | Comma-separated declared reasoning modes. If unset, `/mode` reports support as not declared and does not permit overrides. |
+| `REASONING_NONE_SEMANTICS` | `literal` (default) sends declared `none` as the effort; `omit` omits reasoning when a declared `/mode none` override is selected. |
+| `REASONING_EFFORT` | Configured default reasoning effort. |
+| `OPENAI_PROJECT` | Optional project value supplied to the client. |
+| `TIMEOUT_SECONDS` | Positive request timeout in seconds; defaults to `90`. |
+| `MAX_RETRIES` | Non-negative request retry count; defaults to `0`. |
 
-### Optional settings
+When `BOLT_MODEL_PROFILES` is unset, HANS retains its legacy single-profile configuration using
+`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. `BOLT_WORKSPACE`
+is optional and defaults to the current directory.
+
+`/models` displays only safe, local catalog metadata: the active profile, display name, endpoint
+profile, context limit, declared reasoning modes, and the active effective reasoning mode. It never
+displays credentials or base URLs. `/models use <id>` is available only while HANS is idle. It starts
+a fresh conversation on the selected local profile and resets reasoning to that profile's configured
+default; HANS does not migrate conversation history. The workspace, permissions, TODOs, theme, and
+other local HANS controls persist.
 
 | Variable | Behavior |
 | --- | --- |
-| `BOLT_MODEL_OPENAI_PROJECT` | Optional project value supplied to the OpenAI client. |
-| `BOLT_MODEL_TIMEOUT_SECONDS` | Positive request timeout in seconds; defaults to `90`. |
-| `BOLT_MODEL_MAX_RETRIES` | Non-negative request retry count; defaults to `0`. |
-| `BOLT_MODEL_CONTEXT_TOKENS` | Context limit used by HANS's conservative request guard; defaults to `16384` and must be at least `1024`. |
-| `BOLT_MODEL_MAX_COMPLETION_TOKENS` | Optional positive completion limit. HANS caps it to the available completion reserve for the configured context. |
 | `HANS_TUI` | Set to `curses` to select the curses fallback; otherwise a TTY uses Textual. |
 | `HANS_DEBUG` | Set to `1` for bounded UI diagnostics. Debug output is not a replacement for tool results and does not print credentials. |
 

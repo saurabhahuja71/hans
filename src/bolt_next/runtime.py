@@ -6,23 +6,35 @@ import asyncio
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable
+from uuid import uuid4
 
 from agents import Runner, SQLiteSession, set_tracing_disabled
+from agents.model_settings import Reasoning
 from agents.run_config import RunConfig
 
 from bolt_next.agent import apply_tool_permission_policy, create_agent
-from bolt_next.context_budget import fit_model_input
+from bolt_next.context_budget import fit_model_input, make_fit_model_input
 from bolt_next.errors import ConfigurationError, FailureCategory
+from bolt_next.model_catalog import (
+    ConfiguredModelProfile,
+    ModelInfo,
+    configured_model_profile,
+    configured_model_profiles,
+)
 from bolt_next.workspace import TaskMutationJournal, resolve_workspace
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
     HansEvent,
+    ModelChanged,
+    ModelStatus,
     PermissionPolicyChanged,
+    ReasoningModeChanged,
+    ReasoningModeStatus,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
@@ -52,8 +64,8 @@ class _ToolCall:
     purpose: str = "inspect"
 
 
-def run_config() -> RunConfig:
-    return RunConfig(call_model_input_filter=fit_model_input, tracing_disabled=True)
+def run_config(context_filter: Callable[[Any], Any] = fit_model_input) -> RunConfig:
+    return RunConfig(call_model_input_filter=context_filter, tracing_disabled=True)
 
 
 def _tool_detail(name: str, arguments: Any) -> str:
@@ -187,16 +199,20 @@ class HansRuntime:
         agent: Any | None = None,
         session: Any | None = None,
         runner: Any = Runner,
+        agent_factory: Callable[..., Any] | None = None,
+        session_factory: Callable[[str], Any] | None = None,
     ) -> None:
         set_tracing_disabled(True)
         # Build the agent on the first request so the terminal UI can still
-        # open when model configuration is missing.  The resulting startup
+        # open when model configuration is missing. The resulting startup
         # error is then rendered as a normal request failure instead of a
         # Python traceback before the user sees HANS.
         self._agent = agent
         self._workspace = resolve_workspace(workspace or os.environ.get("BOLT_WORKSPACE"))
         self._journal = TaskMutationJournal(self._workspace)
-        self._session = session if session is not None else SQLiteSession("hans-tui")
+        self._agent_factory = agent_factory or create_agent
+        self._session_factory = session_factory or SQLiteSession
+        self._session = session if session is not None else self._session_factory("hans-tui")
         self._owns_session = session is None
         self._runner = runner
         self._permissions = {"read": True, "write": True, "execute": True}
@@ -207,8 +223,14 @@ class HansRuntime:
         self._tool_calls: dict[str, _ToolCall] = {}
         self._evidence: VerificationEvidence | None = None
         self._assistant_text: list[str] = []
+        self._profile: ConfiguredModelProfile | None = None
+        self._model_info: ModelInfo | None = None
+        self._context_filter: Callable[[Any], Any] = fit_model_input
+        self._reasoning_mode_override: str | None = None
+        self._base_model_settings: Any | None = None
         if self._agent is not None:
             apply_tool_permission_policy(self._agent, self._permission_allowed)
+            self._snapshot_model_settings()
 
     def get_control_status(self) -> RuntimeControlStatus:
         return RuntimeControlStatus(
@@ -216,6 +238,140 @@ class HansRuntime:
             write_allowed=self._permissions["write"],
             execute_allowed=self._permissions["execute"],
         )
+
+    def _active_profile(self) -> ConfiguredModelProfile:
+        if self._profile is None:
+            profile = configured_model_profile()
+            self._profile = profile
+            self._model_info = profile.info
+            self._context_filter = make_fit_model_input(profile.info.context_tokens)
+        return self._profile
+
+    def _active_model_info(self) -> ModelInfo:
+        return self._active_profile().info
+
+    @staticmethod
+    def _model_settings_snapshot(agent: Any) -> Any | None:
+        settings = getattr(agent, "model_settings", None)
+        return settings if is_dataclass(settings) else None
+
+    def _snapshot_model_settings(self) -> None:
+        self._base_model_settings = self._model_settings_snapshot(self._agent)
+
+    def _configured_reasoning_mode(self) -> str | None:
+        if self._base_model_settings is not None:
+            reasoning = getattr(self._base_model_settings, "reasoning", None)
+            effort = getattr(reasoning, "effort", None)
+            if isinstance(effort, str) and effort:
+                return effort
+        return self._active_profile().reasoning_effort
+
+    def _apply_effective_model_settings(self) -> None:
+        if self._base_model_settings is None:
+            return
+        model_info = self._active_model_info()
+        if self._reasoning_mode_override is None:
+            effective_settings = self._base_model_settings
+        elif self._reasoning_mode_override == "none" and model_info.none_semantics == "omit":
+            effective_settings = replace(self._base_model_settings, reasoning=None)
+        else:
+            effective_settings = replace(
+                self._base_model_settings,
+                reasoning=Reasoning(effort=self._reasoning_mode_override),
+            )
+        self._agent.model_settings = effective_settings
+
+    def _new_session_id(self) -> str:
+        return f"hans-tui-{uuid4().hex}"
+
+    def select_model(self, model_id: str) -> ModelChanged | RuntimeControlRejected | None:
+        if self._request_active:
+            return RuntimeControlRejected("Model selection is available when HANS is idle.")
+        normalized_id = model_id.strip().lower()
+        if not normalized_id or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", normalized_id):
+            return RuntimeControlRejected("Unknown configured model.")
+        try:
+            profiles = configured_model_profiles()
+            target_profile = next(
+                (profile for profile in profiles if profile.info.id.lower() == normalized_id),
+                None,
+            )
+            current_profile = self._profile or configured_model_profile()
+        except ConfigurationError:
+            return RuntimeControlRejected("Model selection is unavailable.")
+        if target_profile is None:
+            return RuntimeControlRejected(f"Unknown configured model: {normalized_id}")
+        if target_profile.info.id == current_profile.info.id:
+            return None
+
+        target_session: Any | None = None
+        try:
+            target_agent = self._agent_factory(self._workspace, journal=self._journal, profile=target_profile)
+            if target_agent is None:
+                raise RuntimeError("target agent is unavailable")
+            apply_tool_permission_policy(target_agent, self._permission_allowed)
+            target_base_settings = self._model_settings_snapshot(target_agent)
+            target_context_filter = make_fit_model_input(target_profile.info.context_tokens)
+            target_session = self._session_factory(self._new_session_id())
+            if target_session is None:
+                raise RuntimeError("target session is unavailable")
+        except Exception:
+            if target_session is not None:
+                try:
+                    target_session.close()
+                except Exception:
+                    pass
+            return RuntimeControlRejected("Unable to start the selected model.")
+
+        previous_model_id = current_profile.info.id
+        previous_session = self._session
+        previous_session_owned = self._owns_session
+        self._profile = target_profile
+        self._model_info = target_profile.info
+        self._agent = target_agent
+        self._session = target_session
+        self._owns_session = True
+        self._base_model_settings = target_base_settings
+        self._context_filter = target_context_filter
+        self._reasoning_mode_override = None
+        if previous_session_owned and previous_session is not None:
+            try:
+                previous_session.close()
+            except Exception:
+                pass
+        return ModelChanged(previous_model_id, target_profile.info, True, True)
+
+    def get_model_status(self) -> ModelStatus:
+        return ModelStatus(
+            self._active_model_info(),
+            self._reasoning_mode_override or self._configured_reasoning_mode(),
+            tuple(profile.info for profile in configured_model_profiles()),
+        )
+
+    def get_reasoning_mode_status(self) -> ReasoningModeStatus:
+        model_info = self._active_model_info()
+        mode = self._reasoning_mode_override or self._configured_reasoning_mode()
+        return ReasoningModeStatus(mode, model_info.supported_reasoning_modes, model_info.none_semantics)
+
+    def set_reasoning_mode(self, mode: str | None) -> ReasoningModeChanged | RuntimeControlRejected:
+        if self._request_active:
+            return RuntimeControlRejected("Reasoning mode can be changed when HANS is idle.")
+        if mode is None:
+            self._reasoning_mode_override = None
+            self._apply_effective_model_settings()
+            return ReasoningModeChanged(None)
+        normalized_mode = mode.strip().lower()
+        model_info = self._active_model_info()
+        supported = model_info.supported_reasoning_modes
+        if not supported:
+            return RuntimeControlRejected("Reasoning mode support is not declared for the active configured model.")
+        if not normalized_mode or normalized_mode not in supported:
+            return RuntimeControlRejected(
+                f"Unsupported reasoning mode: {normalized_mode or mode}. Supported modes: {', '.join(supported)}."
+            )
+        self._reasoning_mode_override = normalized_mode
+        self._apply_effective_model_settings()
+        return ReasoningModeChanged(normalized_mode)
 
     def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged | RuntimeControlRejected:
         if category not in self._permissions:
@@ -280,14 +436,17 @@ class HansRuntime:
             self._assistant_text = []
             yield UserMessageSubmitted(message)
             yield RequestStarted(message)
+            profile = self._active_profile()
             if self._agent is None:
-                self._agent = create_agent(self._workspace, journal=self._journal)
+                self._agent = self._agent_factory(self._workspace, journal=self._journal, profile=profile)
                 apply_tool_permission_policy(self._agent, self._permission_allowed)
+                self._snapshot_model_settings()
+            self._apply_effective_model_settings()
             result = self._runner.run_streamed(
                 self._agent,
                 message,
                 session=self._session,
-                run_config=run_config(),
+                run_config=run_config(self._context_filter),
             )
             self._active_result = result
             stream = result.stream_events().__aiter__()

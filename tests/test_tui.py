@@ -5,7 +5,11 @@ import pytest
 
 from bolt_next.events import (
     AssistantMessageDelta,
+    ModelChanged,
+    ModelStatus,
     PermissionPolicyChanged,
+    ReasoningModeChanged,
+    ReasoningModeStatus,
     RequestCancelled,
     RuntimeControlRejected,
     RuntimeControlStatus,
@@ -26,6 +30,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
+from bolt_next.model_catalog import ModelInfo
 from bolt_next.runtime import run_config
 from bolt_next.tui import (
     FOOTER,
@@ -389,6 +394,20 @@ def test_local_todos_commands_and_bounded_presentation_are_ui_only() -> None:
     assert handle_local_command("/theme sepia", todos).text == (
         "Theme error: choose one of dark, light, high-contrast, terminal"
     )
+    model_status = handle_local_command("/models", todos)
+    mode_status = handle_local_command("/mode", todos)
+    mode_change = handle_local_command("/mode  HIGH ", todos)
+    assert model_status.control is not None and model_status.control.kind == "model_status"
+    assert mode_status.control is not None and mode_status.control.kind == "reasoning_mode_status"
+    assert mode_change.control is not None
+    assert (mode_change.control.kind, mode_change.control.mode) == ("set_reasoning_mode", "high")
+    model_change = handle_local_command("/models use LARGE", todos)
+    assert model_change.control is not None
+    assert (model_change.control.kind, model_change.control.model_id) == ("select_model", "large")
+    assert handle_local_command("/models use", todos).text == "Usage: /models [use <model>]"
+    assert handle_local_command("/models use large extra", todos).text == "Usage: /models [use <model>]"
+    assert handle_local_command("/models list", todos).text == "Usage: /models [use <model>]"
+    assert handle_local_command("/mode high extra", todos).text == "Usage: /mode [mode]"
     assert display_bounded("abcdef", 3) == "abc\n… display truncated (3 characters omitted)"
     assert display_bounded("abc", 3) == "abc"
 
@@ -398,11 +417,26 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     status = handle_local_command("/permissions", todos)
     changed = handle_local_command("/permissions WRITE deny", todos)
     clear = handle_local_command("/clear", todos)
+    model_status = handle_local_command("/models", todos)
+    reasoning_status = handle_local_command("/mode", todos)
+    reasoning_changed = handle_local_command("/mode high", todos)
+    invalid_reasoning_mode = handle_local_command("/mode unsupported", todos)
+    model_changed = handle_local_command("/models use LARGE", todos)
+    unknown_model = handle_local_command("/models use missing", todos)
 
     assert status.control is not None and status.control.kind == "permissions_status"
     assert changed.control is not None
     assert (changed.control.kind, changed.control.category, changed.control.allowed) == ("set_permission", "write", False)
     assert clear.control is not None and clear.control.kind == "clear_session"
+    assert model_status.control is not None and model_status.control.kind == "model_status"
+    assert reasoning_status.control is not None and reasoning_status.control.kind == "reasoning_mode_status"
+    assert reasoning_changed.control is not None
+    assert (reasoning_changed.control.kind, reasoning_changed.control.mode) == ("set_reasoning_mode", "high")
+    assert invalid_reasoning_mode.control is not None
+    assert model_changed.control is not None
+    assert (model_changed.control.kind, model_changed.control.model_id) == ("select_model", "large")
+    assert unknown_model.control is not None
+    assert (unknown_model.control.kind, unknown_model.control.model_id) == ("select_model", "missing")
     assert handle_local_command("/permissions foo allow", todos).text == "Unknown permission: foo"
     assert handle_local_command("/permissions write maybe", todos).text == "Expected allow or deny."
     assert handle_local_command("/permissions write", todos).text == (
@@ -413,10 +447,30 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     class Runtime:
         def __init__(self) -> None:
             self.permissions = {"read": True, "write": True, "execute": True}
-            self.calls: list[tuple[str, str | None, bool | None]] = []
+            self.calls: list[tuple[object, ...]] = []
+            self.models = (
+                ModelInfo(
+                    id="configured-model",
+                    display_name="Configured Model",
+                    endpoint_profile="configured endpoint",
+                    context_tokens=128_000,
+                    supported_reasoning_modes=("none", "high"),
+                    none_semantics="omit",
+                ),
+                ModelInfo(
+                    id="large",
+                    display_name="Large Model",
+                    endpoint_profile="configured endpoint",
+                    context_tokens=256_000,
+                    supported_reasoning_modes=("none", "low"),
+                    none_semantics="literal",
+                ),
+            )
+            self.model = self.models[0]
+            self.reasoning_mode: str | None = None
 
         def get_control_status(self) -> RuntimeControlStatus:
-            self.calls.append(("status", None, None))
+            self.calls.append(("status",))
             return RuntimeControlStatus(**{f"{name}_allowed": allowed for name, allowed in self.permissions.items()})
 
         def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged:
@@ -425,28 +479,93 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
             return PermissionPolicyChanged(category, allowed)
 
         async def clear_session_history(self) -> SessionCleared:
-            self.calls.append(("clear", None, None))
+            self.calls.append(("clear",))
             return SessionCleared()
+
+        def get_model_status(self) -> ModelStatus:
+            self.calls.append(("model_status",))
+            return ModelStatus(self.model, self.reasoning_mode, self.models)
+
+        def select_model(self, model_id: str) -> ModelChanged | RuntimeControlRejected | None:
+            self.calls.append(("select_model", model_id))
+            selected = next((model for model in self.models if model.id == model_id), None)
+            if selected is None:
+                return RuntimeControlRejected("Model selection is unavailable.")
+            if selected.id == self.model.id:
+                return None
+            previous_model_id = self.model.id
+            self.model = selected
+            self.reasoning_mode = None
+            return ModelChanged(previous_model_id, selected, new_session_started=True, reasoning_reset=True)
+
+        def get_reasoning_mode_status(self) -> ReasoningModeStatus:
+            self.calls.append(("reasoning_mode_status",))
+            return ReasoningModeStatus(
+                self.reasoning_mode, self.model.supported_reasoning_modes, self.model.none_semantics
+            )
+
+        def set_reasoning_mode(self, mode: str) -> ReasoningModeChanged | RuntimeControlRejected:
+            self.calls.append(("reasoning_mode", mode))
+            if mode not in self.model.supported_reasoning_modes:
+                return RuntimeControlRejected(f"Unsupported reasoning mode: {mode}")
+            self.reasoning_mode = mode
+            return ReasoningModeChanged(mode)
 
     runtime = Runtime()
     transcript = Transcript()
-    display = _Display(transcript)
+    shown_models: list[str] = []
+    display = _Display(
+        transcript,
+        on_model=lambda model: shown_models.append(str(getattr(model, "display_name", ""))),
+    )
 
     async def scenario() -> None:
-        for local in (status, changed, clear):
+        for local in (
+            status,
+            changed,
+            clear,
+            model_status,
+            reasoning_status,
+            reasoning_changed,
+            invalid_reasoning_mode,
+            model_changed,
+            unknown_model,
+        ):
             assert local.control is not None
             await _dispatch_control(runtime, local.control, display)
 
     asyncio.run(scenario())
     rendered = "\n".join(transcript.render(120))
     assert runtime.calls == [
-        ("status", None, None),
+        ("status",),
         ("permission", "write", False),
-        ("clear", None, None),
+        ("clear",),
+        ("model_status",),
+        ("reasoning_mode_status",),
+        ("reasoning_mode", "high"),
+        ("reasoning_mode", "unsupported"),
+        ("select_model", "large"),
+        ("select_model", "missing"),
     ]
+    assert shown_models == ["Configured Model", "Large Model"]
+    assert "model: Large Model" in format_header(shown_models[-1], Path.cwd())
     assert "Permissions" in rendered
     assert "✓ write permission set to deny." in rendered
     assert "✓ Conversation history cleared." in rendered
+    assert "LOCAL\n  MODELS\n  * Active: Configured Model (configured-model)" in rendered
+    assert "Context: 128,000 tokens" in rendered
+    assert "Reasoning support: none, high" in rendered
+    assert "Current reasoning: configured default" in rendered
+    assert "Large Model (large)" in rendered
+    assert "Context: 256,000 tokens" in rendered
+    assert "✓ Switched from configured-model to Large Model (large)." in rendered
+    assert "✓ New conversation started." in rendered
+    assert "✓ Reasoning reset to configured default." in rendered
+    assert "https://" not in rendered
+    assert "LOCAL\n  REASONING MODE\n  Current: configured default\n  Supported: none, high" in rendered
+    assert "LOCAL\n  REASONING\n  ✓ Mode set to high." in rendered
+    assert "Unsupported reasoning mode: unsupported" in rendered
+    assert "Model selection is unavailable." in rendered
 
     display.event(RuntimeControlRejected("Cannot clear the session while HANS is busy."))
     assert "Cannot clear the session while HANS is busy." in "\n".join(transcript.render(120))
@@ -467,6 +586,9 @@ def test_non_tty_local_commands_do_not_run_model_turns() -> None:
 
     assert asyncio.run(submit_once("/permissions")) == []
     assert asyncio.run(submit_once("/clear")) == []
+    assert asyncio.run(submit_once("/models")) == []
+    assert asyncio.run(submit_once("/models use any-model")) == []
+    assert asyncio.run(submit_once("/mode high")) == []
     assert asyncio.run(submit_once("/unknown")) == []
     assert asyncio.run(submit_once("ordinary prompt")) == ["ordinary prompt"]
 

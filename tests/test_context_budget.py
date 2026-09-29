@@ -10,6 +10,7 @@ from bolt_next.context_budget import (
     context_token_limit,
     estimate_tokens,
     fit_model_input,
+    make_fit_model_input,
     request_tokens,
     tool_result_token_budget,
 )
@@ -90,6 +91,25 @@ def test_filter_keeps_request_inside_budget() -> None:
     assert huge not in json.dumps(fitted.input)
     assert "not a summary" in json.dumps(fitted.input)
     assert items[3]["output"] == huge
+
+
+def test_selected_capacity_filter_uses_its_bound_profile_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOLT_MODEL_CONTEXT_TOKENS", "32768")
+    huge = "SOURCE " * 2_000
+    fitted = make_fit_model_input(1024)(
+        CallModelData(
+            model_data=ModelInputData(
+                input=[{"type": "function_call_output", "call_id": "read", "output": huge}],
+                instructions="instructions",
+            ),
+            agent=Agent(name="Hans"),
+            context=None,
+        )
+    )
+
+    assert request_tokens(fitted.instructions, fitted.input) <= 1024 * 3 // 4
+    assert "1024 tokens" in json.dumps(fitted.input)
+    assert huge not in json.dumps(fitted.input)
 
 
 def test_token_estimate_is_conservative_for_source_payloads() -> None:

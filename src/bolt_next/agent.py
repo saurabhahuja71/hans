@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 
 from bolt_next.context_budget import completion_token_reserve
 from bolt_next.errors import ConfigurationError
+from bolt_next.model_catalog import ConfiguredModelProfile, configured_model_profile
 from bolt_next.workspace import (
     TaskMutationJournal,
     make_list_directory_tool,
@@ -74,21 +75,20 @@ STAGE_4_INSTRUCTIONS = (
 )
 
 
-def _model_settings() -> ModelSettings:
-    reasoning_effort = os.environ.get("BOLT_MODEL_REASONING_EFFORT", "").strip()
-    raw_max_completion = os.environ.get("BOLT_MODEL_MAX_COMPLETION_TOKENS", "").strip()
+def _model_settings(profile: ConfiguredModelProfile | None = None) -> ModelSettings:
+    reasoning_effort = profile.reasoning_effort if profile is not None else os.environ.get("BOLT_MODEL_REASONING_EFFORT", "").strip()
+    raw_max_completion = (
+        profile.max_completion_tokens if profile is not None else os.environ.get("BOLT_MODEL_MAX_COMPLETION_TOKENS", "").strip()
+    )
     extra_args: dict[str, object] = {}
     if raw_max_completion:
         try:
             max_completion_tokens = int(raw_max_completion)
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             raise ConfigurationError("BOLT_MODEL_MAX_COMPLETION_TOKENS must be an integer") from error
-        reserve = completion_token_reserve()
+        reserve = completion_token_reserve(profile.info.context_tokens if profile is not None else None)
         if max_completion_tokens <= 0:
             raise ConfigurationError("BOLT_MODEL_MAX_COMPLETION_TOKENS must be positive")
-        # Keep the request valid for the configured context. A provider or
-        # profile may advertise a completion value larger than the remaining
-        # reserve; cap it instead of failing before the first prompt.
         extra_args["max_completion_tokens"] = min(max_completion_tokens, reserve)
     return ModelSettings(
         reasoning=Reasoning(effort=reasoning_effort) if reasoning_effort else None,
@@ -126,39 +126,47 @@ def _configured_max_retries() -> int:
     return retries
 
 
-def create_agent(workspace: str | Path | None = None, *, journal: TaskMutationJournal | None = None) -> Agent:
-    """Build the Hans agent using the configured OpenAI-compatible endpoint."""
-    base_url = _configured_value("BOLT_MODEL_BASE_URL", required=True)
-    api_key = _configured_value("BOLT_MODEL_API_KEY", required=True)
-    project = _configured_value("BOLT_MODEL_OPENAI_PROJECT")
-    model_name = _configured_value("BOLT_MODEL", default="qwen3.6-27b")
-    if model_name is None:
-        raise ConfigurationError("BOLT_MODEL must not be empty")
-    client = AsyncOpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        project=project,
-        timeout=_configured_timeout_seconds(),
-        max_retries=_configured_max_retries(),
-    )
+def _selected_profile(profile: ConfiguredModelProfile | str | None) -> ConfiguredModelProfile:
+    if isinstance(profile, ConfiguredModelProfile):
+        return profile
+    return configured_model_profile(profile)
 
+
+def create_agent(
+    workspace: str | Path | None = None,
+    *,
+    journal: TaskMutationJournal | None = None,
+    profile: ConfiguredModelProfile | str | None = None,
+) -> Agent:
+    """Build the Hans agent using the selected OpenAI-compatible model profile."""
+    selected_profile = _selected_profile(profile)
+    if not selected_profile.base_url or not selected_profile.api_key:
+        raise ConfigurationError("Set BOLT_MODEL_BASE_URL and BOLT_MODEL_API_KEY before starting Hans")
+    client = AsyncOpenAI(
+        base_url=selected_profile.base_url,
+        api_key=selected_profile.api_key,
+        project=selected_profile.openai_project,
+        timeout=selected_profile.timeout_seconds,
+        max_retries=selected_profile.max_retries,
+    )
     model = OpenAIChatCompletionsModel(
-        model=model_name,
+        model=selected_profile.model,
         openai_client=client,
     )
 
     root = resolve_workspace(workspace or os.environ.get("BOLT_WORKSPACE"))
+    context_tokens = selected_profile.info.context_tokens
     return Agent(
         name="Hans",
         instructions=STAGE_4_INSTRUCTIONS,
         model=model,
-        model_settings=_model_settings(),
+        model_settings=_model_settings(selected_profile),
         tools=[
-            make_list_directory_tool(root),
-            make_search_files_tool(root),
-            make_read_file_tool(root),
+            make_list_directory_tool(root, context_tokens=context_tokens),
+            make_search_files_tool(root, context_tokens=context_tokens),
+            make_read_file_tool(root, context_tokens=context_tokens),
             make_replace_in_file_tool(root, journal),
             make_write_file_tool(root, journal),
-            make_run_command_tool(root),
+            make_run_command_tool(root, context_tokens=context_tokens),
         ],
     )

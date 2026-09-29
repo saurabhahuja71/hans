@@ -271,8 +271,15 @@ def _range_result(path: str, lines: list[str], start_line: int, end_line: int) -
     return header + body
 
 
-def _fitting_end(path: str, lines: list[str], start_line: int, end_line: int) -> int | None:
-    budget = tool_result_token_budget()
+def _fitting_end(
+    path: str,
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+    *,
+    context_tokens: int | None = None,
+) -> int | None:
+    budget = tool_result_token_budget(context_tokens)
     if estimate_tokens(_range_result(path, lines, start_line, end_line)) <= budget:
         return end_line
     low = start_line
@@ -288,7 +295,7 @@ def _fitting_end(path: str, lines: list[str], start_line: int, end_line: int) ->
     return best
 
 
-def make_read_file_tool(workspace: Path):
+def make_read_file_tool(workspace: Path, *, context_tokens: int | None = None):
     @function_tool
     async def read_file(path: str, start_line: int = 1, end_line: int = 0) -> str:
         """Read a UTF-8 text file inside the workspace.
@@ -328,25 +335,25 @@ def make_read_file_tool(workspace: Path):
                 not explicit
                 and start_line == 1
                 and end_line == total
-                and estimate_tokens(text) <= tool_result_token_budget()
+                and estimate_tokens(text) <= tool_result_token_budget(context_tokens)
             ):
                 return text
-            fitted = _fitting_end(path, lines, start_line, end_line)
+            fitted = _fitting_end(path, lines, start_line, end_line, context_tokens=context_tokens)
             if fitted is None:
                 return (
                     f"Error reading {path!r}: requested range {start_line}-{end_line} "
-                    f"does not fit in the tool result budget of {tool_result_token_budget()} tokens. "
+                    f"does not fit in the tool result budget of {tool_result_token_budget(context_tokens)} tokens. "
                     f"total_lines: {total}. Request a smaller end_line. "
                     "No partial source was returned."
                 )
             if explicit and fitted < end_line:
                 return (
                     f"Error reading {path!r}: requested range {start_line}-{end_line} "
-                    f"does not fit in the tool result budget of {tool_result_token_budget()} tokens. "
+                    f"does not fit in the tool result budget of {tool_result_token_budget(context_tokens)} tokens. "
                     f"total_lines: {total}. A range ending at {fitted} fits. "
                     "No partial source was returned."
                 )
-            if fitted == total and start_line == 1 and estimate_tokens(text) <= tool_result_token_budget():
+            if fitted == total and start_line == 1 and estimate_tokens(text) <= tool_result_token_budget(context_tokens):
                 return text
             return _range_result(path, lines, start_line, fitted)
         except (OSError, UnicodeError, WorkspaceError) as exc:
@@ -379,8 +386,10 @@ def make_write_file_tool(workspace: Path, journal: object | None = None):
     return write_file
 
 
-def _bounded_lines(lines: list[str], *, max_results: int | None = None) -> str:
-    budget = tool_result_token_budget()
+def _bounded_lines(
+    lines: list[str], *, max_results: int | None = None, context_tokens: int | None = None
+) -> str:
+    budget = tool_result_token_budget(context_tokens)
     limited = lines if max_results is None else lines[:max_results]
     if not limited:
         return ""
@@ -420,10 +429,10 @@ _SEARCH_IGNORED_DIRECTORIES = {
 }
 
 
-def _search_match_line(path: Path, line_number: int, line: str) -> str:
+def _search_match_line(path: Path, line_number: int, line: str, *, context_tokens: int | None = None) -> str:
     prefix = f"{path}:{line_number}: "
     suffix = " ... [matching line truncated]"
-    maximum_line_length = max(0, tool_result_token_budget() * 3 - len(prefix) - len(suffix))
+    maximum_line_length = max(0, tool_result_token_budget(context_tokens) * 3 - len(prefix) - len(suffix))
     if len(line) <= maximum_line_length:
         return prefix + line
     return prefix + line[:maximum_line_length] + suffix
@@ -452,7 +461,7 @@ def _search_candidates(workspace: Path, target: Path):
             yield candidate
 
 
-def make_list_directory_tool(workspace: Path):
+def make_list_directory_tool(workspace: Path, *, context_tokens: int | None = None):
     @function_tool
     async def list_directory(path: str = ".") -> str:
         """List direct workspace-directory entries in sorted order.
@@ -477,14 +486,14 @@ def make_list_directory_tool(workspace: Path):
                 else:
                     kind = "other"
                 entries.append(f"{kind}: {entry.name}")
-            return _bounded_lines(entries)
+            return _bounded_lines(entries, context_tokens=context_tokens)
         except (OSError, WorkspaceError) as exc:
             return f"Error listing {path!r}: {exc}"
 
     return list_directory
 
 
-def make_search_files_tool(workspace: Path):
+def make_search_files_tool(workspace: Path, *, context_tokens: int | None = None):
     @function_tool
     async def search_files(query: str, path: str = ".", max_results: int = 50) -> str:
         """Search UTF-8 text files in the workspace and return matching path:line text.
@@ -518,15 +527,17 @@ def make_search_files_tool(workspace: Path):
                                 break
                             line = line.rstrip("\r\n")
                             if query in line and len(matches) + len(file_matches) < max_results:
-                                file_matches.append(_search_match_line(relative, line_number, line))
+                                file_matches.append(
+                                    _search_match_line(relative, line_number, line, context_tokens=context_tokens)
+                                )
                     if binary:
                         continue
                     matches.extend(file_matches)
                 except (OSError, UnicodeError, ValueError):
                     continue
                 if len(matches) >= max_results:
-                    return _bounded_lines(matches, max_results=max_results)
-            return _bounded_lines(matches, max_results=max_results)
+                    return _bounded_lines(matches, max_results=max_results, context_tokens=context_tokens)
+            return _bounded_lines(matches, max_results=max_results, context_tokens=context_tokens)
         except (OSError, WorkspaceError) as exc:
             return f"Error searching {path!r}: {exc}"
 
@@ -664,7 +675,7 @@ def reject_workspace_escape(workspace: Path, args: list[str]) -> str | None:
     return None
 
 
-def make_run_command_tool(workspace: Path):
+def make_run_command_tool(workspace: Path, *, context_tokens: int | None = None):
     @function_tool
     async def run_command(command: str, purpose: str = "inspect") -> str:
         """Run one direct command in the workspace and return its exit code and output.
@@ -719,7 +730,7 @@ def make_run_command_tool(workspace: Path):
             f"stdout:\n{completed.stdout}"
             f"stderr:\n{completed.stderr}"
         )
-        budget = tool_result_token_budget()
+        budget = tool_result_token_budget(context_tokens)
         if estimate_tokens(result) <= budget:
             return result
         notice = (

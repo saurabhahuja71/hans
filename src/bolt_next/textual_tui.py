@@ -23,7 +23,11 @@ from bolt_next.events import (
     AssistantMessageDelta,
     ConnectionChanged,
     HansEvent,
+    ModelChanged,
+    ModelStatus,
     PermissionPolicyChanged,
+    ReasoningModeChanged,
+    ReasoningModeStatus,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
@@ -50,6 +54,10 @@ from bolt_next.tui_screen import (
     display_bounded,
     footer_text,
     format_change_summary,
+    format_model_changed,
+    format_model_status,
+    format_reasoning_mode_changed,
+    format_reasoning_mode_status,
     handle_local_command,
     is_exit_command,
     task_summary_has_hans_changes,
@@ -70,6 +78,14 @@ class Runtime(Protocol):
     def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged | RuntimeControlRejected: ...
 
     async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected: ...
+
+    def get_model_status(self) -> ModelStatus: ...
+
+    def select_model(self, model_id: str) -> ModelChanged | RuntimeControlRejected | None: ...
+
+    def get_reasoning_mode_status(self) -> ReasoningModeStatus: ...
+
+    def set_reasoning_mode(self, mode: str) -> ReasoningModeChanged | RuntimeControlRejected: ...
 
     def close(self) -> None: ...
 
@@ -383,6 +399,10 @@ class HansTextualApp(App[None]):
         except ValueError:
             shown_workspace = str(self.workspace)
         return f"HANS  |  model {self.model}  |  {marker}\nworkspace {shown_workspace}"
+
+    def _set_model(self, model: object) -> None:
+        self.model = str(getattr(model, "display_name", None) or getattr(model, "id", None) or self.model)
+        self.query_one("#hans-header", Static).update(self._header_text())
 
     def _footer_text(self) -> str:
         return footer_text(
@@ -729,6 +749,29 @@ class HansTextualApp(App[None]):
                 )
             )
             await self._append_transcript("\n".join(lines), "change")
+        elif isinstance(event, ModelStatus):
+            self._set_model(event.model)
+            await self._append_transcript(
+                format_model_status(event.model, event.current_reasoning_mode, event.models), "change"
+            )
+        elif isinstance(event, ModelChanged):
+            self._set_model(event.model)
+            await self._append_transcript(
+                format_model_changed(
+                    event.previous_model_id,
+                    event.model,
+                    new_session_started=event.new_session_started,
+                    reasoning_reset=event.reasoning_reset,
+                ),
+                "change",
+            )
+        elif isinstance(event, ReasoningModeStatus):
+            await self._append_transcript(
+                format_reasoning_mode_status(event.mode, event.available_modes, event.none_semantics),
+                "change",
+            )
+        elif isinstance(event, ReasoningModeChanged):
+            await self._append_transcript(format_reasoning_mode_changed(event.mode), "change")
         elif isinstance(event, PermissionPolicyChanged):
             value = "allow" if event.allowed else "deny"
             await self._append_transcript(
@@ -824,9 +867,18 @@ class HansTextualApp(App[None]):
             event = self.runtime.set_permission(control.category or "", bool(control.allowed))
         elif control.kind == "clear_session":
             event = await self.runtime.clear_session_history()
+        elif control.kind == "model_status":
+            event = self.runtime.get_model_status()
+        elif control.kind == "select_model":
+            event = self.runtime.select_model(control.model_id or "")
+        elif control.kind == "reasoning_mode_status":
+            event = self.runtime.get_reasoning_mode_status()
+        elif control.kind == "set_reasoning_mode":
+            event = self.runtime.set_reasoning_mode(control.mode or "")
         else:
             return
-        await self._render_event(event)
+        if event is not None:
+            await self._render_event(event)
 
     @work(exclusive=True)
     async def _submit(self, prompt: str) -> None:

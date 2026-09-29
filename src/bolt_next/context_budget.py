@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from copy import deepcopy
 
 from agents.run_config import CallModelData, ModelInputData
@@ -17,21 +18,28 @@ from bolt_next.errors import ConfigurationError
 DEFAULT_CONTEXT_TOKENS = 16384
 
 
-def context_token_limit() -> int:
-    raw = os.environ.get("BOLT_MODEL_CONTEXT_TOKENS", "").strip()
-    if not raw:
-        return DEFAULT_CONTEXT_TOKENS
-    try:
-        limit = int(raw)
-    except ValueError as exc:
-        raise ConfigurationError("BOLT_MODEL_CONTEXT_TOKENS must be an integer") from exc
+def context_token_limit(context_tokens: int | None = None) -> int:
+    """Return an explicit capacity or the legacy environment-backed capacity."""
+    if context_tokens is None:
+        raw = os.environ.get("BOLT_MODEL_CONTEXT_TOKENS", "").strip()
+        if not raw:
+            return DEFAULT_CONTEXT_TOKENS
+        try:
+            limit = int(raw)
+        except ValueError as exc:
+            raise ConfigurationError("BOLT_MODEL_CONTEXT_TOKENS must be an integer") from exc
+    else:
+        limit = context_tokens
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ConfigurationError("context_tokens must be an integer")
     if limit < 1024:
-        raise ConfigurationError("BOLT_MODEL_CONTEXT_TOKENS must be at least 1024")
+        variable = "BOLT_MODEL_CONTEXT_TOKENS" if context_tokens is None else "context_tokens"
+        raise ConfigurationError(f"{variable} must be at least 1024")
     return limit
 
 
-def completion_token_reserve() -> int:
-    return context_token_limit() - max_input_tokens()
+def completion_token_reserve(context_tokens: int | None = None) -> int:
+    return context_token_limit(context_tokens) - max_input_tokens(context_tokens)
 
 
 def estimate_tokens(text: str) -> int:
@@ -45,14 +53,14 @@ def estimate_tokens(text: str) -> int:
     return (len(text) + 2) // 3
 
 
-def max_input_tokens() -> int:
+def max_input_tokens(context_tokens: int | None = None) -> int:
     """Input budget, leaving a quarter of the context for the model reply."""
-    return max(256, context_token_limit() * 3 // 4)
+    return max(256, context_token_limit(context_tokens) * 3 // 4)
 
 
-def tool_result_token_budget() -> int:
+def tool_result_token_budget(context_tokens: int | None = None) -> int:
     """Largest single tool result that can still leave room for the rest of the turn."""
-    return max(128, max_input_tokens() // 4)
+    return max(128, max_input_tokens(context_tokens) // 4)
 
 
 def request_tokens(instructions: str | None, items: list) -> int:
@@ -78,29 +86,27 @@ def _set_output(item, text: str):
     return cloned
 
 
-def _omitted_notice() -> str:
-    limit = context_token_limit()
+def _omitted_notice(context_tokens: int) -> str:
     return (
         "Tool output omitted from this model request because including it would "
-        f"exceed the context budget of {limit} tokens. "
+        f"exceed the context budget of {context_tokens} tokens. "
         "The authoritative output is unchanged in the session and on disk. "
         "This is not a summary. Request a smaller read_file range or a narrower command."
     )
 
 
-def fit_model_input(data: CallModelData) -> ModelInputData:
-    """Return model input that fits the configured context budget."""
+def _fit_model_input(data: CallModelData, context_tokens: int) -> ModelInputData:
     instructions = data.model_data.instructions
     items = list(data.model_data.input)
-    limit = max_input_tokens()
+    limit = max_input_tokens(context_tokens)
     if request_tokens(instructions, items) <= limit:
         return ModelInputData(input=items, instructions=instructions)
 
-    notice = _omitted_notice()
+    notice = _omitted_notice(context_tokens)
     fitted = []
     for item in items:
         text = _output_text(item)
-        if text is not None and estimate_tokens(text) > tool_result_token_budget():
+        if text is not None and estimate_tokens(text) > tool_result_token_budget(context_tokens):
             fitted.append(_set_output(item, notice))
         else:
             fitted.append(item)
@@ -119,3 +125,18 @@ def fit_model_input(data: CallModelData) -> ModelInputData:
     elif request_tokens(instructions, kept) > limit:
         kept = [{"role": "user", "content": notice}]
     return ModelInputData(input=kept, instructions=instructions)
+
+
+def make_fit_model_input(context_tokens: int) -> Callable[[CallModelData], ModelInputData]:
+    """Build a model-input filter bound to one selected model capacity."""
+    selected_context_tokens = context_token_limit(context_tokens)
+
+    def fit(data: CallModelData) -> ModelInputData:
+        return _fit_model_input(data, selected_context_tokens)
+
+    return fit
+
+
+def fit_model_input(data: CallModelData) -> ModelInputData:
+    """Return model input that fits the legacy configured context budget."""
+    return _fit_model_input(data, context_token_limit())

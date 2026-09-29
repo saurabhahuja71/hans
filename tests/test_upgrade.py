@@ -93,7 +93,7 @@ def test_main_reports_invalid_usage(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().err == "usage: hans [upgrade|update]\n"
 
 
-def test_phase_eight_point_one_release_uses_patch_version() -> None:
+def test_phase_nine_release_uses_patch_version() -> None:
     project = (Path(__file__).parents[1] / "pyproject.toml").read_text()
 
-    assert 'version = "0.5.1"' in project
+    assert 'version = "0.5.2"' in project

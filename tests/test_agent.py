@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,69 @@ def test_max_completion_is_capped_to_context_reserve(monkeypatch: pytest.MonkeyP
     settings = agent_module._model_settings()
 
     assert settings.extra_args == {"max_completion_tokens": 4096}
+
+
+def test_create_agent_binds_selected_profile_without_mutating_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("BOLT_MODEL_PROFILES", "small,selected")
+    monkeypatch.setenv("BOLT_MODEL_ACTIVE_PROFILE", "small")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SMALL_MODEL", "small-model")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SMALL_BASE_URL", "https://small.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SMALL_API_KEY", "small-key")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_MODEL", "selected-model")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_API_KEY", "selected-key")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_OPENAI_PROJECT", "selected-project")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_MAX_RETRIES", "3")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_CONTEXT_TOKENS", "8192")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_MAX_COMPLETION_TOKENS", "4096")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_REASONING_EFFORT", "high")
+    environment_before = dict(os.environ)
+    captured: dict[str, object] = {"tool_capacities": []}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client"] = kwargs
+            captured["openai_client"] = self
+
+    def record_capacity(name: str):
+        def tool(_root: Path, *, context_tokens: int | None = None) -> str:
+            captured["tool_capacities"].append((name, context_tokens))
+            return name
+
+        return tool
+
+    monkeypatch.setattr(agent_module, "AsyncOpenAI", FakeAsyncOpenAI)
+    monkeypatch.setattr(agent_module, "OpenAIChatCompletionsModel", lambda **kwargs: kwargs)
+    monkeypatch.setattr(agent_module, "Agent", lambda **kwargs: kwargs)
+    monkeypatch.setattr(agent_module, "make_list_directory_tool", record_capacity("list"))
+    monkeypatch.setattr(agent_module, "make_search_files_tool", record_capacity("search"))
+    monkeypatch.setattr(agent_module, "make_read_file_tool", record_capacity("read"))
+    monkeypatch.setattr(agent_module, "make_run_command_tool", record_capacity("command"))
+    monkeypatch.setattr(agent_module, "make_replace_in_file_tool", lambda *_args: "replace")
+    monkeypatch.setattr(agent_module, "make_write_file_tool", lambda *_args: "write")
+
+    agent = agent_module.create_agent(tmp_path, profile="selected")
+
+    assert captured["client"] == {
+        "base_url": "https://selected.example.test/v1",
+        "api_key": "selected-key",
+        "project": "selected-project",
+        "timeout": 12.5,
+        "max_retries": 3,
+    }
+    assert agent["model"] == {"model": "selected-model", "openai_client": captured["openai_client"]}
+    assert agent["model_settings"].reasoning.effort == "high"
+    assert agent["model_settings"].extra_args == {"max_completion_tokens": 2048}
+    assert captured["tool_capacities"] == [
+        ("list", 8192),
+        ("search", 8192),
+        ("read", 8192),
+        ("command", 8192),
+    ]
+    assert dict(os.environ) == environment_before
 
 
 def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> None:

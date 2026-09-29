@@ -6,14 +6,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agents import Agent, SQLiteSession, set_tracing_disabled
+from agents import Agent, ModelSettings, SQLiteSession, set_tracing_disabled
+from agents.model_settings import Reasoning
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
 
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
+    ModelStatus,
     PermissionPolicyChanged,
+    ReasoningModeChanged,
+    ReasoningModeStatus,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
@@ -247,7 +251,7 @@ def test_runtime_reports_journal_changes_and_exposes_safe_undo(
         ]
     )
 
-    def fake_create_agent(workspace: Path, *, journal: object) -> Agent:
+    def fake_create_agent(workspace: Path, *, journal: object, profile: object) -> Agent:
         return Agent(
             name="journal test agent",
             instructions="Use the provided tools.",
@@ -518,7 +522,7 @@ def test_clear_session_history_removes_sdk_history_and_preserves_runtime_control
     )
     session = SQLiteSession("runtime-clear-history")
 
-    def fake_create_agent(workspace: Path, *, journal: object) -> Agent:
+    def fake_create_agent(workspace: Path, *, journal: object, profile: object) -> Agent:
         return Agent(
             name="clear history test agent",
             instructions="Use the provided tools.",
@@ -587,6 +591,114 @@ def test_controls_reject_while_active_and_work_after_cancellation() -> None:
     assert any(isinstance(event, RequestCancelled) for event in events)
     assert idle_permission == PermissionPolicyChanged("write", False)
     assert idle_clear == SessionCleared()
+
+
+def test_runtime_model_and_reasoning_status_are_sdk_independent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOLT_MODEL", "runtime-model")
+    monkeypatch.setenv("BOLT_MODEL_CONTEXT_TOKENS", "32768")
+    monkeypatch.setenv("BOLT_MODEL_REASONING_MODES", "low, high, none")
+    monkeypatch.setenv("BOLT_MODEL_REASONING_NONE_SEMANTICS", "literal")
+    agent = SimpleNamespace(model_settings=ModelSettings(reasoning=Reasoning(effort="low")), tools=())
+    runtime = HansRuntime(agent=agent, session=object(), runner=object())
+
+    model_status = runtime.get_model_status()
+    mode_status = runtime.get_reasoning_mode_status()
+
+    assert isinstance(model_status, ModelStatus)
+    assert model_status.model.id == "runtime-model"
+    assert model_status.model.context_tokens == 32768
+    assert model_status.current_reasoning_mode == "low"
+    assert isinstance(mode_status, ReasoningModeStatus)
+    assert mode_status == ReasoningModeStatus("low", ("low", "high", "none"), "literal")
+    assert not hasattr(model_status, "model_settings")
+    assert not hasattr(mode_status, "model_settings")
+
+
+@pytest.mark.parametrize(
+    ("none_semantics", "expected_reasoning"),
+    (("literal", "none"), ("omit", None)),
+)
+def test_reasoning_mode_override_uses_base_settings_without_rebuilding_runtime_objects(
+    monkeypatch: pytest.MonkeyPatch, none_semantics: str, expected_reasoning: str | None
+) -> None:
+    monkeypatch.setenv("BOLT_MODEL", "runtime-model")
+    monkeypatch.setenv("BOLT_MODEL_REASONING_MODES", "low,none,high")
+    monkeypatch.setenv("BOLT_MODEL_REASONING_NONE_SEMANTICS", none_semantics)
+
+    class _Result:
+        async def stream_events(self):
+            return
+            yield None
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, object]] = []
+
+        def run_streamed(self, agent, _message, *, session, run_config):
+            self.calls.append((agent, session))
+            return _Result()
+
+    base_settings = ModelSettings(reasoning=Reasoning(effort="low"))
+    agent = SimpleNamespace(model_settings=base_settings, tools=())
+    session = object()
+    runner = _Runner()
+    runtime = HansRuntime(agent=agent, session=session, runner=runner)
+
+    run(collect(runtime, "Use the configured default."))
+    assert agent.model_settings is base_settings
+    assert runtime.set_reasoning_mode(" NONE ") == ReasoningModeChanged("none")
+    assert runner.calls == [(agent, session)]
+    assert agent.model_settings is not base_settings
+    assert (agent.model_settings.reasoning.effort if agent.model_settings.reasoning else None) == expected_reasoning
+
+    run(collect(runtime, "Use the none override."))
+    assert runner.calls == [(agent, session), (agent, session)]
+    assert runtime.set_reasoning_mode("high") == ReasoningModeChanged("high")
+    assert agent.model_settings.reasoning is not None
+    assert agent.model_settings.reasoning.effort == "high"
+
+    run(collect(runtime, "Use the high override."))
+    assert runner.calls == [(agent, session), (agent, session), (agent, session)]
+    assert runtime.set_reasoning_mode(None) == ReasoningModeChanged(None)
+    assert agent.model_settings is base_settings
+
+
+def test_reasoning_mode_rejects_undeclared_values_and_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOLT_MODEL", "qwen3.6-27b")
+    monkeypatch.delenv("BOLT_MODEL_REASONING_MODES", raising=False)
+    undeclared_runtime = HansRuntime(agent=object(), session=object(), runner=object())
+    assert undeclared_runtime.set_reasoning_mode("low") == RuntimeControlRejected(
+        "Reasoning mode support is not declared for the active configured model."
+    )
+
+    monkeypatch.setenv("BOLT_MODEL_REASONING_MODES", "low,high")
+    runtime = HansRuntime(agent=object(), session=object(), runner=object())
+    assert runtime.set_reasoning_mode("medium") == RuntimeControlRejected(
+        "Unsupported reasoning mode: medium. Supported modes: low, high."
+    )
+
+    class _Result:
+        def cancel(self) -> None:
+            pass
+
+        async def stream_events(self):
+            await asyncio.Event().wait()
+            yield None
+
+    class _Runner:
+        def run_streamed(self, *_args, **_kwargs):
+            return _Result()
+
+    async def scenario():
+        active_runtime = HansRuntime(agent=object(), session=object(), runner=_Runner())
+        task = asyncio.create_task(collect(active_runtime, "Wait."))
+        await asyncio.sleep(0.01)
+        rejected = active_runtime.set_reasoning_mode("high")
+        active_runtime.cancel_active()
+        await asyncio.wait_for(task, timeout=1)
+        return rejected
+
+    assert run(scenario()) == RuntimeControlRejected("Reasoning mode can be changed when HANS is idle.")
 
 
 def test_tui_modules_do_not_depend_on_sdk_or_raw_wire_names() -> None:
