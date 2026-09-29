@@ -38,9 +38,9 @@ branding are HANS. Current release: **0.7.0**.
 - The `ask` permission policy pauses eligible tools for an explicit terminal approval. Approval prompts
   show bounded, redacted tool details rather than tool payloads.
 - `/help` is a local guide to configuration, session, safety, and workspace controls. In an idle
-  Textual or curses composer, type `/` for bounded local command and argument suggestions; use Up/Down
-  and Enter or Tab to select, or Esc to dismiss. Configured model IDs and declared reasoning modes are
-  suggested without sending a model request.
+  Textual or curses composer, type `/` for bounded local command and argument suggestions, including
+  `/exit` and `/quit`; use Up/Down and Enter or Tab to select, or Esc to dismiss. Configured model IDs
+  and declared reasoning modes are suggested without sending a model request.
 
 ## Configuration
 
@@ -177,7 +177,8 @@ one prompt; embedded newlines are preserved.
 The footer shows only controls relevant to the current semantic task state:
 
 - **Idle/composer:** Enter submits, Shift+Enter inserts a newline, and Ctrl-D submits. Ctrl-D on an
-  empty composer exits. Ctrl-Q exits immediately. Ctrl-C clears an idle draft.
+  empty composer exits. Ctrl-Q exits immediately. Ctrl-C clears an idle draft. Ctrl-B cycles session
+  themes and Ctrl-T toggles the compact local TODO view; neither submits a request.
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
@@ -185,7 +186,7 @@ The footer shows only controls relevant to the current semantic task state:
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded
   task diff inline.
-- A prompt whose entire text is `exit` or `quit` exits locally without calling the model.
+- A prompt whose entire text is `exit`, `quit`, `/exit`, or `/quit` exits locally without calling the model.
 
 The UI reports `COMPLETE`, `FAILED`, or `CANCELLED` from runtime events. Verification is
 authoritative only when `run_command(..., purpose="verify")` completes; assistant prose alone does

@@ -56,8 +56,10 @@ from bolt_next.tui_screen import (
     copy_osc52,
     display_bounded,
     footer_text,
+    format_todo_view,
     handle_local_command,
     is_exit_command,
+    next_theme,
     layout_rows,
     task_summary_has_hans_changes,
     visible_transcript,
@@ -237,6 +239,8 @@ def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
     assert decoder.feed("\x04") == ["ctrl-d"]
     assert decoder.feed("\x07") == ["ctrl-g"]
     assert decoder.feed("\x1a") == ["ctrl-z"]
+    assert decoder.feed("\x02") == ["ctrl-b"]
+    assert decoder.feed("\x14") == ["ctrl-t"]
     assert decoder.feed("\x11") == ["ctrl-q"]
     assert decoder.feed("\t") == ["tab"]
 
@@ -247,9 +251,35 @@ def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
 
 
 def test_exit_and_quit_are_not_model_prompts() -> None:
-    assert is_exit_command("exit")
-    assert is_exit_command(" quit ")
-    assert not is_exit_command("exit the file")
+    for command in ("exit", " quit ", "/exit", " /quit "):
+        assert is_exit_command(command)
+    for command in ("exit the file", "/exit now", "/quit now"):
+        assert not is_exit_command(command)
+
+
+def test_theme_cycle_and_compact_todo_view_are_deterministic_and_bounded() -> None:
+    assert [next_theme(name) for name in ("dark", "light", "high-contrast", "terminal")] == [
+        "light",
+        "high-contrast",
+        "terminal",
+        "dark",
+    ]
+    assert next_theme("unknown") == "dark"
+
+    todos = TodoList(max_items=5, max_text_chars=100)
+    for text in ("first", "x" * 16, "third", "fourth", "fifth"):
+        todos.add(text)
+    todos.done("1")
+
+    assert format_todo_view(todos, max_items=4, max_text_chars=8) == (
+        "TODO (5)\n"
+        "x #1 first\n"
+        "  #2 xxxxxxx…\n"
+        "  #3 third\n"
+        "  #4 fourth\n"
+        "… 1 more item"
+    )
+    assert format_todo_view(TodoList()) == "TODO (0)\n(no items)"
 
 
 def test_curses_display_uses_semantic_lifecycle_hierarchy_and_tool_privacy(monkeypatch) -> None:
@@ -425,6 +455,8 @@ def test_local_todos_commands_and_bounded_presentation_are_ui_only() -> None:
     assert handle_local_command("ordinary prompt", todos).handled is False
     assert handle_local_command("/help", todos).text == format_help()
     assert handle_local_command("/help now", todos).text == "Usage: /help"
+    assert handle_local_command("/exit", todos).handled
+    assert handle_local_command("/quit", todos).handled
     assert handle_local_command("/unknown", todos).text == "Unknown command: /unknown"
     assert handle_local_command("/todo add  write   tests ", todos).text == "TODO added #1: write tests"
     assert handle_local_command("/todo add review", todos).text == "TODO added #2: review"
@@ -633,6 +665,8 @@ def test_non_tty_local_commands_do_not_run_model_turns() -> None:
         return seen
 
     assert asyncio.run(submit_once("/help")) == []
+    assert asyncio.run(submit_once("/exit")) == []
+    assert asyncio.run(submit_once("/quit")) == []
     assert asyncio.run(submit_once("/permissions")) == []
     assert asyncio.run(submit_once("/clear")) == []
     assert asyncio.run(submit_once("/models")) == []

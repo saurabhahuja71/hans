@@ -14,11 +14,22 @@ from bolt_next.tui_screen import TodoList, handle_local_command
 def test_registry_contains_the_supported_local_commands_once() -> None:
     names = command_names()
 
-    assert names == ("/help", "/clear", "/models", "/mode", "/permissions", "/todo", "/theme")
+    assert names == (
+        "/help",
+        "/clear",
+        "/exit",
+        "/quit",
+        "/models",
+        "/mode",
+        "/permissions",
+        "/todo",
+        "/theme",
+    )
     assert len(names) == len(set(names)) == len(COMMANDS)
     assert known_command("/MODELS") is not None
     assert known_command("/unknown") is None
     assert is_complete_command("/MODELS")
+    assert is_complete_command("/exit")
     assert is_complete_command("/permissions   ")
     assert not is_complete_command("/permissions write")
     assert not is_complete_command("explain /mode")
@@ -28,6 +39,8 @@ def test_parser_recognizes_every_registry_command_and_keeps_unknown_commands_loc
     todos = TodoList()
 
     assert all(handle_local_command(command.name, todos).handled for command in COMMANDS)
+    assert handle_local_command("/exit", todos).handled
+    assert handle_local_command("/quit", todos).handled
     assert handle_local_command("/unknown", todos).text == "Unknown command: /unknown"
 
 
@@ -56,6 +69,8 @@ def test_command_suggestions_are_canonical_bounded_and_contextual() -> None:
 
     assert command_suggestions("/", context) == command_names()
     assert command_suggestions("/mo", context) == ("/models", "/mode")
+    assert command_suggestions("/ex", context) == ("/exit",)
+    assert command_suggestions("/qu", context) == ("/quit",)
     assert command_suggestions("/models", context) == ("/models use",)
     assert command_suggestions("/models ", context) == ("/models use",)
     assert command_suggestions("/models use", context) == (

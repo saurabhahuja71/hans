@@ -58,12 +58,14 @@ from bolt_next.tui_screen import (
     footer_text,
     format_approval_request,
     format_change_summary,
+    format_todo_view,
     format_model_changed,
     format_model_status,
     format_reasoning_mode_changed,
     format_reasoning_mode_status,
     handle_local_command,
     is_exit_command,
+    next_theme,
     task_summary_has_hans_changes,
 )
 
@@ -234,6 +236,17 @@ class HansTextualApp(App[None]):
         text-style: bold;
     }
 
+    #todo-view {
+        display: none;
+        height: auto;
+        max-height: 6;
+        margin: 0 1;
+        padding: 0 1;
+        border: round $secondary;
+        background: $surface;
+        color: $text;
+    }
+
     #footer {
         height: 1;
         padding: 0 2;
@@ -318,6 +331,8 @@ class HansTextualApp(App[None]):
         Binding("ctrl+z", "undo_task", "undo", show=False),
         Binding("ctrl+o", "show_latest_output", "output", show=False),
         Binding("ctrl+y", "copy_visible", "copy", show=False),
+        Binding("ctrl+b", "cycle_theme", "theme", show=False),
+        Binding("ctrl+t", "toggle_todos", "todos", show=False),
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
@@ -339,6 +354,7 @@ class HansTextualApp(App[None]):
         self._tool_purposes: dict[str, str] = {}
         self._latest_tool_call_id: str | None = None
         self._todos = TodoList()
+        self._todos_visible = False
         self._theme_name = "dark"
         self._completed_tool_rows: deque[str] = deque()
         self._transcript_rows: deque[Static] = deque()
@@ -361,6 +377,7 @@ class HansTextualApp(App[None]):
         yield Static(self._header_text(), id="hans-header", markup=False)
         yield VerticalScroll(id="transcript")
         yield Static(self._state, id="state-line", markup=False)
+        yield Static("", id="todo-view", markup=False)
         yield Static(self._footer_text(), id="footer", markup=False)
         yield Static("", id="command-suggestions", markup=False)
         yield ComposerTextArea("", id="composer")
@@ -389,6 +406,16 @@ class HansTextualApp(App[None]):
         if announce and self.is_mounted:
             self._set_state("IDLE", f"theme {name}")
         return True
+
+    def _render_todos(self) -> None:
+        if not self.is_mounted:
+            return
+        widget = self.query_one("#todo-view", Static)
+        if self._todos_visible:
+            widget.update(format_todo_view(self._todos))
+            widget.styles.display = "block"
+        else:
+            widget.styles.display = "none"
 
     def copy_plain_text(self, text: str) -> bool:
         if not text:
@@ -528,6 +555,8 @@ class HansTextualApp(App[None]):
             "ctrl+z": self.action_undo_task,
             "ctrl+o": self.action_show_latest_output,
             "ctrl+y": self.action_copy_visible,
+            "ctrl+b": self.action_cycle_theme,
+            "ctrl+t": self.action_toggle_todos,
             "ctrl+q": self.action_exit_app,
         }
         action = actions.get(event.key)
@@ -974,6 +1003,7 @@ class HansTextualApp(App[None]):
                 self.push_screen(ThemeScreen())
             if local.text:
                 self.run_worker(self._append_transcript(local.text, "change"), exclusive=False)
+            self._render_todos()
             return
         if self._request_active:
             return
@@ -995,6 +1025,17 @@ class HansTextualApp(App[None]):
                 self._set_state("CANCELLED", "cancellation requested")
         else:
             self.query_one("#composer", TextArea).text = ""
+
+    def action_cycle_theme(self) -> None:
+        if self._request_active or self._approval_pending is not None or self._approval_resolving:
+            return
+        self.apply_theme(next_theme(self._theme_name))
+
+    def action_toggle_todos(self) -> None:
+        if self._request_active or self._approval_pending is not None or self._approval_resolving:
+            return
+        self._todos_visible = not self._todos_visible
+        self._render_todos()
 
     def action_show_latest_output(self) -> None:
         if self._request_active:

@@ -50,6 +50,7 @@ from bolt_next.tui_screen import (
     footer_text,
     format_approval_request,
     format_change_summary,
+    format_todo_view,
     format_model_changed,
     format_model_status,
     format_reasoning_mode_changed,
@@ -57,6 +58,7 @@ from bolt_next.tui_screen import (
     handle_local_command,
     is_exit_command,
     layout_rows,
+    next_theme,
     task_summary_has_hans_changes,
     visible_transcript,
 )
@@ -584,6 +586,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
         "detail": None,
         "theme": "terminal",
         "todos": TodoList(),
+        "todos_visible": False,
         "command_suggestions": (),
         "command_suggestion_index": 0,
         "completion_model_ids": (),
@@ -670,20 +673,25 @@ async def _run_curses(runtime: HansRuntime) -> None:
         for row, line in enumerate(header[:2]):
             stdscr.addnstr(row, 0, line, width - 1, header_attr)
         stdscr.hline(2, 0, curses.ACS_HLINE, width - 1)
-        conversation, _editor_height = layout_rows(height, len(editor.lines))
+        todo_lines = format_todo_view(state["todos"]).splitlines() if state["todos_visible"] else []
+        todo_lines = todo_lines[: max(0, height - 7 - len(editor.lines))]
+        conversation, _editor_height = layout_rows(height - len(todo_lines), len(editor.lines))
         body = visible_transcript(transcript.render(width - 1), conversation)
         for offset, line in enumerate(body):
             stdscr.addnstr(3 + offset, 0, line, width - 1)
-        footer_at = 3 + conversation
+        todo_at = 3 + conversation
         suggestions = state["command_suggestions"]
-        available_suggestion_rows = max(0, footer_at - 3)
+        available_suggestion_rows = max(0, todo_at - 3)
         visible_suggestions = suggestions[-available_suggestion_rows:] if available_suggestion_rows else ()
         first_suggestion = len(suggestions) - len(visible_suggestions)
         for offset, suggestion in enumerate(visible_suggestions):
             index = first_suggestion + offset
             marker = ">" if index == state["command_suggestion_index"] else " "
             attr = curses.A_REVERSE if index == state["command_suggestion_index"] else curses.A_NORMAL
-            stdscr.addnstr(footer_at - len(visible_suggestions) + offset, 0, f"{marker} {suggestion}", width - 1, attr)
+            stdscr.addnstr(todo_at - len(visible_suggestions) + offset, 0, f"{marker} {suggestion}", width - 1, attr)
+        for offset, line in enumerate(todo_lines):
+            stdscr.addnstr(todo_at + offset, 0, line, width - 1, header_attr)
+        footer_at = todo_at + len(todo_lines)
         stdscr.hline(footer_at, 0, curses.ACS_HLINE, width - 1)
         display = state["display"]
         status_footer = footer_text(
@@ -717,7 +725,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
                 state["completion_models_loaded"] = False
                 state["completion_reasoning_modes_loaded"] = False
         elif local.theme:
-            state["theme"] = "high-contrast" if local.theme == "high-contrast" else "terminal"
+            state["theme"] = local.theme
         if local.text:
             transcript.change(local.text, title="LOCAL")
             state["display"]._trim_presentation()
@@ -812,6 +820,12 @@ async def _run_curses(runtime: HansRuntime) -> None:
             return False
         if name == "ctrl-z":
             state["display"].event(runtime.undo_task())
+            return False
+        if name == "ctrl-b":
+            state["theme"] = next_theme(state["theme"])
+            return False
+        if name == "ctrl-t":
+            state["todos_visible"] = not state["todos_visible"]
             return False
         suggestions = state["command_suggestions"]
         if suggestions:
@@ -976,6 +990,8 @@ def _set_enhanced_input(enabled: bool) -> None:
 
 
 def _key_name(key) -> str | None:
+    if key in {2, "\x02"}:
+        return "ctrl-b"
     if key in {3, "\x03"}:
         return "ctrl-c"
     if key in {4, "\x04"}:
@@ -986,6 +1002,8 @@ def _key_name(key) -> str | None:
         return "ctrl-o"
     if key in {17, "\x11"}:
         return "ctrl-q"
+    if key in {20, "\x14"}:
+        return "ctrl-t"
     if key in {25, "\x19"}:
         return "ctrl-y"
     if key in {26, "\x1a"}:

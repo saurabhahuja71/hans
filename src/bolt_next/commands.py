@@ -11,11 +11,14 @@ class CommandSpec:
     category: str
     usage: str
     summary: str
+    exits: bool = False
 
 
 COMMANDS = (
     CommandSpec("/help", "General", "/help", "Show local command help."),
     CommandSpec("/clear", "General", "/clear", "Clear conversation history."),
+    CommandSpec("/exit", "Exit", "/exit", "Exit HANS locally.", exits=True),
+    CommandSpec("/quit", "Exit", "/quit", "Exit HANS locally.", exits=True),
     CommandSpec("/models", "Models", "/models [use <model>]", "Show or select a configured model."),
     CommandSpec("/mode", "Models", "/mode [mode]", "Show or set the reasoning mode."),
     CommandSpec(
@@ -35,6 +38,8 @@ PERMISSION_POLICIES = ("allow", "deny", "ask")
 KEYBOARD_SHORTCUTS = (
     ("Enter", "Send"),
     ("Shift+Enter", "New line"),
+    ("Ctrl-B", "Cycle theme"),
+    ("Ctrl-T", "Toggle TODO view"),
     ("Ctrl-D", "Send / exit when empty"),
     ("Ctrl-C", "Cancel"),
     ("Ctrl-G", "Diff"),

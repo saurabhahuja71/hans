@@ -218,7 +218,74 @@ def test_empty_exit_and_ctrl_q_do_not_submit(tmp_path: Path) -> None:
     asyncio.run(scenario(("ctrl+d",)))
     asyncio.run(scenario(tuple("exit") + ("enter",)))
     asyncio.run(scenario(tuple("quit") + ("enter",)))
+    asyncio.run(scenario(tuple("/exit") + ("enter",)))
+    asyncio.run(scenario(tuple("/quit") + ("enter",)))
     asyncio.run(scenario(("ctrl+q",)))
+
+
+def test_textual_theme_cycle_and_todo_panel_are_local_and_persist_through_clear(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            app._todos.add("review compact TODO panel")
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            todo_view = app.query_one("#todo-view", Static)
+            assert app._todos_visible is True
+            assert todo_view.styles.display == "block"
+            assert rendered(todo_view) == "TODO (1)\n  #1 review compact TODO panel"
+
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert app._theme_name == "light"
+            assert app.theme == "hans-light"
+            await pilot.press("ctrl+b", "ctrl+b", "ctrl+b")
+            await pilot.pause()
+            assert app._theme_name == "dark"
+
+            await pilot.press(*"/clear", "enter")
+            await pilot.pause()
+            assert app._todos_visible is True
+            assert rendered(todo_view) == "TODO (1)\n  #1 review compact TODO panel"
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert app._todos_visible is False
+            assert todo_view.styles.display == "none"
+            assert runtime.prompts == []
+            assert runtime.control_calls == [("clear", None, None)]
+
+    asyncio.run(scenario())
+
+
+def test_textual_theme_and_todo_shortcuts_do_not_bypass_active_or_approval_input(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(RequestStarted("work"))
+            await pilot.press("ctrl+b", "ctrl+t")
+            await pilot.pause()
+            assert app._theme_name == "dark"
+            assert app._todos_visible is False
+
+            await app._render_event(RequestCompleted(None))
+            await app._render_event(approval_event("request-1", "call-1", "write_file", "write"))
+            await pilot.press("ctrl+b", "ctrl+t")
+            await pilot.pause()
+            assert app._approval_pending == ("request-1", "call-1")
+            assert app._theme_name == "dark"
+            assert app._todos_visible is False
+
+            app._approval_pending = None
+            app._approval_resolving = True
+            await pilot.press("ctrl+b", "ctrl+t")
+            await pilot.pause()
+            assert app._theme_name == "dark"
+            assert app._todos_visible is False
+            assert runtime.prompts == []
+
+    asyncio.run(scenario())
 
 
 def approval_event(

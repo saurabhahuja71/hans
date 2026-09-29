@@ -288,7 +288,11 @@ class Editor:
 
 
 def is_exit_command(text: str) -> bool:
-    return text.strip().lower() in {"exit", "quit"}
+    command = text.strip().lower()
+    if command in {"exit", "quit"}:
+        return True
+    spec = known_command(command)
+    return bool(spec and spec.exits)
 
 
 def layout_rows(height: int, editor_lines: int) -> tuple[int, int]:
@@ -376,6 +380,25 @@ class TodoList:
         return f"TODO error: no item #{value}"
 
 
+def format_todo_view(todos: TodoList, *, max_items: int = 4, max_text_chars: int = 72) -> str:
+    """Render a compact, bounded snapshot of UI-local TODO state."""
+    max_items = max(1, max_items)
+    max_text_chars = max(1, max_text_chars)
+    items = todos.items
+    if not items:
+        return "TODO (0)\n(no items)"
+    lines = [f"TODO ({len(items)})"]
+    for item in items[:max_items]:
+        text = item.text
+        if len(text) > max_text_chars:
+            text = text[: max_text_chars - 1] + "…" if max_text_chars > 1 else "…"
+        lines.append(f"{'x' if item.done else ' '} #{item.id} {text}")
+    omitted = len(items) - max_items
+    if omitted > 0:
+        lines.append(f"… {omitted} more item{'s' if omitted != 1 else ''}")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class LocalControl:
     kind: str
@@ -395,6 +418,13 @@ class LocalCommand:
 
 
 THEME_NAMES = ("dark", "light", "high-contrast", "terminal")
+
+
+def next_theme(name: str) -> str:
+    try:
+        return THEME_NAMES[(THEME_NAMES.index(name) + 1) % len(THEME_NAMES)]
+    except ValueError:
+        return THEME_NAMES[0]
 
 
 def _model_label(model: object) -> tuple[str, str]:
@@ -466,6 +496,8 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
         return LocalCommand(True, f"Unknown command: {command}")
     normalized_command = spec.name
     argument = argument.strip()
+    if spec.exits:
+        return LocalCommand(True)
     if normalized_command == "/help":
         if argument:
             return LocalCommand(True, "Usage: /help")
