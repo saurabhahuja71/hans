@@ -1,4 +1,6 @@
+import inspect
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from agents import Agent, ModelSettings, OpenAIChatCompletionsModel
@@ -17,6 +19,37 @@ from bolt_next.workspace import (
     make_write_file_tool,
     resolve_workspace,
 )
+
+
+_TOOL_PERMISSION_GROUPS = {
+    "list_directory": "read",
+    "search_files": "read",
+    "read_file": "read",
+    "write_file": "write",
+    "replace_in_file": "write",
+    "run_command": "execute",
+}
+
+
+def apply_tool_permission_policy(agent: Agent, is_allowed: Callable[[str], bool]) -> None:
+    """Apply a runtime-owned permission policy to the HANS workspace tools."""
+    for tool in getattr(agent, "tools", ()):
+        category = _TOOL_PERMISSION_GROUPS.get(getattr(tool, "name", ""))
+        if category is None:
+            continue
+        original_invoke = getattr(tool, "on_invoke_tool", None)
+        if not callable(original_invoke):
+            continue
+
+        async def invoke(context, arguments, *, category=category, original_invoke=original_invoke):
+            if not is_allowed(category):
+                return f"Permission denied: {category} operations are disabled."
+            result = original_invoke(context, arguments)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        tool.on_invoke_tool = invoke
 
 
 STAGE_4_INSTRUCTIONS = (

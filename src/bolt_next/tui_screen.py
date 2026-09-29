@@ -351,24 +351,49 @@ class TodoList:
 
 
 @dataclass(frozen=True)
+class LocalControl:
+    kind: str
+    category: str | None = None
+    allowed: bool | None = None
+
+
+@dataclass(frozen=True)
 class LocalCommand:
     handled: bool
     text: str = ""
     theme: str | None = None
     show_theme_selector: bool = False
+    control: LocalControl | None = None
 
 
 THEME_NAMES = ("dark", "light", "high-contrast", "terminal")
 
 
 def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
-    """Handle presentation-only commands, leaving ordinary prompts untouched."""
+    """Handle local commands, leaving ordinary prompts untouched."""
     stripped = prompt.strip()
     if not stripped.startswith("/"):
         return LocalCommand(False)
     command, _, argument = stripped.partition(" ")
+    normalized_command = command.lower()
     argument = argument.strip()
-    if command == "/todo":
+    if normalized_command == "/permissions":
+        values = argument.lower().split()
+        if not values:
+            return LocalCommand(True, control=LocalControl("permissions_status"))
+        if len(values) != 2:
+            return LocalCommand(True, "Usage: /permissions [read|write|execute] [allow|deny]")
+        category, value = values
+        if category not in {"read", "write", "execute"}:
+            return LocalCommand(True, f"Unknown permission: {category}")
+        if value not in {"allow", "deny"}:
+            return LocalCommand(True, "Expected allow or deny.")
+        return LocalCommand(True, control=LocalControl("set_permission", category, value == "allow"))
+    if normalized_command == "/clear":
+        if argument:
+            return LocalCommand(True, "Usage: /clear")
+        return LocalCommand(True, control=LocalControl("clear_session"))
+    if normalized_command == "/todo":
         if not argument or argument == "list":
             return LocalCommand(True, todos.list_text())
         verb, _, value = argument.partition(" ")
@@ -382,13 +407,13 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
         if verb == "clear" and not value:
             return LocalCommand(True, todos.clear())
         return LocalCommand(True, "TODO error: use /todo [list|add|done|remove|clear]")
-    if command == "/theme":
+    if normalized_command == "/theme":
         if not argument:
             return LocalCommand(True, "Theme: choose dark, light, high-contrast, or terminal", show_theme_selector=True)
         if argument in THEME_NAMES:
             return LocalCommand(True, f"Theme selected: {argument}", theme=argument)
         return LocalCommand(True, f"Theme error: choose one of {', '.join(THEME_NAMES)}")
-    return LocalCommand(True, f"Command error: unknown command {command}")
+    return LocalCommand(True, f"Unknown command: {command}")
 
 
 def display_bounded(text: str, limit: int) -> str:

@@ -23,10 +23,14 @@ from bolt_next.events import (
     AssistantMessageDelta,
     ConnectionChanged,
     HansEvent,
+    PermissionPolicyChanged,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    RuntimeControlRejected,
+    RuntimeControlStatus,
+    SessionCleared,
     TaskChangeSummary,
     TaskDiff,
     TaskUndoRefused,
@@ -41,6 +45,7 @@ from bolt_next.events import (
 )
 from bolt_next.tui_screen import (
     THEME_NAMES,
+    LocalControl,
     TodoList,
     display_bounded,
     footer_text,
@@ -59,6 +64,12 @@ class Runtime(Protocol):
     def task_diff(self, *, max_chars: int | None = None) -> TaskDiff: ...
 
     def undo_task(self) -> TaskUndoSucceeded | TaskUndoRefused: ...
+
+    def get_control_status(self) -> RuntimeControlStatus: ...
+
+    def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged | RuntimeControlRejected: ...
+
+    async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected: ...
 
     def close(self) -> None: ...
 
@@ -707,6 +718,29 @@ class HansTextualApp(App[None]):
             conflicts = ", ".join(event.conflicting_files) or "task changes"
             self._set_state("IDLE", "undo refused")
             await self._append_transcript(f"UNDO\n✗ Undo refused\nConflicts: {conflicts}", "error")
+        elif isinstance(event, RuntimeControlStatus):
+            lines = ["Permissions"]
+            lines.extend(
+                f"{name:<10} {'✓ allow' if allowed else '✗ deny'}"
+                for name, allowed in (
+                    ("read", event.read_allowed),
+                    ("write", event.write_allowed),
+                    ("execute", event.execute_allowed),
+                )
+            )
+            await self._append_transcript("\n".join(lines), "change")
+        elif isinstance(event, PermissionPolicyChanged):
+            value = "allow" if event.allowed else "deny"
+            await self._append_transcript(
+                f"PERMISSIONS\n✓ {event.category} permission set to {value}.", "change"
+            )
+        elif isinstance(event, SessionCleared):
+            await self._append_transcript(
+                "SESSION\n✓ Conversation history cleared.\nWorkspace and local HANS state preserved.",
+                "change",
+            )
+        elif isinstance(event, RuntimeControlRejected):
+            await self._append_transcript(f"ERROR\n✗ {event.message}", "error")
         elif isinstance(event, ConnectionChanged):
             self._connected = event.connected
             self.query_one("#hans-header", Static).update(self._header_text())
@@ -720,11 +754,14 @@ class HansTextualApp(App[None]):
         local = handle_local_command(prompt, self._todos)
         if local.handled:
             composer.text = ""
+            if local.control is not None:
+                self.run_worker(self._dispatch_control(local.control), group="runtime-controls", exclusive=True)
             if local.theme:
                 self.apply_theme(local.theme)
             if local.show_theme_selector:
                 self.push_screen(ThemeScreen())
-            self.run_worker(self._append_transcript(local.text, "change"), exclusive=False)
+            if local.text:
+                self.run_worker(self._append_transcript(local.text, "change"), exclusive=False)
             return
         if self._request_active:
             return
@@ -778,6 +815,17 @@ class HansTextualApp(App[None]):
 
     @work(exclusive=False)
     async def _render_task_event(self, event: TaskDiff | TaskUndoSucceeded | TaskUndoRefused) -> None:
+        await self._render_event(event)
+
+    async def _dispatch_control(self, control: LocalControl) -> None:
+        if control.kind == "permissions_status":
+            event = self.runtime.get_control_status()
+        elif control.kind == "set_permission":
+            event = self.runtime.set_permission(control.category or "", bool(control.allowed))
+        elif control.kind == "clear_session":
+            event = await self.runtime.clear_session_history()
+        else:
+            return
         await self._render_event(event)
 
     @work(exclusive=True)

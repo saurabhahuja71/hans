@@ -5,7 +5,11 @@ import pytest
 
 from bolt_next.events import (
     AssistantMessageDelta,
+    PermissionPolicyChanged,
     RequestCancelled,
+    RuntimeControlRejected,
+    RuntimeControlStatus,
+    SessionCleared,
     RequestCompleted,
     RequestFailed,
     RequestStarted,
@@ -27,6 +31,7 @@ from bolt_next.tui import (
     FOOTER,
     _Display,
     _InputDecoder,
+    _dispatch_control,
     detail_window,
     format_header,
     format_tool_call,
@@ -371,7 +376,7 @@ def test_curses_failed_verification_is_not_claimed_complete() -> None:
 def test_local_todos_commands_and_bounded_presentation_are_ui_only() -> None:
     todos = TodoList(max_items=2, max_text_chars=12)
     assert handle_local_command("ordinary prompt", todos).handled is False
-    assert handle_local_command("/unknown", todos).text == "Command error: unknown command /unknown"
+    assert handle_local_command("/unknown", todos).text == "Unknown command: /unknown"
     assert handle_local_command("/todo add  write   tests ", todos).text == "TODO added #1: write tests"
     assert handle_local_command("/todo add review", todos).text == "TODO added #2: review"
     assert handle_local_command("/todo add one too many", todos).text == "TODO error: list is limited to 2 items"
@@ -386,6 +391,84 @@ def test_local_todos_commands_and_bounded_presentation_are_ui_only() -> None:
     )
     assert display_bounded("abcdef", 3) == "abc\n… display truncated (3 characters omitted)"
     assert display_bounded("abc", 3) == "abc"
+
+
+def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_model_turn() -> None:
+    todos = TodoList()
+    status = handle_local_command("/permissions", todos)
+    changed = handle_local_command("/permissions WRITE deny", todos)
+    clear = handle_local_command("/clear", todos)
+
+    assert status.control is not None and status.control.kind == "permissions_status"
+    assert changed.control is not None
+    assert (changed.control.kind, changed.control.category, changed.control.allowed) == ("set_permission", "write", False)
+    assert clear.control is not None and clear.control.kind == "clear_session"
+    assert handle_local_command("/permissions foo allow", todos).text == "Unknown permission: foo"
+    assert handle_local_command("/permissions write maybe", todos).text == "Expected allow or deny."
+    assert handle_local_command("/permissions write", todos).text == (
+        "Usage: /permissions [read|write|execute] [allow|deny]"
+    )
+    assert handle_local_command("/clear now", todos).text == "Usage: /clear"
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.permissions = {"read": True, "write": True, "execute": True}
+            self.calls: list[tuple[str, str | None, bool | None]] = []
+
+        def get_control_status(self) -> RuntimeControlStatus:
+            self.calls.append(("status", None, None))
+            return RuntimeControlStatus(**{f"{name}_allowed": allowed for name, allowed in self.permissions.items()})
+
+        def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged:
+            self.calls.append(("permission", category, allowed))
+            self.permissions[category] = allowed
+            return PermissionPolicyChanged(category, allowed)
+
+        async def clear_session_history(self) -> SessionCleared:
+            self.calls.append(("clear", None, None))
+            return SessionCleared()
+
+    runtime = Runtime()
+    transcript = Transcript()
+    display = _Display(transcript)
+
+    async def scenario() -> None:
+        for local in (status, changed, clear):
+            assert local.control is not None
+            await _dispatch_control(runtime, local.control, display)
+
+    asyncio.run(scenario())
+    rendered = "\n".join(transcript.render(120))
+    assert runtime.calls == [
+        ("status", None, None),
+        ("permission", "write", False),
+        ("clear", None, None),
+    ]
+    assert "Permissions" in rendered
+    assert "✓ write permission set to deny." in rendered
+    assert "✓ Conversation history cleared." in rendered
+
+    display.event(RuntimeControlRejected("Cannot clear the session while HANS is busy."))
+    assert "Cannot clear the session while HANS is busy." in "\n".join(transcript.render(120))
+
+
+def test_non_tty_local_commands_do_not_run_model_turns() -> None:
+    async def submit_once(message: str) -> list[str]:
+        seen: list[str] = []
+
+        async def run_turn(prompt: str) -> None:
+            seen.append(prompt)
+
+        async def handle_local(prompt: str) -> bool:
+            return handle_local_command(prompt, TodoList()).handled
+
+        await serve(_Lines([message, None]), run_turn, handle_local)
+        return seen
+
+    assert asyncio.run(submit_once("/permissions")) == []
+    assert asyncio.run(submit_once("/clear")) == []
+    assert asyncio.run(submit_once("/unknown")) == []
+    assert asyncio.run(submit_once("ordinary prompt")) == ["ordinary prompt"]
 
 
 def test_osc52_copy_is_plain_text_bounded_and_failure_safe() -> None:

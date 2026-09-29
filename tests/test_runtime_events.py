@@ -13,10 +13,14 @@ from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
+    PermissionPolicyChanged,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    RuntimeControlRejected,
+    RuntimeControlStatus,
+    SessionCleared,
     TaskChangeSummary,
     TaskDiff,
     TaskUndoRefused,
@@ -434,6 +438,155 @@ def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:
     assert ToolCompleted("call-a", "run_command", "printf A", False, 1) in a_events
     a_verification = next(event for event in a_events if isinstance(event, VerificationFailed))
     assert a_verification.evidence.command == "printf A"
+
+
+
+@pytest.mark.parametrize(
+    ("category", "tool_name", "arguments", "assert_denied", "assert_allowed"),
+    (
+        ("read", "list_directory", {"path": "."}, lambda root: None, lambda root: None),
+        ("read", "search_files", {"query": "guarded", "path": "."}, lambda root: None, lambda root: None),
+        ("read", "read_file", {"path": "guarded.txt"}, lambda root: None, lambda root: None),
+        (
+            "write",
+            "write_file",
+            {"path": "created.txt", "content": "created"},
+            lambda root: assert_path_text(root / "created.txt", None),
+            lambda root: assert_path_text(root / "created.txt", "created"),
+        ),
+        (
+            "write",
+            "replace_in_file",
+            {"path": "guarded.txt", "old_text": "guarded", "new_text": "changed"},
+            lambda root: assert_path_text(root / "guarded.txt", "guarded"),
+            lambda root: assert_path_text(root / "guarded.txt", "changed"),
+        ),
+        (
+            "execute",
+            "run_command",
+            {"command": "touch executed.txt"},
+            lambda root: assert_path_text(root / "executed.txt", None),
+            lambda root: assert_path_text(root / "executed.txt", ""),
+        ),
+    ),
+)
+def test_permission_policy_blocks_every_workspace_tool_and_allow_restores_execution(
+    tmp_path: Path, category: str, tool_name: str, arguments: dict[str, str], assert_denied, assert_allowed
+) -> None:
+    (tmp_path / "guarded.txt").write_text("guarded", encoding="utf-8")
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call(tool_name, arguments, call_id="denied")]),
+            ModelStep(output=[assistant_message("denied result received")]),
+            ModelStep(output=[function_call(tool_name, arguments, call_id="allowed")]),
+            ModelStep(output=[assistant_message("allowed result received")]),
+        ]
+    )
+    runtime = HansRuntime(agent=make_agent(model, tmp_path), session=SQLiteSession(f"permission-{tool_name}"))
+
+    assert runtime.set_permission(category, False) == PermissionPolicyChanged(category, False)
+    denied_events = run(collect(runtime, "Try the tool."))
+    assert ToolOutput("denied", f"Permission denied: {category} operations are disabled.") in denied_events
+    assert any(
+        isinstance(event, ToolCompleted) and event.call_id == "denied" and not event.success for event in denied_events
+    )
+    assert_denied(tmp_path)
+
+    assert runtime.set_permission(category, True) == PermissionPolicyChanged(category, True)
+    allowed_events = run(collect(runtime, "Try the tool again."))
+    assert any(
+        isinstance(event, ToolCompleted) and event.call_id == "allowed" and event.success for event in allowed_events
+    )
+    assert_allowed(tmp_path)
+    runtime.close()
+
+
+def assert_path_text(path: Path, expected: str | None) -> None:
+    if expected is None:
+        assert not path.exists()
+    else:
+        assert path.read_text(encoding="utf-8") == expected
+
+
+def test_clear_session_history_removes_sdk_history_and_preserves_runtime_controls_and_journal(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("write_file", {"path": "task.txt", "content": "BLUE"}, call_id="write")]),
+            ModelStep(output=[assistant_message("The remembered value is BLUE.")]),
+            ModelStep(output=[assistant_message("There is no prior conversation context.")]),
+        ]
+    )
+    session = SQLiteSession("runtime-clear-history")
+
+    def fake_create_agent(workspace: Path, *, journal: object) -> Agent:
+        return Agent(
+            name="clear history test agent",
+            instructions="Use the provided tools.",
+            model=model,
+            tools=[make_write_file_tool(workspace, journal)],
+        )
+
+    original_create_agent = runtime_module.create_agent
+    runtime_module.create_agent = fake_create_agent
+    try:
+        runtime = HansRuntime(workspace=str(tmp_path), session=session)
+        run(collect(runtime, "Remember that the value is BLUE."))
+    finally:
+        runtime_module.create_agent = original_create_agent
+    assert session_items(session)
+    assert "task.txt" in runtime.task_diff().diff
+    assert runtime.set_permission("write", False) == PermissionPolicyChanged("write", False)
+
+    assert run(runtime.clear_session_history()) == SessionCleared()
+    assert session_items(session) == []
+    assert runtime.get_control_status() == RuntimeControlStatus(True, False, True)
+    assert "task.txt" in runtime.task_diff().diff
+    follow_up_events = run(collect(runtime, "What was the remembered value?"))
+
+    assert any(isinstance(event, RequestCompleted) for event in follow_up_events)
+    assert "BLUE" not in repr(model.calls[-1].input)
+    assert "Remember that the value" not in repr(model.calls[-1].input)
+    assert (tmp_path / "task.txt").read_text(encoding="utf-8") == "BLUE"
+    session.close()
+
+
+def session_items(session: SQLiteSession):
+    return run(session.get_items())
+
+
+def test_controls_reject_while_active_and_work_after_cancellation() -> None:
+    class _Result:
+        def cancel(self) -> None:
+            pass
+
+        async def stream_events(self):
+            await asyncio.Event().wait()
+            yield None
+
+    class _Runner:
+        def run_streamed(self, *_args, **_kwargs):
+            return _Result()
+
+    async def scenario():
+        session = SQLiteSession("runtime-control-cancellation")
+        runtime = HansRuntime(agent=object(), session=session, runner=_Runner())
+        task = asyncio.create_task(collect(runtime, "Wait."))
+        await asyncio.sleep(0.01)
+        busy_permission = runtime.set_permission("write", False)
+        busy_clear = await runtime.clear_session_history()
+        runtime.cancel_active()
+        events = await asyncio.wait_for(task, timeout=1)
+        idle_permission = runtime.set_permission("write", False)
+        idle_clear = await runtime.clear_session_history()
+        session.close()
+        return busy_permission, busy_clear, events, idle_permission, idle_clear
+
+    busy_permission, busy_clear, events, idle_permission, idle_clear = run(scenario())
+    assert busy_permission == RuntimeControlRejected("Permission changes are available when HANS is idle.")
+    assert busy_clear == RuntimeControlRejected("Cannot clear the session while HANS is busy.")
+    assert any(isinstance(event, RequestCancelled) for event in events)
+    assert idle_permission == PermissionPolicyChanged("write", False)
+    assert idle_clear == SessionCleared()
 
 
 def test_tui_modules_do_not_depend_on_sdk_or_raw_wire_names() -> None:

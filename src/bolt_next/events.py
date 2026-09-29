@@ -121,6 +121,29 @@ class TaskUndoRefused:
     conflicting_files: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeControlStatus:
+    read_allowed: bool
+    write_allowed: bool
+    execute_allowed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionPolicyChanged:
+    category: str
+    allowed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCleared:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeControlRejected:
+    message: str
+
+
 HansEvent = (
     UserMessageSubmitted
     | AssistantMessageDelta
@@ -140,4 +163,8 @@ HansEvent = (
     | TaskDiff
     | TaskUndoSucceeded
     | TaskUndoRefused
+    | RuntimeControlStatus
+    | PermissionPolicyChanged
+    | SessionCleared
+    | RuntimeControlRejected
 )

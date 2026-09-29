@@ -11,10 +11,14 @@ from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
+    PermissionPolicyChanged,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    RuntimeControlRejected,
+    RuntimeControlStatus,
+    SessionCleared,
     TaskChangeSummary,
     TaskDiff,
     TaskUndoRefused,
@@ -39,6 +43,8 @@ class FakeRuntime:
         self.closed = 0
         self.task_diff_calls: list[int | None] = []
         self.undo_calls = 0
+        self.permissions = {"read": True, "write": True, "execute": True}
+        self.control_calls: list[tuple[str, str | None, bool | None]] = []
         self.diff_event = TaskDiff("--- a/task.txt\n+++ b/task.txt\n+updated")
         self.undo_event: TaskUndoSucceeded | TaskUndoRefused = TaskUndoSucceeded((), ())
 
@@ -58,6 +64,22 @@ class FakeRuntime:
     def undo_task(self) -> TaskUndoSucceeded | TaskUndoRefused:
         self.undo_calls += 1
         return self.undo_event
+
+    def get_control_status(self) -> RuntimeControlStatus:
+        return RuntimeControlStatus(
+            read_allowed=self.permissions["read"],
+            write_allowed=self.permissions["write"],
+            execute_allowed=self.permissions["execute"],
+        )
+
+    def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged:
+        self.control_calls.append(("permission", category, allowed))
+        self.permissions[category] = allowed
+        return PermissionPolicyChanged(category, allowed)
+
+    async def clear_session_history(self) -> SessionCleared:
+        self.control_calls.append(("clear", None, None))
+        return SessionCleared()
 
     def close(self) -> None:
         self.closed += 1
@@ -480,15 +502,33 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             await submit(pilot, "/todo list")
             await submit(pilot, "/todo remove 1")
             await submit(pilot, "/todo clear")
+            await submit(pilot, "/todo add survive clear")
+            await submit(pilot, "/theme light")
+            await submit(pilot, "/permissions")
+            await submit(pilot, "/permissions WRITE deny")
+            await submit(pilot, "/clear")
+            await submit(pilot, "/todo list")
             await submit(pilot, "/unknown")
             assert runtime.prompts == []
+            assert runtime.permissions == {"read": True, "write": False, "execute": True}
+            assert runtime.control_calls == [
+                ("permission", "write", False),
+                ("clear", None, None),
+            ]
             text = transcript_text(app)
             assert "TODO added #1: write tests" in text
             assert "TODO\nx #1 write tests" in text
             assert "TODO completed #1: write tests" in text
             assert "TODO removed #1" in text
             assert "TODO cleared (0 items)" in text
-            assert "Command error: unknown command /unknown" in text
+            assert "TODO\n  #2 survive clear" in text
+            assert app._theme_name == "light"
+            assert app.theme == "hans-light"
+            assert "Permissions\nread       ✓ allow\nwrite      ✓ allow\nexecute    ✓ allow" in text
+            assert "write permission set to deny." in text
+            assert "Conversation history cleared." in text
+            assert "Workspace and local HANS state preserved." in text
+            assert "Unknown command: /unknown" in text
 
             await submit(pilot, "/theme light")
             assert app._theme_name == "light"

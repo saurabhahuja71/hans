@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator, Iterable
 from agents import Runner, SQLiteSession, set_tracing_disabled
 from agents.run_config import RunConfig
 
-from bolt_next.agent import create_agent
+from bolt_next.agent import apply_tool_permission_policy, create_agent
 from bolt_next.context_budget import fit_model_input
 from bolt_next.errors import ConfigurationError, FailureCategory
 from bolt_next.workspace import TaskMutationJournal, resolve_workspace
@@ -22,10 +22,14 @@ from bolt_next.events import (
     AssistantMessageDelta,
     ConnectionChanged,
     HansEvent,
+    PermissionPolicyChanged,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    RuntimeControlRejected,
+    RuntimeControlStatus,
+    SessionCleared,
     TaskChangeSummary,
     TaskDiff,
     TaskUndoRefused,
@@ -195,12 +199,42 @@ class HansRuntime:
         self._session = session if session is not None else SQLiteSession("hans-tui")
         self._owns_session = session is None
         self._runner = runner
+        self._permissions = {"read": True, "write": True, "execute": True}
+        self._request_active = False
         self._active_result: Any | None = None
         self._stream_waiter: asyncio.Future[Any] | None = None
         self._cancel_requested = False
         self._tool_calls: dict[str, _ToolCall] = {}
         self._evidence: VerificationEvidence | None = None
         self._assistant_text: list[str] = []
+        if self._agent is not None:
+            apply_tool_permission_policy(self._agent, self._permission_allowed)
+
+    def get_control_status(self) -> RuntimeControlStatus:
+        return RuntimeControlStatus(
+            read_allowed=self._permissions["read"],
+            write_allowed=self._permissions["write"],
+            execute_allowed=self._permissions["execute"],
+        )
+
+    def set_permission(self, category: str, allowed: bool) -> PermissionPolicyChanged | RuntimeControlRejected:
+        if category not in self._permissions:
+            raise ValueError(f"Unknown permission: {category}")
+        if self._request_active:
+            return RuntimeControlRejected("Permission changes are available when HANS is idle.")
+        self._permissions[category] = allowed
+        return PermissionPolicyChanged(category, allowed)
+
+    async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected:
+        if self._request_active:
+            return RuntimeControlRejected("Cannot clear the session while HANS is busy.")
+        if self._session is None:
+            return RuntimeControlRejected("The session is unavailable.")
+        await self._session.clear_session()
+        return SessionCleared()
+
+    def _permission_allowed(self, category: str) -> bool:
+        return self._permissions[category]
 
     def cancel_active(self) -> None:
         self._cancel_requested = True
@@ -235,18 +269,20 @@ class HansRuntime:
         return TaskChangeSummary(self._journal.compact_summary())
 
     async def submit(self, message: str) -> AsyncIterator[HansEvent]:
-        if self._active_result is not None:
+        if self._request_active:
             raise RuntimeError("a request is already active")
-        self._cancel_requested = False
-        self._journal.begin_task()
-        self._tool_calls = {}
-        self._evidence = None
-        self._assistant_text = []
-        yield UserMessageSubmitted(message)
-        yield RequestStarted(message)
+        self._request_active = True
         try:
+            self._cancel_requested = False
+            self._journal.begin_task()
+            self._tool_calls = {}
+            self._evidence = None
+            self._assistant_text = []
+            yield UserMessageSubmitted(message)
+            yield RequestStarted(message)
             if self._agent is None:
                 self._agent = create_agent(self._workspace, journal=self._journal)
+                apply_tool_permission_policy(self._agent, self._permission_allowed)
             result = self._runner.run_streamed(
                 self._agent,
                 message,
@@ -298,6 +334,7 @@ class HansRuntime:
                 yield ConnectionChanged(False)
         finally:
             self._active_result = None
+            self._request_active = False
 
     def translate_stream_event(self, stream_event: Any) -> Iterable[HansEvent]:
         if getattr(stream_event, "type", None) == "raw_response_event":
@@ -348,7 +385,7 @@ class HansRuntime:
                 else:
                     events.append(VerificationFailed(call_id, evidence))
             return tuple(events)
-        success = not rendered_output.startswith("Error:")
+        success = not rendered_output.startswith(("Error:", "Permission denied:"))
         if call.name in {"write_file", "replace_in_file"} and success:
             self._evidence = None
         events.append(ToolCompleted(call_id, call.name, call.detail, success))

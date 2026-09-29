@@ -11,10 +11,14 @@ from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
     ConnectionChanged,
+    PermissionPolicyChanged,
     RequestCancelled,
     RequestCompleted,
     RequestFailed,
     RequestStarted,
+    RuntimeControlRejected,
+    RuntimeControlStatus,
+    SessionCleared,
     TaskChangeSummary,
     TaskDiff,
     TaskUndoRefused,
@@ -30,6 +34,7 @@ from bolt_next.events import (
 from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import (
     Editor,
+    LocalControl,
     TodoList,
     Transcript,
     copy_osc52,
@@ -310,6 +315,40 @@ class _Display:
             else:
                 print(f"\n✗ undo refused: conflicts: {conflicts}", flush=True)
             self._set_state("IDLE", "undo refused")
+        elif isinstance(event, RuntimeControlStatus):
+            text = "\n".join(
+                ["Permissions"]
+                + [
+                    f"{name:<10} {'✓ allow' if allowed else '✗ deny'}"
+                    for name, allowed in (
+                        ("read", event.read_allowed),
+                        ("write", event.write_allowed),
+                        ("execute", event.execute_allowed),
+                    )
+                ]
+            )
+            if self.transcript is not None:
+                self.transcript.change(text, title="LOCAL")
+            else:
+                print(f"\n{text}", flush=True)
+        elif isinstance(event, PermissionPolicyChanged):
+            value = "allow" if event.allowed else "deny"
+            text = f"✓ {event.category} permission set to {value}."
+            if self.transcript is not None:
+                self.transcript.change(text, title="PERMISSIONS")
+            else:
+                print(f"\n{text}", flush=True)
+        elif isinstance(event, SessionCleared):
+            text = "✓ Conversation history cleared.\nWorkspace and local HANS state preserved."
+            if self.transcript is not None:
+                self.transcript.change(text, title="SESSION")
+            else:
+                print(f"\n{text}", flush=True)
+        elif isinstance(event, RuntimeControlRejected):
+            if self.transcript is not None:
+                self.transcript.error(event.message)
+            else:
+                print(f"\n✗ {event.message}", flush=True)
         elif isinstance(event, ConnectionChanged) and self.on_connection is not None:
             self.on_connection(event.connected)
         elif isinstance(event, AssistantMessageComplete):
@@ -352,7 +391,19 @@ async def _run_turn(runtime: HansRuntime, prompt: str, display: _Display | None 
         shown.event(event)
 
 
-async def serve(read_line, run_turn) -> None:
+async def _dispatch_control(runtime: HansRuntime, control: LocalControl, display: _Display) -> None:
+    if control.kind == "permissions_status":
+        event = runtime.get_control_status()
+    elif control.kind == "set_permission":
+        event = runtime.set_permission(control.category or "", bool(control.allowed))
+    elif control.kind == "clear_session":
+        event = await runtime.clear_session_history()
+    else:
+        return
+    display.event(event)
+
+
+async def serve(read_line, run_turn, handle_local=None) -> None:
     """Interactive loop. Ctrl-C returns to the prompt. Ctrl-D on empty input exits."""
     while True:
         try:
@@ -364,6 +415,8 @@ async def serve(read_line, run_turn) -> None:
             print(flush=True)
             return
         if not prompt.strip():
+            continue
+        if handle_local is not None and await handle_local(prompt):
             continue
         if debug_enabled():
             print("[user_turn]", flush=True)
@@ -392,11 +445,24 @@ async def _run_tui() -> None:
         print(format_header(_model_name(), _workspace(), False), flush=True)
         print(FOOTER, flush=True)
 
+        display = _Display()
+        todos = TodoList()
+
         async def run_turn(prompt: str) -> None:
-            await _run_turn(runtime, prompt)
+            await _run_turn(runtime, prompt, display)
+
+        async def handle_local(prompt: str) -> bool:
+            local = handle_local_command(prompt, todos)
+            if not local.handled:
+                return False
+            if local.control is not None:
+                await _dispatch_control(runtime, local.control, display)
+            elif local.text:
+                print(f"\n{local.text}", flush=True)
+            return True
 
         try:
-            await serve(input, run_turn)
+            await serve(input, run_turn, handle_local)
         finally:
             runtime.close()
         return
@@ -478,6 +544,15 @@ async def _run_curses(runtime: HansRuntime) -> None:
             runtime.cancel_active()
             raise
 
+    async def dispatch_local(local) -> None:
+        if local.control is not None:
+            await _dispatch_control(runtime, local.control, state["display"])
+        elif local.theme:
+            state["theme"] = "high-contrast" if local.theme == "high-contrast" else "terminal"
+        if local.text:
+            transcript.change(local.text, title="LOCAL")
+            state["display"]._trim_presentation()
+
     def open_detail(title: str, content: str | None) -> None:
         if content is None:
             state["display"]._set_state("IDLE", "no retained tool output")
@@ -513,9 +588,16 @@ async def _run_curses(runtime: HansRuntime) -> None:
         if state["task"] is not None:
             if name == "ctrl-c":
                 request_cancel()
-            elif name == "ctrl-q":
+                return False
+            if name == "ctrl-q":
                 request_cancel()
                 return True
+            submitted = editor.on_key(name)
+            if submitted is None:
+                return False
+            local = handle_local_command(submitted, state["todos"])
+            if local.handled:
+                await dispatch_local(local)
             return False
         if name == "ctrl-g":
             diff = runtime.task_diff(max_chars=TASK_DIFF_MAX_CHARS)
@@ -547,10 +629,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
             return True
         local = handle_local_command(submitted, state["todos"])
         if local.handled:
-            if local.theme:
-                state["theme"] = "high-contrast" if local.theme == "high-contrast" else "terminal"
-            transcript.change(local.text, title="LOCAL")
-            state["display"]._trim_presentation()
+            await dispatch_local(local)
             return False
         state["task"] = asyncio.create_task(run_prompt(submitted))
         return False
