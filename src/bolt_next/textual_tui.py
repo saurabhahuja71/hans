@@ -18,6 +18,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Static, TextArea
 
+from bolt_next.commands import CompletionContext, command_suggestions, is_complete_command
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
@@ -197,6 +198,9 @@ class ComposerTextArea(TextArea):
         handler = getattr(self.app, "_handle_approval_key", None)
         if handler is not None and handler(event):
             return
+        completion_handler = getattr(self.app, "_handle_completion_key", None)
+        if completion_handler is not None and completion_handler(event):
+            return
 
 
 class HansTextualApp(App[None]):
@@ -235,6 +239,17 @@ class HansTextualApp(App[None]):
         padding: 0 2;
         color: $text-muted;
         background: $surface;
+    }
+
+    #command-suggestions {
+        display: none;
+        height: auto;
+        max-height: 7;
+        margin: 0 1;
+        padding: 0 1;
+        border: round $secondary;
+        background: $surface;
+        color: $text;
     }
 
     #composer {
@@ -292,6 +307,7 @@ class HansTextualApp(App[None]):
     MAX_TOOL_OUTPUT_CHARS = 4_000
     MAX_TASK_DIFF_CHARS = 4_000
     MAX_COMPOSER_ROWS = 6
+    MAX_COMMAND_SUGGESTIONS = 7
 
     BINDINGS = [
         Binding("enter", "submit_or_exit", "send", show=False, priority=True),
@@ -333,12 +349,20 @@ class HansTextualApp(App[None]):
         self._has_task_changes = False
         self._state = "IDLE"
         self._closed = False
+        self._command_suggestions: tuple[str, ...] = ()
+        self._command_suggestion_index = 0
+        self._completion_dismissed_text: str | None = None
+        self._completion_model_ids: tuple[str, ...] = ()
+        self._completion_reasoning_modes: tuple[str, ...] = ()
+        self._completion_models_loaded = False
+        self._completion_reasoning_modes_loaded = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._header_text(), id="hans-header", markup=False)
         yield VerticalScroll(id="transcript")
         yield Static(self._state, id="state-line", markup=False)
         yield Static(self._footer_text(), id="footer", markup=False)
+        yield Static("", id="command-suggestions", markup=False)
         yield ComposerTextArea("", id="composer")
 
     def on_mount(self) -> None:
@@ -383,6 +407,94 @@ class HansTextualApp(App[None]):
             return
         rows = min(self.MAX_COMPOSER_ROWS, max(1, event.text_area.text.count("\n") + 1))
         event.text_area.styles.height = rows + 2
+        if event.text_area.text == self._completion_dismissed_text:
+            self._completion_dismissed_text = None
+            self._hide_command_suggestions()
+            return
+        self._refresh_command_suggestions(event.text_area.text)
+
+    def _completion_context(self, text: str) -> CompletionContext:
+        command, _, argument = text.partition(" ")
+        if command.lower() == "/models" and (
+            argument.lower().strip() == "use" or argument.lower().startswith("use ")
+        ):
+            if not self._completion_models_loaded:
+                try:
+                    status = self.runtime.get_model_status()
+                    self._completion_model_ids = tuple(str(model.id) for model in status.models)
+                except Exception:
+                    pass
+                self._completion_models_loaded = True
+        elif command.lower() == "/mode":
+            if not self._completion_reasoning_modes_loaded:
+                try:
+                    status = self.runtime.get_reasoning_mode_status()
+                    self._completion_reasoning_modes = tuple(str(mode) for mode in status.available_modes)
+                except Exception:
+                    pass
+                self._completion_reasoning_modes_loaded = True
+        return CompletionContext(
+            model_ids=self._completion_model_ids,
+            reasoning_modes=self._completion_reasoning_modes,
+            themes=THEME_NAMES,
+        )
+
+    def _refresh_command_suggestions(self, text: str) -> None:
+        if self._request_active or self._approval_pending is not None or self._approval_resolving:
+            self._hide_command_suggestions()
+            return
+        suggestions = command_suggestions(
+            text, self._completion_context(text), limit=self.MAX_COMMAND_SUGGESTIONS
+        )
+        self._command_suggestions = suggestions
+        self._command_suggestion_index = 0
+        if not suggestions:
+            self._hide_command_suggestions()
+            return
+        self._render_command_suggestions()
+
+    def _render_command_suggestions(self) -> None:
+        widget = self.query_one("#command-suggestions", Static)
+        widget.update(
+            "\n".join(
+                f"{'›' if index == self._command_suggestion_index else ' '} {suggestion}"
+                for index, suggestion in enumerate(self._command_suggestions)
+            )
+        )
+        widget.styles.display = "block"
+
+    def _hide_command_suggestions(self) -> None:
+        self._command_suggestions = ()
+        self._command_suggestion_index = 0
+        if self.is_mounted:
+            self.query_one("#command-suggestions", Static).styles.display = "none"
+
+    def _accept_command_suggestion(self) -> None:
+        replacement = self._command_suggestions[self._command_suggestion_index]
+        self._completion_dismissed_text = replacement
+        self.query_one("#composer", TextArea).text = replacement
+        self._hide_command_suggestions()
+
+    def _handle_completion_key(self, event: Key) -> bool:
+        if not self._command_suggestions:
+            return False
+        if event.key in {"up", "down"}:
+            step = -1 if event.key == "up" else 1
+            self._command_suggestion_index = (
+                self._command_suggestion_index + step
+            ) % len(self._command_suggestions)
+            self._render_command_suggestions()
+        elif event.key == "enter" and is_complete_command(self.query_one("#composer", TextArea).text):
+            return False
+        elif event.key in {"enter", "tab"}:
+            self._accept_command_suggestion()
+        elif event.key == "escape":
+            self._hide_command_suggestions()
+        else:
+            return False
+        event.stop()
+        event.prevent_default()
+        return True
 
     def _handle_approval_key(self, event: Key) -> bool:
         if self._approval_pending is None and not self._approval_resolving:
@@ -659,6 +771,7 @@ class HansTextualApp(App[None]):
             self._verification_failed = False
             self._has_task_changes = False
             self._request_active = True
+            self._hide_command_suggestions()
             self._set_state("INVESTIGATING")
         elif isinstance(event, AssistantMessageDelta):
             if event.delta:
@@ -676,6 +789,7 @@ class HansTextualApp(App[None]):
         elif isinstance(event, ToolApprovalRequested):
             self._approval_pending = (event.request_id, event.call_id)
             self._request_active = True
+            self._hide_command_suggestions()
             self._set_state("APPROVAL REQUIRED")
             await self._append_transcript(
                 format_approval_request(event.tool_name, event.category, event.display.fields), "change"
@@ -804,6 +918,8 @@ class HansTextualApp(App[None]):
                 format_model_status(event.model, event.current_reasoning_mode, event.models), "change"
             )
         elif isinstance(event, ModelChanged):
+            self._completion_models_loaded = False
+            self._completion_reasoning_modes_loaded = False
             self._set_model(event.model)
             await self._append_transcript(
                 format_model_changed(
@@ -841,6 +957,9 @@ class HansTextualApp(App[None]):
             return
         composer = self.query_one("#composer", TextArea)
         prompt = composer.text
+        if self._command_suggestions and not is_complete_command(prompt):
+            self._accept_command_suggestion()
+            return
         if not prompt.strip() or is_exit_command(prompt):
             self.action_exit_app()
             return

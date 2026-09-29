@@ -7,6 +7,7 @@ import sys
 import termios
 from pathlib import Path
 
+from bolt_next.commands import CompletionContext, command_suggestions, is_complete_command
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
@@ -39,6 +40,7 @@ from bolt_next.events import (
 )
 from bolt_next.runtime import HansRuntime
 from bolt_next.tui_screen import (
+    THEME_NAMES,
     Editor,
     LocalControl,
     TodoList,
@@ -582,6 +584,12 @@ async def _run_curses(runtime: HansRuntime) -> None:
         "detail": None,
         "theme": "terminal",
         "todos": TodoList(),
+        "command_suggestions": (),
+        "command_suggestion_index": 0,
+        "completion_model_ids": (),
+        "completion_reasoning_modes": (),
+        "completion_models_loaded": False,
+        "completion_reasoning_modes_loaded": False,
     }
     state["display"] = _Display(
         transcript,
@@ -590,6 +598,45 @@ async def _run_curses(runtime: HansRuntime) -> None:
             "model", str(getattr(model, "display_name", None) or getattr(model, "id", None) or state["model"])
         ),
     )
+
+    def hide_command_suggestions() -> None:
+        state["command_suggestions"] = ()
+        state["command_suggestion_index"] = 0
+
+    def completion_context(text: str) -> CompletionContext:
+        command, _, argument = text.partition(" ")
+        if command.lower() == "/models" and (
+            argument.lower().strip() == "use" or argument.lower().startswith("use ")
+        ):
+            if not state["completion_models_loaded"]:
+                try:
+                    status = runtime.get_model_status()
+                    state["completion_model_ids"] = tuple(str(model.id) for model in status.models)
+                except Exception:
+                    pass
+                state["completion_models_loaded"] = True
+        elif command.lower() == "/mode":
+            if not state["completion_reasoning_modes_loaded"]:
+                try:
+                    status = runtime.get_reasoning_mode_status()
+                    state["completion_reasoning_modes"] = tuple(str(mode) for mode in status.available_modes)
+                except Exception:
+                    pass
+                state["completion_reasoning_modes_loaded"] = True
+        return CompletionContext(
+            model_ids=state["completion_model_ids"],
+            reasoning_modes=state["completion_reasoning_modes"],
+            themes=THEME_NAMES,
+        )
+
+    def refresh_command_suggestions() -> None:
+        display = state["display"]
+        if display.request_active or display.approval_pending is not None or state["resolving_approval"]:
+            hide_command_suggestions()
+            return
+        suggestions = command_suggestions("\n".join(editor.lines), completion_context("\n".join(editor.lines)))
+        state["command_suggestions"] = suggestions
+        state["command_suggestion_index"] = 0
 
     def request_cancel(*_args) -> None:
         state["cancel"] = True
@@ -628,6 +675,15 @@ async def _run_curses(runtime: HansRuntime) -> None:
         for offset, line in enumerate(body):
             stdscr.addnstr(3 + offset, 0, line, width - 1)
         footer_at = 3 + conversation
+        suggestions = state["command_suggestions"]
+        available_suggestion_rows = max(0, footer_at - 3)
+        visible_suggestions = suggestions[-available_suggestion_rows:] if available_suggestion_rows else ()
+        first_suggestion = len(suggestions) - len(visible_suggestions)
+        for offset, suggestion in enumerate(visible_suggestions):
+            index = first_suggestion + offset
+            marker = ">" if index == state["command_suggestion_index"] else " "
+            attr = curses.A_REVERSE if index == state["command_suggestion_index"] else curses.A_NORMAL
+            stdscr.addnstr(footer_at - len(visible_suggestions) + offset, 0, f"{marker} {suggestion}", width - 1, attr)
         stdscr.hline(footer_at, 0, curses.ACS_HLINE, width - 1)
         display = state["display"]
         status_footer = footer_text(
@@ -657,6 +713,9 @@ async def _run_curses(runtime: HansRuntime) -> None:
     async def dispatch_local(local) -> None:
         if local.control is not None:
             await _dispatch_control(runtime, local.control, state["display"])
+            if local.control.kind == "select_model":
+                state["completion_models_loaded"] = False
+                state["completion_reasoning_modes_loaded"] = False
         elif local.theme:
             state["theme"] = "high-contrast" if local.theme == "high-contrast" else "terminal"
         if local.text:
@@ -754,9 +813,28 @@ async def _run_curses(runtime: HansRuntime) -> None:
         if name == "ctrl-z":
             state["display"].event(runtime.undo_task())
             return False
+        suggestions = state["command_suggestions"]
+        if suggestions:
+            if name in {"up", "down"}:
+                step = -1 if name == "up" else 1
+                state["command_suggestion_index"] = (
+                    state["command_suggestion_index"] + step
+                ) % len(suggestions)
+                return False
+            if name == "enter" and is_complete_command("\n".join(editor.lines)):
+                pass
+            elif name in {"enter", "tab"}:
+                editor.replace_text(suggestions[state["command_suggestion_index"]])
+                hide_command_suggestions()
+                return False
+            if name == "escape":
+                hide_command_suggestions()
+                return False
         submitted = editor.on_key(name)
         if submitted is None:
+            refresh_command_suggestions()
             return False
+        hide_command_suggestions()
         if submitted == "" or is_exit_command(submitted):
             return True
         local = handle_local_command(submitted, state["todos"])
@@ -916,6 +994,8 @@ def _key_name(key) -> str | None:
         return "escape"
     if key in {"\n", "\r", 10}:
         return "enter"
+    if key in {9, "\t"}:
+        return "tab"
     if key in {"\x7f", "\b", 127, 263}:
         return "backspace"
     if key in {259, 258, 339, 338}:

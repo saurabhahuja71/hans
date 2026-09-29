@@ -12,6 +12,12 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from bolt_next.commands import (
+    PERMISSION_CATEGORIES,
+    PERMISSION_POLICIES,
+    format_help,
+    known_command,
+)
 from bolt_next.events import VerificationEvidence
 
 
@@ -238,6 +244,9 @@ class Editor:
     def clear(self) -> None:
         self.lines = [""]
 
+    def replace_text(self, text: str) -> None:
+        self.lines = text.split("\n") or [""]
+
     def on_key(self, key: str) -> str | None:
         """Return text to submit, '' to exit, or None to keep editing."""
         if key == "ctrl-c":
@@ -452,8 +461,15 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
     if not stripped.startswith("/"):
         return LocalCommand(False)
     command, _, argument = stripped.partition(" ")
-    normalized_command = command.lower()
+    spec = known_command(command)
+    if spec is None:
+        return LocalCommand(True, f"Unknown command: {command}")
+    normalized_command = spec.name
     argument = argument.strip()
+    if normalized_command == "/help":
+        if argument:
+            return LocalCommand(True, "Usage: /help")
+        return LocalCommand(True, format_help())
     if normalized_command == "/models":
         values = argument.split()
         if not values:
@@ -475,9 +491,9 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
         if len(values) != 2:
             return LocalCommand(True, "Usage: /permissions [read|write|execute] [allow|deny|ask]")
         category, value = values
-        if category not in {"read", "write", "execute"}:
+        if category not in PERMISSION_CATEGORIES:
             return LocalCommand(True, f"Unknown permission: {category}")
-        if value not in {"allow", "deny", "ask"}:
+        if value not in PERMISSION_POLICIES:
             return LocalCommand(True, "Expected allow, deny, or ask.")
         return LocalCommand(True, control=LocalControl("set_permission", category=category, policy=value))
     if normalized_command == "/clear":

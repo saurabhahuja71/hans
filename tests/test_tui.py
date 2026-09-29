@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from bolt_next.commands import format_help
 from bolt_next.events import (
     AssistantMessageDelta,
     ModelChanged,
@@ -224,6 +225,8 @@ def test_editor_submission_newlines_cancellation_and_exit() -> None:
     editor.on_key("char:keep")
     assert editor.on_key("ctrl-q") == ""
     assert editor.lines == [""]
+    editor.replace_text("/models use large")
+    assert editor.on_key("enter") == "/models use large"
 
 
 def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
@@ -235,6 +238,7 @@ def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
     assert decoder.feed("\x07") == ["ctrl-g"]
     assert decoder.feed("\x1a") == ["ctrl-z"]
     assert decoder.feed("\x11") == ["ctrl-q"]
+    assert decoder.feed("\t") == ["tab"]
 
     message = "line one\nline two"
     pasted = _InputDecoder()
@@ -419,6 +423,8 @@ def test_curses_failed_verification_is_not_claimed_complete() -> None:
 def test_local_todos_commands_and_bounded_presentation_are_ui_only() -> None:
     todos = TodoList(max_items=2, max_text_chars=12)
     assert handle_local_command("ordinary prompt", todos).handled is False
+    assert handle_local_command("/help", todos).text == format_help()
+    assert handle_local_command("/help now", todos).text == "Usage: /help"
     assert handle_local_command("/unknown", todos).text == "Unknown command: /unknown"
     assert handle_local_command("/todo add  write   tests ", todos).text == "TODO added #1: write tests"
     assert handle_local_command("/todo add review", todos).text == "TODO added #2: review"
@@ -626,6 +632,7 @@ def test_non_tty_local_commands_do_not_run_model_turns() -> None:
         await serve(_Lines([message, None]), run_turn, handle_local)
         return seen
 
+    assert asyncio.run(submit_once("/help")) == []
     assert asyncio.run(submit_once("/permissions")) == []
     assert asyncio.run(submit_once("/clear")) == []
     assert asyncio.run(submit_once("/models")) == []

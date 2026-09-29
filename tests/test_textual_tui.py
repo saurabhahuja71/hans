@@ -40,6 +40,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
+from bolt_next.commands import format_help
 from bolt_next.model_catalog import ModelInfo
 from bolt_next.textual_tui import DetailScreen, HansTextualApp, TaskDiffScreen, ThemeScreen
 
@@ -648,6 +649,110 @@ def test_tool_output_retention_tracks_evicted_rows(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_textual_command_completion_accepts_selection_without_submitting(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.press(*"/mo")
+            await pilot.pause()
+            assert app._command_suggestions == ("/models", "/mode")
+            assert "/models" in rendered(app.query_one("#command-suggestions", Static))
+            assert "/mode" in rendered(app.query_one("#command-suggestions", Static))
+            assert runtime.prompts == []
+
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            assert app.query_one("#composer", TextArea).text == "/mode"
+            assert app._command_suggestions == ()
+            assert runtime.prompts == []
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert runtime.prompts == []
+            assert runtime.control_calls == [("reasoning_mode_status",)]
+
+    asyncio.run(scenario())
+
+
+def test_textual_command_completion_uses_dynamic_values_and_can_be_dismissed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.press(*"/models use")
+            await pilot.pause()
+            assert app._command_suggestions == ("/models use configured-model", "/models use large")
+            assert runtime.control_calls == [("reasoning_mode_status",), ("model_status",)]
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.query_one("#composer", TextArea).text == "/models use"
+            assert app._command_suggestions == ()
+
+            app.query_one("#composer", TextArea).text = ""
+            await pilot.pause()
+            await pilot.press(*"/mode")
+            await pilot.pause()
+            assert app._command_suggestions == ("/mode none", "/mode high")
+            assert runtime.control_calls == [("reasoning_mode_status",), ("model_status",)]
+            await pilot.press("escape")
+            await pilot.pause()
+
+            app.query_one("#composer", TextArea).text = ""
+            await pilot.pause()
+            await pilot.press(*"/models use l")
+            await pilot.pause()
+            assert app._command_suggestions == ("/models use large",)
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app.query_one("#composer", TextArea).text == "/models use large"
+            assert app._command_suggestions == ()
+            assert runtime.prompts == []
+
+            app.query_one("#composer", TextArea).text = ""
+            await pilot.pause()
+            await pilot.press(*"/th")
+            await pilot.pause()
+            assert app._command_suggestions == ("/theme",)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.query_one("#composer", TextArea).text == "/th"
+            assert app._command_suggestions == ()
+
+            app.query_one("#composer", TextArea).text = ""
+            await pilot.pause()
+            await pilot.press(*"/mo", "shift+enter")
+            await pilot.pause()
+            assert app._command_suggestions == ()
+            assert runtime.prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_textual_approval_input_precedes_command_completion(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.approval_events = [ToolApprovalResolved("request-1", "call-1", True), RequestCompleted(None)]
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.press(*"/mo")
+            await pilot.pause()
+            assert app._command_suggestions == ("/models", "/mode")
+            await app._render_event(approval_event("request-1", "call-1", "write_file", "write"))
+            assert app._command_suggestions == ()
+
+            await pilot.press("y")
+            await asyncio.wait_for(runtime.approval_started.wait(), timeout=1)
+            assert runtime.approval_calls == [("request-1", "call-1", True)]
+            assert app.query_one("#composer", TextArea).text == "/mo"
+            assert runtime.prompts == []
+            runtime.approval_release.set()
+            await pilot.pause()
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+
 def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) -> None:
     async def submit(pilot, text: str) -> None:
         await pilot.press(*text, "enter")
@@ -657,6 +762,7 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
         runtime = FakeRuntime()
         app = HansTextualApp(runtime, "test-model", tmp_path)
         async with app.run_test() as pilot:
+            await submit(pilot, "/help")
             await submit(pilot, "/todo add write tests")
             await submit(pilot, "/todo list")
             await submit(pilot, "/todo done 1")
@@ -677,6 +783,7 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
                 ("clear", None, None),
             ]
             text = transcript_text(app)
+            assert format_help() in text
             assert "TODO added #1: write tests" in text
             assert "TODO\nx #1 write tests" in text
             assert "TODO completed #1: write tests" in text
@@ -697,17 +804,24 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             await submit(pilot, "/mode unsupported")
             await submit(pilot, "/models use large")
             await submit(pilot, "/models use does-not-exist")
-            await submit(pilot, "/models use")
+            await pilot.press(*"/models use")
+            await pilot.pause()
+            await pilot.press("escape", "enter")
+            await pilot.pause()
             await submit(pilot, "/mode high extra")
             assert runtime.prompts == []
             assert runtime.control_calls == [
                 ("permission", "write", "deny"),
                 ("clear", None, None),
+                ("reasoning_mode_status",),
                 ("model_status",),
                 ("reasoning_mode_status",),
                 ("reasoning_mode", "high"),
                 ("reasoning_mode", "unsupported"),
+                ("model_status",),
                 ("select_model", "large"),
+                ("reasoning_mode_status",),
+                ("model_status",),
                 ("select_model", "does-not-exist"),
             ]
             text = transcript_text(app)

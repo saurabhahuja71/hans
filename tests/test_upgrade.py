@@ -96,4 +96,4 @@ def test_main_reports_invalid_usage(capsys: pytest.CaptureFixture[str]) -> None:
 def test_current_release_version() -> None:
     project = (Path(__file__).parents[1] / "pyproject.toml").read_text()
 
-    assert 'version = "0.6.0"' in project
+    assert 'version = "0.7.0"' in project
