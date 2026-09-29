@@ -264,7 +264,7 @@ def test_permission_policy_wraps_target_tools_after_switch(monkeypatch: pytest.M
 
         events = run(collect(runtime, "Try writing."))
         assert ToolOutput("write", "Permission denied: write operations are disabled.") in events
-        assert ToolCompleted("write", "write_file", "blocked.txt", False) in events
+        assert ToolCompleted("write", "write_file", "blocked.txt", False, None, "Permission denied.") in events
         assert not (tmp_path / "blocked.txt").exists()
     finally:
         runtime.close()

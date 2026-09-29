@@ -56,8 +56,11 @@ from bolt_next.tui_screen import (
     TodoList,
     display_bounded,
     footer_text,
+    format_approval_denied,
     format_approval_request,
     format_change_summary,
+    format_tool_label,
+    human_tool_name,
     format_todo_view,
     format_model_changed,
     format_model_status,
@@ -351,6 +354,7 @@ class HansTextualApp(App[None]):
         self._tool_details: dict[str, str] = {}
         self._tool_results: dict[str, str] = {}
         self._tool_outputs: dict[str, str] = {}
+        self._tool_failure_reasons: dict[str, str] = {}
         self._tool_purposes: dict[str, str] = {}
         self._latest_tool_call_id: str | None = None
         self._todos = TodoList()
@@ -361,6 +365,7 @@ class HansTextualApp(App[None]):
         self._verification_failed = False
         self._request_active = False
         self._approval_pending: tuple[str, str] | None = None
+        self._approval_tools: dict[tuple[str, str], str] = {}
         self._approval_resolving = False
         self._has_task_changes = False
         self._state = "IDLE"
@@ -656,6 +661,7 @@ class HansTextualApp(App[None]):
                 self._tool_details.pop(call_id, None)
                 self._tool_results.pop(call_id, None)
                 self._tool_outputs.pop(call_id, None)
+                self._tool_failure_reasons.pop(call_id, None)
                 if self._latest_tool_call_id == call_id:
                     self._latest_tool_call_id = None
                 self._tool_purposes.pop(call_id, None)
@@ -677,6 +683,7 @@ class HansTextualApp(App[None]):
                     self._tool_details.pop(call_id, None)
                     self._tool_results.pop(call_id, None)
                     self._tool_outputs.pop(call_id, None)
+                    self._tool_failure_reasons.pop(call_id, None)
                     if self._latest_tool_call_id == call_id:
                         self._latest_tool_call_id = None
                     self._tool_purposes.pop(call_id, None)
@@ -756,12 +763,14 @@ class HansTextualApp(App[None]):
         name = self._tool_names.get(call_id, "tool")
         detail = self._tool_details.get(call_id, "")
         result = self._tool_results.get(call_id, "")
-        target = f" {detail}" if detail else ""
+        reason = self._tool_failure_reasons.get(call_id, "")
         suffix = f"\n  {result}" if result else ""
-        if exit_code is not None:
+        if reason:
+            suffix += f"\n  Reason: {reason}"
+        elif exit_code is not None:
             suffix += f"\n  exit {exit_code}"
         marker = {"RUNNING": "◉", "DONE": "✓", "FAILED": "✗"}[state]
-        return f"{marker} {name}{target}{suffix}"
+        return f"{marker} {format_tool_label(name, detail)}{suffix}"
 
     async def _tool_widget(self, call_id: str) -> Static:
         widget = self._tool_widgets.get(call_id)
@@ -787,6 +796,7 @@ class HansTextualApp(App[None]):
                 await widget.remove()
             else:
                 self._tool_outputs.pop(call_id, None)
+                self._tool_failure_reasons.pop(call_id, None)
             if self._latest_tool_call_id == call_id:
                 self._latest_tool_call_id = None
 
@@ -816,7 +826,9 @@ class HansTextualApp(App[None]):
                 self._update_assistant(f"HANS\n{final_text}")
             self._assistant_text = final_text
         elif isinstance(event, ToolApprovalRequested):
-            self._approval_pending = (event.request_id, event.call_id)
+            key = (event.request_id, event.call_id)
+            self._approval_pending = key
+            self._approval_tools[key] = event.tool_name
             self._request_active = True
             self._hide_command_suggestions()
             self._set_state("APPROVAL REQUIRED")
@@ -824,8 +836,12 @@ class HansTextualApp(App[None]):
                 format_approval_request(event.tool_name, event.category, event.display.fields), "change"
             )
         elif isinstance(event, ToolApprovalResolved):
-            if self._approval_pending == (event.request_id, event.call_id):
+            key = (event.request_id, event.call_id)
+            tool_name = self._approval_tools.pop(key, "tool")
+            if self._approval_pending == key:
                 self._approval_pending = None
+            if not event.approved:
+                await self._append_transcript(format_approval_denied(tool_name), "change")
         elif isinstance(event, ToolStarted):
             self._tool_names[event.call_id] = event.name
             self._tool_details[event.call_id] = self._compact(event.detail, self.MAX_TOOL_DETAIL_CHARS)
@@ -846,6 +862,7 @@ class HansTextualApp(App[None]):
         elif isinstance(event, ToolCompleted):
             self._tool_names.setdefault(event.call_id, event.name)
             self._tool_details.setdefault(event.call_id, self._compact(event.detail, self.MAX_TOOL_DETAIL_CHARS))
+            self._tool_failure_reasons[event.call_id] = event.failure_reason or ""
             widget = await self._tool_widget(event.call_id)
             status = "DONE" if event.success else "FAILED"
             widget.update(self._tool_text(event.call_id, status, event.exit_code))
@@ -855,7 +872,7 @@ class HansTextualApp(App[None]):
             if event.success:
                 self._set_state(self._tool_stage(event.name, self._verification_failed, purpose))
             else:
-                self._set_state("FAILED", f"tool {event.name}")
+                self._set_state("FAILED", event.failure_reason or f"{human_tool_name(event.name)} failed.")
         elif isinstance(event, VerificationStarted):
             self._set_state("VERIFYING", event.command)
         elif isinstance(event, VerificationPassed):
@@ -874,6 +891,7 @@ class HansTextualApp(App[None]):
             await self._flush_assistant_deltas()
             self._request_active = False
             self._approval_pending = None
+            self._approval_tools.clear()
             if event.evidence is None:
                 result = "COMPLETE\nVerification not established"
                 result_class = "final"
@@ -895,12 +913,14 @@ class HansTextualApp(App[None]):
             await self._flush_assistant_deltas()
             self._request_active = False
             self._approval_pending = None
+            self._approval_tools.clear()
             self._set_state("CANCELLED")
             await self._append_transcript("CANCELLED\nThe request was stopped. You can send another prompt.", "error")
         elif isinstance(event, RequestFailed):
             await self._flush_assistant_deltas()
             self._request_active = False
             self._approval_pending = None
+            self._approval_tools.clear()
             title = self._failure_title(event.category)
             self._set_state("FAILED", title)
             await self._append_transcript(f"ERROR\n✗ {title}\n{event.message}", "error")

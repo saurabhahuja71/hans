@@ -54,6 +54,7 @@ class ToolCompleted:
     detail: str
     success: bool
     exit_code: int | None = None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

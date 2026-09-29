@@ -48,9 +48,12 @@ from bolt_next.tui_screen import (
     copy_osc52,
     display_bounded,
     footer_text,
+    format_approval_denied,
     format_approval_request,
     format_change_summary,
+    format_tool_label,
     format_todo_view,
+    human_tool_name,
     format_model_changed,
     format_model_status,
     format_reasoning_mode_changed,
@@ -91,15 +94,25 @@ def format_header(model: str, workspace: Path, connected: bool = False) -> str:
     )
 
 
-def format_tool_call(name: str, detail: str) -> str:
-    return f"  ◇ {name}  {detail}".rstrip()
+def format_tool_call(name: str, detail: str, *, label: str | None = None) -> str:
+    return f"  ◇ {label or name}  {detail}".rstrip()
 
 
-def format_tool_result(name: str, success: bool, exit_code: int | None = None) -> str:
+def format_tool_result(
+    name: str,
+    success: bool,
+    exit_code: int | None = None,
+    *,
+    label: str | None = None,
+    failure_reason: str = "",
+) -> str:
     mark = "✓" if success else "✗"
+    rendered = f"  {mark} {label or name}"
+    if failure_reason:
+        return f"{rendered}\n    Reason: {failure_reason}"
     if exit_code is not None:
-        return f"  {mark} {name}  exit {exit_code}"
-    return f"  {mark} {name}"
+        return f"{rendered}  exit {exit_code}"
+    return rendered
 
 
 def detail_window(content: str, width: int, height: int, offset: int = 0) -> list[str]:
@@ -158,6 +171,7 @@ class _Display:
         self._started = False
         self._verification_failed = False
         self._tool_purposes: dict[str, str] = {}
+        self._approval_tools: dict[tuple[str, str], str] = {}
         self.tool_outputs: dict[str, str] = {}
         self.latest_tool_call_id: str | None = None
         self.max_tool_outputs = 100
@@ -213,7 +227,9 @@ class _Display:
         elif isinstance(event, AssistantMessageDelta):
             self._text(event.delta)
         elif isinstance(event, ToolApprovalRequested):
-            self.approval_pending = (event.request_id, event.call_id)
+            key = (event.request_id, event.call_id)
+            self.approval_pending = key
+            self._approval_tools[key] = event.tool_name
             self.request_active = True
             self._set_state("APPROVAL REQUIRED")
             if self.transcript is not None:
@@ -221,10 +237,17 @@ class _Display:
             else:
                 print("\n" + format_approval_request(event.tool_name, event.category, event.display.fields), flush=True)
         elif isinstance(event, ToolApprovalResolved):
-            if self.approval_pending == (event.request_id, event.call_id):
+            key = (event.request_id, event.call_id)
+            tool_name = self._approval_tools.pop(key, "tool")
+            if self.approval_pending == key:
                 self.approval_pending = None
+            if not event.approved:
+                if self.transcript is not None:
+                    self.transcript.approval_denied(tool_name)
+                else:
+                    print("\n" + format_approval_denied(tool_name), flush=True)
         elif isinstance(event, ToolStarted):
-            label = f"{event.name}  {self._compact(event.detail)}".rstrip()
+            label = format_tool_label(event.name, self._compact(event.detail))
             self._tool_purposes[event.call_id] = event.purpose
             if self.transcript is not None:
                 self.transcript.tool_started(label)
@@ -239,7 +262,7 @@ class _Display:
                     flush=True,
                 )
             else:
-                print("\n" + format_tool_call(event.name, self._compact(event.detail)), flush=True)
+                print("\n" + format_tool_call(event.name, self._compact(event.detail), label=label), flush=True)
         elif isinstance(event, ToolOutput):
             output = self._debug_tool_output(event.output)
             self.tool_outputs[event.call_id] = output
@@ -250,16 +273,25 @@ class _Display:
                 else:
                     print(f"\n[tool_output] call_id={event.call_id}\n{output}", flush=True)
         elif isinstance(event, ToolCompleted):
-            label = event.detail or event.name
+            label = format_tool_label(event.name, self._compact(event.detail))
             purpose = self._tool_purposes.pop(event.call_id, "inspect")
             if self.transcript is not None:
-                self.transcript.tool_finished(label, ok=event.success)
+                self.transcript.tool_finished(label, ok=event.success, reason=event.failure_reason or "")
             elif not self.debug:
-                print(format_tool_result(event.name, event.success, event.exit_code), flush=True)
+                print(
+                    format_tool_result(
+                        event.name,
+                        event.success,
+                        event.exit_code,
+                        label=label,
+                        failure_reason=event.failure_reason or "",
+                    ),
+                    flush=True,
+                )
             if event.success:
                 self._set_state(self._tool_stage(event.name, purpose))
             else:
-                self._set_state("FAILED", f"tool {event.name}")
+                self._set_state("FAILED", event.failure_reason or f"{human_tool_name(event.name)} failed.")
         elif isinstance(event, VerificationStarted):
             self._set_state("VERIFYING", event.command)
         elif isinstance(event, VerificationPassed):
@@ -275,6 +307,7 @@ class _Display:
         elif isinstance(event, RequestCompleted):
             self.request_active = False
             self.approval_pending = None
+            self._approval_tools.clear()
             if self.transcript is not None:
                 self.transcript.completed(event.evidence)
             self._set_state("FAILED" if event.evidence is not None and not event.evidence.success else "COMPLETE")
@@ -283,6 +316,7 @@ class _Display:
         elif isinstance(event, RequestCancelled):
             self.request_active = False
             self.approval_pending = None
+            self._approval_tools.clear()
             if self.transcript is not None:
                 self.transcript.cancelled()
             self._set_state("CANCELLED")
@@ -291,6 +325,7 @@ class _Display:
         elif isinstance(event, RequestFailed):
             self.request_active = False
             self.approval_pending = None
+            self._approval_tools.clear()
             titles = {
                 "configuration": "configuration failed",
                 "authentication": "authentication failed",

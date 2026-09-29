@@ -728,10 +728,108 @@ def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:
     b_verification = next(event for event in b_events if isinstance(event, VerificationPassed))
     assert b_verification.evidence.command == "printf B"
     assert a_events[0] == ToolOutput("call-a", "exit_code=1\nstdout:\nA\n")
-    assert ToolCompleted("call-a", "run_command", "printf A", False, 1) in a_events
+    a_completed = next(event for event in a_events if isinstance(event, ToolCompleted))
+    assert a_completed == ToolCompleted(
+        "call-a", "run_command", "printf A", False, 1, "Command exited with code 1."
+    )
     a_verification = next(event for event in a_events if isinstance(event, VerificationFailed))
     assert a_verification.evidence.command == "printf A"
 
+
+def test_tool_failures_have_safe_semantic_reasons_and_redacted_output() -> None:
+    runtime = HansRuntime(agent=object(), session=object(), runner=object())
+
+    def called(call_id: str, name: str, arguments: dict[str, str]):
+        return SimpleNamespace(
+            type="run_item_stream_event",
+            name="tool_called",
+            item=SimpleNamespace(
+                call_id=call_id,
+                tool_name=name,
+                raw_item={"call_id": call_id, "arguments": arguments},
+            ),
+        )
+
+    def output(call_id: str, value: str):
+        return SimpleNamespace(
+            type="run_item_stream_event",
+            name="tool_output",
+            item=SimpleNamespace(call_id=call_id, output=value),
+        )
+
+    def failure(call_id: str, name: str, arguments: dict[str, str], value: str) -> ToolCompleted:
+        runtime.translate_stream_event(called(call_id, name, arguments))
+        events = tuple(runtime.translate_stream_event(output(call_id, value)))
+        completed = next(event for event in events if isinstance(event, ToolCompleted))
+        assert completed.success is False
+        return completed
+
+    missing = failure("read-missing", "read_file", {"path": "missing.py"}, "Error: file does not exist: missing.py")
+    assert missing.failure_reason == "File does not exist."
+
+    read_call_id = "read-1"
+    runtime.translate_stream_event(called(read_call_id, "read_file", {"path": "secret.txt"}))
+    read_events = tuple(
+        runtime.translate_stream_event(
+            output(
+                read_call_id,
+                "Error reading 'secret.txt': Authorization: Bearer sk-secret-value-123 "
+                "password=hidden https://user:pass@example.test",
+            )
+        )
+    )
+    read_output = next(event for event in read_events if isinstance(event, ToolOutput))
+    read_completed = next(event for event in read_events if isinstance(event, ToolCompleted))
+    assert read_completed.success is False
+    assert read_completed.failure_reason is not None
+    for secret in ("sk-secret-value-123", "hidden", "user:pass"):
+        assert secret not in read_output.output
+        assert secret not in read_completed.failure_reason
+    assert "[REDACTED]" in read_output.output
+    assert "[REDACTED]" in read_completed.failure_reason
+
+    assert failure(
+        "write", "write_file", {"path": "../outside.py"}, "Error writing '../outside.py': Path is outside the workspace"
+    ).failure_reason == "Path is outside the workspace."
+    assert failure(
+        "replace", "replace_in_file", {"path": "main.py"},
+        "Error replacing 'main.py': old_text must occur exactly once (found 2)",
+    ).failure_reason == "Old_text must occur exactly once (found 2)."
+    assert failure(
+        "list", "list_directory", {"path": "file.txt"},
+        "Error listing 'file.txt': path is a file; use read_file instead",
+    ).failure_reason == "Path is a file; use read_file instead."
+    assert failure(
+        "search", "search_files", {"query": ""}, "Error searching: query must be a non-empty string"
+    ).failure_reason == "Query must be a non-empty string."
+
+    runtime.translate_stream_event(called("run-1", "run_command", {"command": "false", "purpose": "verify"}))
+    command_events = tuple(runtime.translate_stream_event(output("run-1", "exit_code=1\nstderr:\nfailed\n")))
+    command_completed = next(event for event in command_events if isinstance(event, ToolCompleted))
+    assert command_completed.exit_code == 1
+    assert command_completed.failure_reason == "Command exited with code 1."
+    assert any(isinstance(event, VerificationFailed) for event in command_events)
+
+    assert failure(
+        "run-timeout", "run_command", {"command": "sleep 1"}, "Error: command timed out after 120 seconds"
+    ).failure_reason == "Command timed out after 120 seconds."
+    assert failure(
+        "run-rejected", "run_command", {"command": "sh -c true"},
+        "Error: run_command does not run a shell. Pass the program and its arguments directly.",
+    ).failure_reason == "Run_command does not run a shell. Pass the program and its arguments directly."
+
+    traceback_events = tuple(
+        runtime.translate_stream_event(
+            output(
+                "read-traceback",
+                "Error reading broken.txt\nTraceback (most recent call last):\nprivate details",
+            )
+        )
+    )
+    assert ToolOutput("read-traceback", "Tool diagnostic omitted.") in traceback_events
+
+    unknown = failure("read-unknown", "read_file", {"path": "broken.txt"}, "Error reading broken.txt")
+    assert unknown.failure_reason == "The tool operation failed without a detailed diagnostic."
 
 
 @pytest.mark.parametrize(

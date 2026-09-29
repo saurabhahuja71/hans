@@ -329,6 +329,8 @@ def test_textual_resolves_tool_approval_without_leaving_a_stale_prompt(
             assert app._approval_resolving is False
             assert app._request_active is False
             assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
+            if not approved:
+                assert "Write file was not approved; it did not run." in transcript_text(app)
 
     asyncio.run(scenario())
 
@@ -402,7 +404,7 @@ def test_textual_renders_inline_stable_tools_without_normal_raw_output(tmp_path:
             text = transcript_text(app)
             assert "YOU\n> inspect this" in text
             assert text.count("HANS\nHello there") == 1
-            assert "✓ read_file a.py" in text
+            assert "✓ Read file a.py" in text
             assert "1 line" in text
             assert "call-a" not in text
             assert "private source bytes" not in text
@@ -411,6 +413,25 @@ def test_textual_renders_inline_stable_tools_without_normal_raw_output(tmp_path:
             assert "FINAL RESULT\nCOMPLETE\nVerified: pytest -q" in text
             assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
             assert "CONNECTED" in rendered(app.query_one("#hans-header", Static))
+
+    asyncio.run(scenario())
+
+
+def test_textual_renders_semantic_tool_failure_reason(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(ToolStarted("call", "run_command", "pytest -q"))
+            await app._render_event(
+                ToolCompleted(
+                    "call", "run_command", "pytest -q", False, 1, "Command exited with code 1."
+                )
+            )
+            await pilot.pause()
+            text = transcript_text(app)
+            assert "✗ Run command pytest -q" in text
+            assert "Reason: Command exited with code 1." in text
+            assert "run_command" not in text
 
     asyncio.run(scenario())
 
@@ -630,7 +651,7 @@ def test_completed_tool_retention_keeps_active_rows(tmp_path: Path) -> None:
             assert set(app._tool_widgets) == {"tool-1", "tool-2", "active"}
             text = transcript_text(app)
             assert "0.txt" not in text
-            assert "◉ read_file active.txt" in text
+            assert "◉ Read file active.txt" in text
 
     asyncio.run(scenario())
 

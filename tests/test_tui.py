@@ -141,7 +141,7 @@ def test_curses_display_renders_tool_approval_and_approval_controls() -> None:
     display.event(ToolApprovalResolved("request-1", "call-1", True))
     assert display.approval_pending == ("request-1", "call-2")
     rendered = "\n".join(transcript.render(120))
-    assert "  APPROVAL REQUIRED\n  Approve write_file (write)? y / n\n  path: task.txt" in rendered
+    assert "  APPROVAL REQUIRED\n  Approve Write file (write)? y / n\n  path: task.txt" in rendered
     assert "private write content" not in rendered
     assert (
         footer_text(
@@ -310,13 +310,54 @@ def test_curses_display_uses_semantic_lifecycle_hierarchy_and_tool_privacy(monke
     rendered = "\n".join(transcript.render(120))
     assert "YOU\n> fix it" in rendered
     assert "HANS\nI found it." in rendered
-    assert "TOOL read_file  a.py" in rendered
+    assert "TOOL Read file a.py" in rendered
     assert "read-1" not in rendered
     assert "private source bytes" not in rendered
     assert "VERIFICATION" in rendered
     assert "✓ pytest -q passed" in rendered
     assert "FINAL RESULT" in rendered
     assert "Verified: pytest -q" in rendered
+
+
+def test_curses_and_plain_tool_failures_use_semantic_presentation(capsys) -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+    display.event(ToolStarted("run-1", "run_command", "pytest -q"))
+    display.event(
+        ToolCompleted(
+            "run-1", "run_command", "pytest -q", False, 1, "Command exited with code 1."
+        )
+    )
+    rendered = "\n".join(transcript.render(120))
+    assert "✗ TOOL Run command pytest -q" in rendered
+    assert "Reason: Command exited with code 1." in rendered
+
+    plain = _Display()
+    plain.event(ToolStarted("run-2", "run_command", "pytest -q"))
+    plain.event(
+        ToolCompleted(
+            "run-2", "run_command", "pytest -q", False, 1, "Command exited with code 1."
+        )
+    )
+    output = capsys.readouterr().out
+    assert "◇ Run command pytest -q" in output
+    assert "✗ Run command pytest -q" in output
+    assert "Command exited with code 1." in output
+
+
+def test_approval_denial_is_not_presented_as_tool_failure() -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+    display.event(
+        ToolApprovalRequested(
+            "request-1", "call-1", "write_file", "write", ToolApprovalDisplay((("path", "task.txt"),))
+        )
+    )
+    display.event(ToolApprovalResolved("request-1", "call-1", False))
+
+    rendered = "\n".join(transcript.render(120))
+    assert "Write file was not approved; it did not run." in rendered
+    assert "TOOL" not in rendered
 
 
 def test_curses_debug_tool_output_is_explicit_and_bounded(monkeypatch) -> None:

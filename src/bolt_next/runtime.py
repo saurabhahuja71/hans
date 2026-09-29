@@ -94,17 +94,6 @@ _TOOL_CATEGORIES = {
 }
 _APPROVAL_DISPLAY_MAX_CHARS = 240
 _APPROVAL_MAX_LINE = 1_000_000
-_APPROVAL_SECRET_PATTERNS = (
-    re.compile(
-        r"(?i)([\"']?(?:api[_-]?key|token|authorization|secret|password)[\"']?\s*[:=]\s*)"
-        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)"
-    ),
-    re.compile(
-        r"(?i)(\b[A-Z_][A-Z0-9_]*(?:API[_-]?KEY|TOKEN|AUTHORIZATION|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*)"
-        r"(?:\"[^\"]*\"|'[^']*'|\S+)"
-    ),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
-)
 
 
 def run_config(context_filter: Callable[[Any], Any] = fit_model_input) -> RunConfig:
@@ -118,16 +107,16 @@ def _tool_detail(name: str, arguments: Any) -> str:
         start = arguments.get("start_line") or 0
         end = arguments.get("end_line") or 0
         if start and end:
-            return f"{detail}:{start}-{end}"
-        if start and int(start) > 1:
-            return f"{detail}:{start}"
-        return detail
+            detail = f"{detail}:{start}-{end}"
+        elif start and int(start) > 1:
+            detail = f"{detail}:{start}"
+        return _bounded_tool_text(detail)
     if name in {"list_directory", "write_file", "replace_in_file"}:
-        return str(arguments.get("path") or "")
+        return _bounded_tool_text(arguments.get("path"))
     if name == "search_files":
-        return f"{arguments.get('path') or '.'}: {arguments.get('query') or ''}".rstrip()
+        return _bounded_tool_text(f"{arguments.get('path') or '.'}: {arguments.get('query') or ''}".rstrip())
     if name == "run_command":
-        return str(arguments.get("command") or "")
+        return _bounded_tool_text(arguments.get("command"))
     return ""
 
 
@@ -170,12 +159,7 @@ def _approval_call_id(item: Any, request_generation: int, index: int) -> str:
 
 
 def _redact_approval_text(value: str) -> str:
-    for pattern in _APPROVAL_SECRET_PATTERNS:
-        if pattern.groups:
-            value = pattern.sub(r"\1[REDACTED]", value)
-        else:
-            value = pattern.sub("[REDACTED]", value)
-    return value
+    return _redact_sensitive_text(value)
 
 
 def _bounded_approval_text(value: Any) -> str:
@@ -256,21 +240,93 @@ def _verification_evidence(command: str, output: str) -> VerificationEvidence:
     )
 
 
+_TOOL_DETAIL_MAX_CHARS = 240
+_TOOL_OUTPUT_MAX_CHARS = 4_000
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)([^\s,;]+)"),
-    re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[:=]\s*[\"']?)([^\s,;\"']+)"),
+    re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[:=]\s*[\"']?)([^\s,;\"']+)"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
 )
+_URL_USERINFO_PATTERN = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)([^\s/@:]+):[^\s/@]+@")
+
+
+def _redact_sensitive_text(value: str) -> str:
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups >= 2:
+            value = pattern.sub(r"\1[REDACTED]", value)
+        else:
+            value = pattern.sub("[REDACTED]", value)
+    return _URL_USERINFO_PATTERN.sub(r"\1[REDACTED]@", value)
+
+
+def _bounded_tool_text(value: Any, limit: int = _TOOL_DETAIL_MAX_CHARS) -> str:
+    text = _redact_sensitive_text(" ".join(str(value or "").split()))
+    return text if len(text) <= limit else f"{text[:limit - 1]}…"
+
+
+def _safe_tool_output(value: str, *, failed: bool) -> str:
+    if failed and "traceback (most recent call last):" in value.lower():
+        return "Tool diagnostic omitted."
+    value = _redact_sensitive_text(value)
+    return value if len(value) <= _TOOL_OUTPUT_MAX_CHARS else f"{value[:_TOOL_OUTPUT_MAX_CHARS - 1]}…"
+
+
+_UNKNOWN_TOOL_FAILURE = "The tool operation failed without a detailed diagnostic."
+
+
+def _failure_reason_text(value: str) -> str:
+    reason = _bounded_tool_text(value)
+    if not reason:
+        return _UNKNOWN_TOOL_FAILURE
+    if reason[-1] not in ".!?":
+        reason += "."
+    return reason[0].upper() + reason[1:]
+
+
+def _workspace_failure_reason(name: str, output: str) -> str | None:
+    prefixes = {
+        "read_file": "Error reading",
+        "write_file": "Error writing",
+        "replace_in_file": "Error replacing",
+        "list_directory": "Error listing",
+        "search_files": "Error searching",
+    }
+    prefix = prefixes.get(name)
+    if prefix is None:
+        return None
+    if output.startswith("Error: file does not exist:"):
+        return "File does not exist."
+    if output.startswith(f"{prefix}:"):
+        return _failure_reason_text(output[len(prefix) + 1 :])
+    pattern = re.compile(rf"^{re.escape(prefix)}\s+.+?:\s*(.+)$", re.DOTALL)
+    match = pattern.match(output)
+    if match is not None:
+        return _failure_reason_text(match.group(1))
+    if output.startswith("Error:"):
+        return _failure_reason_text(output.removeprefix("Error:"))
+    if output.startswith(prefix):
+        return _UNKNOWN_TOOL_FAILURE
+    return None
+
+
+def _tool_failure_reason(name: str, output: str, exit_code: int | None = None) -> str | None:
+    if "traceback (most recent call last):" in output.lower():
+        return _UNKNOWN_TOOL_FAILURE
+    if output.startswith("Permission denied:"):
+        return "Permission denied."
+    if name == "run_command":
+        if exit_code is not None:
+            return None if exit_code == 0 else f"Command exited with code {exit_code}."
+        for prefix in ("Error running command:", "Error:"):
+            if output.startswith(prefix):
+                return _failure_reason_text(output.removeprefix(prefix))
+        return _UNKNOWN_TOOL_FAILURE
+    return _workspace_failure_reason(name, output)
 
 
 def _debug_detail(exc: BaseException) -> str:
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else "request failed"
-    for pattern in _SECRET_PATTERNS:
-        if pattern.groups >= 2:
-            text = pattern.sub(r"\1[REDACTED]", text)
-        else:
-            text = pattern.sub("[REDACTED]", text)
-    return text
+    return _redact_sensitive_text(text)
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -822,15 +878,31 @@ class HansRuntime:
             return ()
         output = getattr(item, "output", "")
         rendered_output = output if isinstance(output, str) else str(output)
-        events: list[HansEvent] = [ToolOutput(call_id, rendered_output)]
         call = self._tool_calls.pop(call_id, None)
         if call is None:
-            return tuple(events)
+            return (
+                ToolOutput(
+                    call_id,
+                    _safe_tool_output(
+                        rendered_output,
+                        failed="traceback (most recent call last):" in rendered_output.lower(),
+                    ),
+                ),
+            )
         if call.name == "run_command":
             evidence = _verification_evidence(call.detail, rendered_output)
-            events.append(
-                ToolCompleted(call_id, call.name, call.detail, evidence.success, evidence.exit_code)
-            )
+            failure_reason = _tool_failure_reason(call.name, rendered_output, evidence.exit_code)
+            events: list[HansEvent] = [
+                ToolOutput(call_id, _safe_tool_output(rendered_output, failed=not evidence.success)),
+                ToolCompleted(
+                    call_id,
+                    call.name,
+                    call.detail,
+                    evidence.success,
+                    evidence.exit_code,
+                    failure_reason,
+                ),
+            ]
             if call.purpose == "verify":
                 self._evidence = evidence
                 if evidence.success:
@@ -838,8 +910,10 @@ class HansRuntime:
                 else:
                     events.append(VerificationFailed(call_id, evidence))
             return tuple(events)
-        success = not rendered_output.startswith(("Error:", "Permission denied:"))
+        failure_reason = _tool_failure_reason(call.name, rendered_output)
+        success = failure_reason is None
+        events = [ToolOutput(call_id, _safe_tool_output(rendered_output, failed=not success))]
         if call.name in {"write_file", "replace_in_file"} and success:
             self._evidence = None
-        events.append(ToolCompleted(call_id, call.name, call.detail, success))
+        events.append(ToolCompleted(call_id, call.name, call.detail, success, failure_reason=failure_reason))
         return tuple(events)

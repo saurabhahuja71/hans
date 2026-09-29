@@ -20,9 +20,9 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.0**.
+branding are HANS. Current release: **0.7.1**.
 
-## What 0.7.0 provides
+## What 0.7.1 provides
 
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
@@ -37,6 +37,8 @@ branding are HANS. Current release: **0.7.0**.
   applies it only to later requests. `/compact` remains unimplemented.
 - The `ask` permission policy pauses eligible tools for an explicit terminal approval. Approval prompts
   show bounded, redacted tool details rather than tool payloads.
+- Failed tool rows identify the safe operation/target and a bounded, redacted reason. HANS does not
+  automatically retry failed or denied tools; inspect output and submit a new task as needed.
 - `/help` is a local guide to configuration, session, safety, and workspace controls. In an idle
   Textual or curses composer, type `/` for bounded local command and argument suggestions, including
   `/exit` and `/quit`; use Up/Down and Enter or Tab to select, or Esc to dismiss. Configured model IDs

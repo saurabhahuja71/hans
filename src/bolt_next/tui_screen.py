@@ -90,8 +90,29 @@ def footer_text(
 
 def format_approval_request(tool_name: str, category: str, fields: tuple[tuple[str, str], ...]) -> str:
     details = "\n".join(f"{name}: {value}" for name, value in fields)
-    prompt = f"APPROVAL REQUIRED\nApprove {tool_name} ({category})? y / n"
+    prompt = f"APPROVAL REQUIRED\nApprove {human_tool_name(tool_name)} ({category})? y / n"
     return f"{prompt}\n{details}" if details else prompt
+
+
+def human_tool_name(name: str) -> str:
+    names = {
+        "read_file": "Read file",
+        "write_file": "Write file",
+        "replace_in_file": "Replace in file",
+        "list_directory": "List directory",
+        "search_files": "Search files",
+        "run_command": "Run command",
+    }
+    return names.get(name, name.replace("_", " ").strip().capitalize() or "Tool")
+
+
+def format_tool_label(name: str, detail: str = "") -> str:
+    label = human_tool_name(name)
+    return f"{label} {detail}".rstrip()
+
+
+def format_approval_denied(tool_name: str) -> str:
+    return f"APPROVAL\n✗ {human_tool_name(tool_name)} was not approved; it did not run."
 
 
 @dataclass
@@ -144,8 +165,13 @@ class Transcript:
         self._drop_status()
         self.pieces.append(Piece("tool", label, "run"))
 
-    def tool_finished(self, label: str, *, ok: bool) -> None:
-        self.pieces.append(Piece("tool", label, "ok" if ok else "fail"))
+    def tool_finished(self, label: str, *, ok: bool, reason: str = "") -> None:
+        fields = (("reason", reason),) if reason else ()
+        self.pieces.append(Piece("tool", label, "ok" if ok else "fail", fields))
+
+    def approval_denied(self, tool_name: str) -> None:
+        self._drop_status()
+        self.pieces.append(Piece("approval-denied", tool_name))
 
     def verification(self, command: str, *, ok: bool) -> None:
         marker = "passed" if ok else "failed"
@@ -207,7 +233,13 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
         return ["HANS", *_wrap(piece.text, width)]
     if piece.kind == "tool":
         mark = {"run": "◇", "ok": "✓", "fail": "✗"}.get(piece.detail, "◇")
-        return _wrap(f"{mark} TOOL {piece.text}", width, "  ")
+        rows = _wrap(f"{mark} TOOL {piece.text}", width, "  ")
+        reason = dict(piece.fields).get("reason", "")
+        if reason:
+            rows.extend(_wrap(f"Reason: {reason}", width, "    "))
+        return rows
+    if piece.kind == "approval-denied":
+        return _wrap(format_approval_denied(piece.text), width, "  ")
     if piece.kind == "verification":
         mark = "✓" if piece.detail == "passed" else "✗"
         return _wrap(f"VERIFICATION\n{mark} {piece.text} {piece.detail}", width, "  ")
