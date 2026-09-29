@@ -154,6 +154,36 @@ def test_curses_display_renders_tool_approval_and_approval_controls() -> None:
     )
 
 
+def test_curses_display_renders_external_access_approval_and_denial() -> None:
+    transcript = Transcript()
+    display = _Display(transcript)
+    path = "/actual/outside.txt"
+
+    display.event(
+        ToolApprovalRequested(
+            "request-1",
+            "call-1",
+            "read_file",
+            "read",
+            ToolApprovalDisplay((("path", path), ("scope", "outside workspace"))),
+            True,
+            path,
+        )
+    )
+    display.event(ToolApprovalResolved("request-1", "call-1", False))
+
+    rendered = "\n".join(transcript.render(120))
+    assert "EXTERNAL ACCESS REQUEST" in rendered
+    assert "Operation: Read file" in rendered
+    assert "Path: /actual/outside.txt" in rendered
+    assert "outside the current workspace" in rendered
+    assert "EXTERNAL ACCESS" in rendered
+    assert "Access denied" in rendered
+    assert "Reason: Path is outside the current workspace." in rendered
+    assert "No changes were made." in rendered
+    assert "APPROVAL REQUIRED" not in rendered
+
+
 @pytest.mark.parametrize(
     ("summary", "expected"),
     (

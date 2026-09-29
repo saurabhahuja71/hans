@@ -52,14 +52,14 @@ def configure_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOLT_MODEL_PROFILE_LARGE_REASONING_EFFORT", "none")
 
 
-def agent_for(profile, model: ScriptedModel, workspace: Path, journal) -> Agent:
+def agent_for(profile, model: ScriptedModel, workspace: Path, journal, authorizer) -> Agent:
     effort = profile.reasoning_effort
     return Agent(
         name=f"{profile.info.id} test agent",
         instructions="Use the provided tools.",
         model=model,
         model_settings=ModelSettings(reasoning=Reasoning(effort=effort) if effort else None),
-        tools=[make_write_file_tool(workspace, journal)],
+        tools=[make_write_file_tool(workspace, journal, authorizer=authorizer)],
     )
 
 
@@ -77,8 +77,8 @@ def test_switch_starts_clean_sqlite_session_without_history_migration_and_clear_
         ),
     }
 
-    def factory(workspace, *, journal, profile):
-        return agent_for(profile, models[profile.info.id], workspace, journal)
+    def factory(workspace, *, journal, profile, authorizer):
+        return agent_for(profile, models[profile.info.id], workspace, journal, authorizer)
 
     old_session = SQLiteSession("switch-history-old")
     runtime = HansRuntime(
@@ -152,10 +152,10 @@ def test_failed_switch_is_atomic_and_old_runtime_can_still_submit(
     old_agent = Agent(name="old", instructions="Answer.", model=old_model)
     old_session = SQLiteSession(f"switch-atomic-{failure}")
 
-    def agent_factory(workspace, *, journal, profile):
+    def agent_factory(workspace, *, journal, profile, authorizer):
         if failure == "agent":
             raise RuntimeError("api_key=must-not-leak")
-        return agent_for(profile, ScriptedModel([ModelStep(output=[assistant_message("unused")])]), workspace, journal)
+        return agent_for(profile, ScriptedModel([ModelStep(output=[assistant_message("unused")])]), workspace, journal, authorizer)
 
     def session_factory(session_id: str):
         if failure == "session":
@@ -212,8 +212,8 @@ def test_switch_binds_profile_context_resets_mode_and_reports_catalog(
             self.configs.append(run_config)
             return Result()
 
-    def factory(workspace, *, journal, profile):
-        return agent_for(profile, ScriptedModel([]), workspace, journal)
+    def factory(workspace, *, journal, profile, authorizer):
+        return agent_for(profile, ScriptedModel([]), workspace, journal, authorizer)
 
     runner = Runner()
     session = SQLiteSession("switch-context-mode")
@@ -252,9 +252,9 @@ def test_permission_policy_wraps_target_tools_after_switch(monkeypatch: pytest.M
         ]
     )
 
-    def factory(workspace, *, journal, profile):
+    def factory(workspace, *, journal, profile, authorizer):
         model = large_model if profile.info.id == "large" else ScriptedModel([])
-        return agent_for(profile, model, workspace, journal)
+        return agent_for(profile, model, workspace, journal, authorizer)
 
     old_session = SQLiteSession("switch-permissions-old")
     runtime = HansRuntime(workspace=str(tmp_path), session=old_session, agent_factory=factory)
@@ -288,8 +288,8 @@ def test_selection_is_rejected_while_busy_and_works_after_cancellation_settles(
         def run_streamed(self, *_args, **_kwargs):
             return BlockedResult()
 
-    def factory(workspace, *, journal, profile):
-        return agent_for(profile, ScriptedModel([]), workspace, journal)
+    def factory(workspace, *, journal, profile, authorizer):
+        return agent_for(profile, ScriptedModel([]), workspace, journal, authorizer)
 
     async def scenario():
         old_session = SQLiteSession("switch-busy-old")

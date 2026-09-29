@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agents import function_tool
+from agents.tool_context import ToolContext
 
 from bolt_next.context_budget import estimate_tokens, tool_result_token_budget
 
@@ -245,6 +246,113 @@ def resolve_workspace_path(workspace: Path, path: str) -> Path:
     return candidate
 
 
+@dataclass(frozen=True)
+class ExternalPathAccess:
+    tool_name: str
+    call_id: str
+    path: Path
+    display_path: str
+
+
+class ExternalPathAuthorizer:
+    """Holds exact, one-use approvals for filesystem targets outside the workspace."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = resolve_workspace(workspace)
+        self._proposals: dict[tuple[str, str], ExternalPathAccess] = {}
+        self._grants: dict[tuple[str, str], ExternalPathAccess] = {}
+
+    def classify(self, path: str, *, mutation: bool = False) -> tuple[Path, bool]:
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise WorkspaceError("Path must be a non-empty relative path")
+        candidate = Path(path).expanduser()
+        target = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute()
+            else (self.workspace / candidate).resolve(strict=False)
+        )
+        try:
+            target.relative_to(self.workspace)
+        except ValueError:
+            return target, True
+        return target, False
+
+    def propose(self, tool_name: str, call_id: str, path: str, *, mutation: bool = False) -> ExternalPathAccess | None:
+        target, external = self.classify(path, mutation=mutation)
+        if not external:
+            return None
+        access = ExternalPathAccess(tool_name, call_id, target, path)
+        self._proposals[(tool_name, call_id)] = access
+        return access
+
+    def proposal_for(self, tool_name: str, call_id: str) -> ExternalPathAccess | None:
+        return self._proposals.get((tool_name, call_id))
+
+    def approve_exact(self, tool_name: str, call_id: str) -> ExternalPathAccess | None:
+        key = (tool_name, call_id)
+        access = self._proposals.pop(key, None)
+        if access is not None:
+            self._grants[key] = access
+        return access
+
+    def revoke(self, tool_name: str, call_id: str) -> None:
+        key = (tool_name, call_id)
+        self._proposals.pop(key, None)
+        self._grants.pop(key, None)
+
+    def clear(self) -> None:
+        self._proposals.clear()
+        self._grants.clear()
+
+    def consume_target(
+        self,
+        context: ToolContext,
+        tool_name: str,
+        path: str,
+        *,
+        mutation: bool = False,
+    ) -> tuple[Path, bool]:
+        call_id = getattr(context, "tool_call_id", None)
+        if not isinstance(call_id, str) or not call_id:
+            raise WorkspaceError("External path requires approval")
+        target, external = self.classify(path, mutation=mutation)
+        key = (tool_name, call_id)
+        granted = self._grants.get(key)
+        if not external:
+            if granted is not None:
+                self._grants.pop(key, None)
+                raise WorkspaceError("External path requires approval")
+            return target, False
+        if granted is None or granted.path != target:
+            self._grants.pop(key, None)
+            raise WorkspaceError("External path requires approval")
+        self._grants.pop(key, None)
+        return target, True
+
+
+def _tool_target(
+    workspace: Path,
+    authorizer: ExternalPathAuthorizer | None,
+    context: ToolContext,
+    tool_name: str,
+    path: str,
+    *,
+    mutation: bool = False,
+) -> tuple[Path, bool]:
+    if authorizer is None:
+        target = resolve_workspace_path(workspace, path)
+        return target, False
+    return authorizer.consume_target(context, tool_name, path, mutation=mutation)
+
+
+def _revalidate_external_write_target(target: Path) -> None:
+    if target.resolve(strict=False) != target or target.parent.resolve(strict=False) != target.parent:
+        raise WorkspaceError("External path changed before it could be written")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.resolve(strict=False) != target or target.parent.resolve(strict=False) != target.parent:
+        raise WorkspaceError("External path changed before it could be written")
+
+
 def _range_result(path: str, lines: list[str], start_line: int, end_line: int) -> str:
     total = len(lines)
     body = "\n".join(lines[start_line - 1 : end_line])
@@ -295,22 +403,27 @@ def _fitting_end(
     return best
 
 
-def make_read_file_tool(workspace: Path, *, context_tokens: int | None = None):
+def make_read_file_tool(
+    workspace: Path,
+    *,
+    context_tokens: int | None = None,
+    authorizer: ExternalPathAuthorizer | None = None,
+):
     @function_tool
-    async def read_file(path: str, start_line: int = 1, end_line: int = 0) -> str:
-        """Read a UTF-8 text file inside the workspace.
+    async def read_file(context: ToolContext, path: str, start_line: int = 1, end_line: int = 0) -> str:
+        """Read a UTF-8 text file inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
 
         Small files are returned in full. A large file is returned as an explicit
         line range, never as a summary. Use start_line and end_line to inspect
         another range. end_line 0 means "as far as the context budget allows".
 
         Args:
-            path: A relative path from the workspace root.
+            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
             start_line: First line to return, starting at 1.
             end_line: Last line to return, inclusive. 0 selects a budget-sized range.
         """
         try:
-            target = resolve_workspace_path(workspace, path)
+            target, _external = _tool_target(workspace, authorizer, context, "read_file", path)
             if target.is_dir():
                 return f"Error reading {path!r}: path is a directory; use list_directory instead"
             if not target.is_file():
@@ -362,23 +475,32 @@ def make_read_file_tool(workspace: Path, *, context_tokens: int | None = None):
     return read_file
 
 
-def make_write_file_tool(workspace: Path, journal: object | None = None):
+def make_write_file_tool(
+    workspace: Path,
+    journal: object | None = None,
+    *,
+    authorizer: ExternalPathAuthorizer | None = None,
+):
     @function_tool
-    async def write_file(path: str, content: str) -> str:
-        """Create or replace a UTF-8 text file inside the workspace.
+    async def write_file(context: ToolContext, path: str, content: str) -> str:
+        """Create or replace a UTF-8 text file inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
 
         Args:
-            path: A relative path from the workspace root.
+            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
             content: The full file contents to write.
         """
         try:
-            target = resolve_workspace_path(workspace, path)
-            original = _prepare_journal_mutation(journal, target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.parent.resolve().is_relative_to(workspace):
-                return f"Error writing {path!r}: Path is outside the workspace"
+            target, external = _tool_target(workspace, authorizer, context, "write_file", path, mutation=True)
+            original = None if external else _prepare_journal_mutation(journal, target)
+            if external:
+                _revalidate_external_write_target(target)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.parent.resolve().is_relative_to(workspace):
+                    return f"Error writing {path!r}: Path is outside the workspace"
             target.write_text(content, encoding="utf-8")
-            _record_journal_mutation(journal, target, original)
+            if not external:
+                _record_journal_mutation(journal, target, original)
             return f"Wrote {path} ({len(content.encode('utf-8'))} bytes)"
         except (OSError, UnicodeError, WorkspaceError) as exc:
             return f"Error writing {path!r}: {exc}"
@@ -438,39 +560,45 @@ def _search_match_line(path: Path, line_number: int, line: str, *, context_token
     return prefix + line[:maximum_line_length] + suffix
 
 
-def _search_candidates(workspace: Path, target: Path):
+def _search_candidates(root: Path, target: Path, *, skip_ignored_root: bool = False):
     if target.is_file():
         yield target
         return
     try:
-        if any(part in _SEARCH_IGNORED_DIRECTORIES for part in target.relative_to(workspace).parts):
-            return
+        relative_target = target.relative_to(root)
     except ValueError:
+        return
+    if skip_ignored_root and any(part in _SEARCH_IGNORED_DIRECTORIES for part in relative_target.parts):
         return
     for candidate in sorted(target.iterdir(), key=lambda entry: entry.name):
         try:
-            candidate.resolve().relative_to(workspace)
+            candidate.resolve().relative_to(root)
         except (OSError, ValueError):
             continue
         if candidate.is_symlink() and candidate.is_dir():
             continue
         if candidate.is_dir():
             if candidate.name not in _SEARCH_IGNORED_DIRECTORIES:
-                yield from _search_candidates(workspace, candidate)
+                yield from _search_candidates(root, candidate)
         elif candidate.is_file():
             yield candidate
 
 
-def make_list_directory_tool(workspace: Path, *, context_tokens: int | None = None):
+def make_list_directory_tool(
+    workspace: Path,
+    *,
+    context_tokens: int | None = None,
+    authorizer: ExternalPathAuthorizer | None = None,
+):
     @function_tool
-    async def list_directory(path: str = ".") -> str:
-        """List direct workspace-directory entries in sorted order.
+    async def list_directory(context: ToolContext, path: str = ".") -> str:
+        """List direct directory entries in sorted order inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
 
         Args:
-            path: A relative directory path from the workspace root.
+            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
         """
         try:
-            target = resolve_workspace_path(workspace, path)
+            target, _external = _tool_target(workspace, authorizer, context, "list_directory", path)
             if target.is_file():
                 return f"Error listing {path!r}: path is a file; use read_file instead"
             if not target.is_dir():
@@ -493,17 +621,23 @@ def make_list_directory_tool(workspace: Path, *, context_tokens: int | None = No
     return list_directory
 
 
-def make_search_files_tool(workspace: Path, *, context_tokens: int | None = None):
+def make_search_files_tool(
+    workspace: Path,
+    *,
+    context_tokens: int | None = None,
+    authorizer: ExternalPathAuthorizer | None = None,
+):
     @function_tool
-    async def search_files(query: str, path: str = ".", max_results: int = 50) -> str:
-        """Search UTF-8 text files in the workspace and return matching path:line text.
+    async def search_files(context: ToolContext, query: str, path: str = ".", max_results: int = 50) -> str:
+        """Search UTF-8 text files and return matching path:line text.
 
+        The path is inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
         Binary and unreadable files are skipped. Results are sorted and constrained by both
         max_results and the tool result context budget.
 
         Args:
             query: Literal text to find. It must not be empty.
-            path: A relative file or directory path from the workspace root.
+            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
             max_results: Maximum matching lines to return, from 1 through 100.
         """
         if not query:
@@ -511,13 +645,15 @@ def make_search_files_tool(workspace: Path, *, context_tokens: int | None = None
         if max_results < 1 or max_results > 100:
             return "Error searching: max_results must be between 1 and 100"
         try:
-            target = resolve_workspace_path(workspace, path)
+            target, external = _tool_target(workspace, authorizer, context, "search_files", path)
             if not target.exists():
                 return f"Error searching {path!r}: path does not exist"
+            search_root = target if external else workspace
+            display_root = target if external and target.is_dir() else target.parent if external else workspace
             matches: list[str] = []
-            for candidate in _search_candidates(workspace, target):
+            for candidate in _search_candidates(search_root, target, skip_ignored_root=not external):
                 try:
-                    relative = candidate.relative_to(workspace)
+                    relative = candidate.relative_to(display_root)
                     file_matches: list[str] = []
                     binary = False
                     with candidate.open(encoding="utf-8") as source:
@@ -544,23 +680,30 @@ def make_search_files_tool(workspace: Path, *, context_tokens: int | None = None
     return search_files
 
 
-def make_replace_in_file_tool(workspace: Path, journal: object | None = None):
+def make_replace_in_file_tool(
+    workspace: Path,
+    journal: object | None = None,
+    *,
+    authorizer: ExternalPathAuthorizer | None = None,
+):
     @function_tool
-    async def replace_in_file(path: str, old_text: str, new_text: str) -> str:
-        """Replace exactly one literal text occurrence in an existing UTF-8 workspace file.
+    async def replace_in_file(context: ToolContext, path: str, old_text: str, new_text: str) -> str:
+        """Replace exactly one literal text occurrence in an existing UTF-8 file inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
 
         Args:
-            path: A relative file path from the workspace root.
+            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
             old_text: Existing text that must occur exactly once.
             new_text: Replacement text.
         """
         if not old_text:
             return "Error replacing: old_text must be a non-empty string"
         try:
-            target = resolve_workspace_path(workspace, path)
+            target, external = _tool_target(workspace, authorizer, context, "replace_in_file", path)
             if not target.is_file():
                 return f"Error replacing {path!r}: file does not exist"
-            original = _prepare_journal_mutation(journal, target)
+            if external:
+                _revalidate_external_write_target(target)
+            original = None if external else _prepare_journal_mutation(journal, target)
             source_stat = target.stat()
             text = target.read_text(encoding="utf-8")
             occurrences = text.count(old_text)
@@ -586,7 +729,8 @@ def make_replace_in_file_tool(workspace: Path, journal: object | None = None):
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
-            _record_journal_mutation(journal, target, original)
+            if not external:
+                _record_journal_mutation(journal, target, original)
             return f"Replaced text in {path}"
         except (OSError, UnicodeError, WorkspaceError) as exc:
             return f"Error replacing {path!r}: {exc}"

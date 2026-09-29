@@ -25,7 +25,7 @@ from bolt_next.model_catalog import (
     configured_model_profile,
     configured_model_profiles,
 )
-from bolt_next.workspace import TaskMutationJournal, resolve_workspace
+from bolt_next.workspace import ExternalPathAuthorizer, TaskMutationJournal, resolve_workspace
 from bolt_next.events import (
     AssistantMessageComplete,
     AssistantMessageDelta,
@@ -82,6 +82,8 @@ class _PendingApproval:
     session: Any
     model_generation: int
     session_generation: int
+    external: bool = False
+    external_path: str | None = None
 
 
 _TOOL_CATEGORIES = {
@@ -386,6 +388,7 @@ class HansRuntime:
         # Python traceback before the user sees HANS.
         self._agent = agent
         self._workspace = resolve_workspace(workspace or os.environ.get("BOLT_WORKSPACE"))
+        self._external_path_authorizer = ExternalPathAuthorizer(self._workspace)
         self._journal = TaskMutationJournal(self._workspace)
         self._agent_factory = agent_factory or create_agent
         self._session_factory = session_factory or SQLiteSession
@@ -411,7 +414,7 @@ class HansRuntime:
         self._reasoning_mode_override: str | None = None
         self._base_model_settings: Any | None = None
         if self._agent is not None:
-            apply_tool_permission_policy(self._agent, self._permission_allowed)
+            apply_tool_permission_policy(self._agent, self._permission_allowed, authorizer=self._external_path_authorizer)
             self._snapshot_model_settings()
 
     def get_control_status(self) -> RuntimeControlStatus:
@@ -488,10 +491,15 @@ class HansRuntime:
 
         target_session: Any | None = None
         try:
-            target_agent = self._agent_factory(self._workspace, journal=self._journal, profile=target_profile)
+            target_agent = self._agent_factory(
+                self._workspace,
+                journal=self._journal,
+                profile=target_profile,
+                authorizer=self._external_path_authorizer,
+            )
             if target_agent is None:
                 raise RuntimeError("target agent is unavailable")
-            apply_tool_permission_policy(target_agent, self._permission_allowed)
+            apply_tool_permission_policy(target_agent, self._permission_allowed, authorizer=self._external_path_authorizer)
             target_base_settings = self._model_settings_snapshot(target_agent)
             target_context_filter = make_fit_model_input(target_profile.info.context_tokens)
             target_session = self._session_factory(self._new_session_id())
@@ -506,6 +514,7 @@ class HansRuntime:
             return RuntimeControlRejected("Unable to start the selected model.")
 
         previous_model_id = current_profile.info.id
+        self._external_path_authorizer.clear()
         previous_session = self._session
         previous_session_owned = self._owns_session
         self._profile = target_profile
@@ -574,6 +583,7 @@ class HansRuntime:
         if self._session is None:
             return RuntimeControlRejected("The session is unavailable.")
         await self._session.clear_session()
+        self._external_path_authorizer.clear()
         self._session_generation += 1
         return SessionCleared()
 
@@ -582,6 +592,7 @@ class HansRuntime:
 
     def _invalidate_pending_approvals(self) -> None:
         self._pending_approvals.clear()
+        self._external_path_authorizer.clear()
 
     def cancel_active(self) -> RequestCancelled | None:
         if not self._request_active:
@@ -639,20 +650,34 @@ class HansRuntime:
             tool_name = _member(item, "tool_name") or _member(item, "name") or _member(raw_item, "name") or "tool"
             tool_name = tool_name if isinstance(tool_name, str) and tool_name else "tool"
             arguments = _call_arguments(item)
+            call_id = _approval_call_id(item, self._request_generation, index)
+            access = self._external_path_authorizer.proposal_for(tool_name, call_id)
+            external_path = _bounded_approval_text(access.display_path) if access is not None else None
+            display = _approval_display(tool_name, arguments)
+            if external_path is not None:
+                display = ToolApprovalDisplay(
+                    tuple(
+                        (name, external_path if name == "path" else value)
+                        for name, value in display.fields
+                    )
+                    + (("scope", "outside workspace"),)
+                )
             pending.append(
                 _PendingApproval(
                     request_id=request_id,
-                    call_id=_approval_call_id(item, self._request_generation, index),
+                    call_id=call_id,
                     item=item,
                     state=state,
                     tool_name=tool_name,
                     category=_TOOL_CATEGORIES.get(tool_name, "execute"),
-                    display=_approval_display(tool_name, arguments),
+                    display=display,
                     request_generation=self._request_generation,
                     agent=self._agent,
                     session=self._session,
                     model_generation=self._model_generation,
                     session_generation=self._session_generation,
+                    external=access is not None,
+                    external_path=external_path,
                 )
             )
         self._pending_approvals = pending
@@ -666,6 +691,8 @@ class HansRuntime:
             pending.tool_name,
             pending.category,
             pending.display,
+            pending.external,
+            pending.external_path,
         )
 
     def _approval_context_is_current(self, pending: _PendingApproval) -> bool:
@@ -712,6 +739,7 @@ class HansRuntime:
                 yield approval_event
                 return
             for pending in self._pending_approvals:
+                self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
                 pending.state.reject(pending.item)
             state = self._pending_approvals[0].state
             self._invalidate_pending_approvals()
@@ -765,8 +793,17 @@ class HansRuntime:
             yield RequestStarted(message)
             profile = self._active_profile()
             if self._agent is None:
-                self._agent = self._agent_factory(self._workspace, journal=self._journal, profile=profile)
-                apply_tool_permission_policy(self._agent, self._permission_allowed)
+                self._agent = self._agent_factory(
+                    self._workspace,
+                    journal=self._journal,
+                    profile=profile,
+                    authorizer=self._external_path_authorizer,
+                )
+                apply_tool_permission_policy(
+                    self._agent,
+                    self._permission_allowed,
+                    authorizer=self._external_path_authorizer,
+                )
                 self._snapshot_model_settings()
             self._apply_effective_model_settings()
             result = self._runner.run_streamed(
@@ -803,11 +840,25 @@ class HansRuntime:
             yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
             return
         try:
+            granted = False
             if approved:
-                pending.state.approve(pending.item)
+                if pending.external:
+                    if self._external_path_authorizer.approve_exact(pending.tool_name, pending.call_id) is None:
+                        yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                        return
+                    granted = True
+                try:
+                    pending.state.approve(pending.item)
+                except Exception:
+                    if granted:
+                        self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
+                    raise
             else:
+                self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
                 pending.state.reject(pending.item)
             if not self._approval_is_current(pending, request_id, call_id):
+                if granted:
+                    self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
                 yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
                 return
             self._pending_approvals.pop(0)

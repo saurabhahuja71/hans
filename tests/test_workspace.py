@@ -1,10 +1,15 @@
+import asyncio
+import inspect
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
+from agents.tool_context import ToolContext
 
 from bolt_next.context_budget import estimate_tokens, tool_result_token_budget
 from bolt_next.workspace import (
+    ExternalPathAuthorizer,
     TaskMutationJournal,
     WorkspaceError,
     _bounded_lines,
@@ -17,12 +22,19 @@ from bolt_next.workspace import (
     reject_shell_syntax,
     resolve_workspace_path,
 )
-import json
 
 
-def invoke(tool, arguments: str):
+def invoke(tool, arguments: str, *, call_id: str = "test-call"):
     # The SDK invokes this wrapped function after parsing the structured JSON arguments.
-    return __import__("asyncio").run(tool.__wrapped__(**json.loads(arguments)))
+    kwargs = json.loads(arguments)
+    if "context" in inspect.signature(tool.__wrapped__).parameters:
+        kwargs["context"] = ToolContext(
+            None,
+            tool_name=tool.name,
+            tool_call_id=call_id,
+            tool_arguments=arguments,
+        )
+    return asyncio.run(tool.__wrapped__(**kwargs))
 
 
 def test_workspace_path_validation(tmp_path: Path) -> None:
@@ -44,6 +56,128 @@ def test_read_file_missing_file(tmp_path: Path) -> None:
 def test_path_traversal_rejected(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceError):
         resolve_workspace_path(tmp_path, "../secret.txt")
+
+
+def test_external_read_requires_exact_one_use_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external-read.txt"
+    other = tmp_path.parent / f"{tmp_path.name}-other-read.txt"
+    outside.write_text("approved contents", encoding="utf-8")
+    other.write_text("other contents", encoding="utf-8")
+    authorizer = ExternalPathAuthorizer(tmp_path)
+    tool = make_read_file_tool(tmp_path, authorizer=authorizer)
+    arguments = json.dumps({"path": str(outside)})
+
+    assert "External path requires approval" in invoke(tool, arguments, call_id="external-read")
+
+    proposal = authorizer.propose("read_file", "external-read", str(outside))
+    assert proposal is not None
+    assert proposal.path == outside.resolve()
+    assert authorizer.approve_exact("read_file", "external-read") == proposal
+    assert invoke(tool, arguments, call_id="external-read") == "approved contents"
+    assert "External path requires approval" in invoke(tool, arguments, call_id="external-read")
+
+    assert authorizer.propose("read_file", "exact-target", str(outside)) is not None
+    assert authorizer.approve_exact("read_file", "exact-target") is not None
+    assert "External path requires approval" in invoke(
+        tool, json.dumps({"path": str(other)}), call_id="exact-target"
+    )
+
+    missing = tmp_path.parent / f"{tmp_path.name}-missing-external-read.txt"
+    missing_arguments = json.dumps({"path": str(missing)})
+    assert authorizer.propose("read_file", "missing-target", str(missing)) is not None
+    assert authorizer.approve_exact("read_file", "missing-target") is not None
+    assert "does not exist" in invoke(tool, missing_arguments, call_id="missing-target")
+
+
+def test_external_traversal_and_symlink_paths_are_proposed_and_require_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("approved contents", encoding="utf-8")
+    authorizer = ExternalPathAuthorizer(tmp_path)
+    tool = make_read_file_tool(tmp_path, authorizer=authorizer)
+
+    traversal = f"../{outside.name}"
+    symlink = tmp_path / "external-link.txt"
+    symlink.symlink_to(outside)
+    for call_id, entered_path in (("traversal", traversal), ("symlink", symlink.name)):
+        arguments = json.dumps({"path": entered_path})
+        assert "External path requires approval" in invoke(tool, arguments, call_id=call_id)
+        proposal = authorizer.propose("read_file", call_id, entered_path)
+        assert proposal is not None
+        assert proposal.path == outside.resolve()
+        assert proposal.display_path == entered_path
+        assert authorizer.approve_exact("read_file", call_id) == proposal
+        assert invoke(tool, arguments, call_id=call_id) == "approved contents"
+
+
+def test_every_filesystem_tool_requires_an_exact_external_grant(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external"
+    outside.mkdir()
+    (outside / "read.txt").write_text("needle", encoding="utf-8")
+    (outside / "replace.txt").write_text("old", encoding="utf-8")
+    authorizer = ExternalPathAuthorizer(tmp_path)
+    cases = (
+        ("read_file", make_read_file_tool(tmp_path, authorizer=authorizer), {"path": str(outside / "read.txt")}, "needle"),
+        (
+            "list_directory",
+            make_list_directory_tool(tmp_path, authorizer=authorizer),
+            {"path": str(outside)},
+            "file: read.txt",
+        ),
+        (
+            "search_files",
+            make_search_files_tool(tmp_path, authorizer=authorizer),
+            {"path": str(outside), "query": "needle"},
+            "read.txt:1: needle",
+        ),
+        (
+            "write_file",
+            make_write_file_tool(tmp_path, authorizer=authorizer),
+            {"path": str(outside / "written.txt"), "content": "written"},
+            "Wrote",
+        ),
+        (
+            "replace_in_file",
+            make_replace_in_file_tool(tmp_path, authorizer=authorizer),
+            {"path": str(outside / "replace.txt"), "old_text": "old", "new_text": "new"},
+            "Replaced",
+        ),
+    )
+
+    for tool_name, tool, arguments, expected in cases:
+        call_id = f"external-{tool_name}"
+        encoded = json.dumps(arguments)
+        assert "External path requires approval" in invoke(tool, encoded, call_id=call_id)
+        if tool_name == "write_file":
+            assert not (outside / "written.txt").exists()
+        if tool_name == "replace_in_file":
+            assert (outside / "replace.txt").read_text(encoding="utf-8") == "old"
+        proposal = authorizer.propose(
+            tool_name, call_id, arguments["path"], mutation=tool_name in {"write_file", "replace_in_file"}
+        )
+        assert proposal is not None
+        assert authorizer.approve_exact(tool_name, call_id) == proposal
+        assert expected in invoke(tool, encoded, call_id=call_id)
+
+    assert (outside / "written.txt").read_text(encoding="utf-8") == "written"
+    assert (outside / "replace.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_external_write_is_excluded_from_the_task_journal(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external-write.txt"
+    journal = TaskMutationJournal(tmp_path)
+    authorizer = ExternalPathAuthorizer(tmp_path)
+    tool = make_write_file_tool(tmp_path, journal, authorizer=authorizer)
+    arguments = json.dumps({"path": str(outside), "content": "external change"})
+
+    assert "External path requires approval" in invoke(tool, arguments, call_id="external-write")
+    assert not outside.exists()
+    assert authorizer.propose("write_file", "external-write", str(outside), mutation=True) is not None
+    assert authorizer.approve_exact("write_file", "external-write") is not None
+
+    assert "Wrote" in invoke(tool, arguments, call_id="external-write")
+    assert outside.read_text(encoding="utf-8") == "external change"
+    assert journal.summary()["changed_files"] == []
+    assert journal.unified_diff() == ""
 
 
 def test_write_file_creates_file(tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
 import inspect
+import json
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +12,7 @@ from bolt_next.context_budget import completion_token_reserve
 from bolt_next.errors import ConfigurationError
 from bolt_next.model_catalog import ConfiguredModelProfile, configured_model_profile
 from bolt_next.workspace import (
+    ExternalPathAuthorizer,
     TaskMutationJournal,
     make_list_directory_tool,
     make_read_file_tool,
@@ -32,10 +34,28 @@ _TOOL_PERMISSION_GROUPS = {
 }
 
 
-def apply_tool_permission_policy(agent: Agent, get_policy: Callable[[str], str]) -> None:
+def _external_path_argument(arguments: object) -> str | None:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    path = arguments.get("path")
+    return path if isinstance(path, str) else None
+
+
+def apply_tool_permission_policy(
+    agent: Agent,
+    get_policy: Callable[[str], str],
+    *,
+    authorizer: ExternalPathAuthorizer | None = None,
+) -> None:
     """Install runtime-owned dynamic policy hooks on HANS workspace tools."""
     for tool in getattr(agent, "tools", ()):
-        category = _TOOL_PERMISSION_GROUPS.get(getattr(tool, "name", ""))
+        tool_name = getattr(tool, "name", "")
+        category = _TOOL_PERMISSION_GROUPS.get(tool_name)
         if category is None:
             continue
         original_invoke = getattr(tool, "_hans_original_invoke", None)
@@ -56,10 +76,30 @@ def apply_tool_permission_policy(agent: Agent, get_policy: Callable[[str], str])
 
             async def needs_approval(context, arguments, call_id, *, tool=tool, category=category):
                 policy = getattr(tool, "_hans_get_policy")(category)
-                if policy == "ask":
-                    return True
                 if policy == "deny":
                     return False
+                tool_name = getattr(tool, "name", "")
+                path = _external_path_argument(arguments)
+                active_authorizer = getattr(tool, "_hans_authorizer", None)
+                if (
+                    active_authorizer is not None
+                    and tool_name in {"read_file", "list_directory", "search_files", "write_file", "replace_in_file"}
+                    and isinstance(call_id, str)
+                    and path is not None
+                ):
+                    try:
+                        proposal = active_authorizer.propose(
+                            tool_name,
+                            call_id,
+                            path,
+                            mutation=tool_name in {"write_file", "replace_in_file"},
+                        )
+                    except (OSError, ValueError):
+                        proposal = None
+                    if proposal is not None:
+                        return True
+                if policy == "ask":
+                    return True
                 original = getattr(tool, "_hans_original_needs_approval")
                 if isinstance(original, bool):
                     return original
@@ -69,6 +109,7 @@ def apply_tool_permission_policy(agent: Agent, get_policy: Callable[[str], str])
             tool.on_invoke_tool = invoke
             tool.needs_approval = needs_approval
         setattr(tool, "_hans_get_policy", get_policy)
+        setattr(tool, "_hans_authorizer", authorizer)
 
 
 STAGE_4_INSTRUCTIONS = (
@@ -88,7 +129,8 @@ STAGE_4_INSTRUCTIONS = (
     "cannot run, say why. Final responses must be concise and state changes, verification evidence, "
     "and remaining limits. Use list_directory and search_files to discover files, read_file to inspect "
     "them, replace_in_file for one precise edit, write_file only to create or replace an entire file, "
-    "and run_command for a direct workspace command. Do not invent patch syntax. When read_file "
+    "and run_command for a direct workspace command. Any filesystem path that resolves outside the workspace "
+    "requires explicit approval for that exact tool call. Do not invent patch syntax. When read_file "
     "reports remaining_ranges, request the next start_line instead of assuming the rest of the file."
 )
 
@@ -155,6 +197,7 @@ def create_agent(
     *,
     journal: TaskMutationJournal | None = None,
     profile: ConfiguredModelProfile | str | None = None,
+    authorizer: ExternalPathAuthorizer | None = None,
 ) -> Agent:
     """Build the Hans agent using the selected OpenAI-compatible model profile."""
     selected_profile = _selected_profile(profile)
@@ -180,11 +223,11 @@ def create_agent(
         model=model,
         model_settings=_model_settings(selected_profile),
         tools=[
-            make_list_directory_tool(root, context_tokens=context_tokens),
-            make_search_files_tool(root, context_tokens=context_tokens),
-            make_read_file_tool(root, context_tokens=context_tokens),
-            make_replace_in_file_tool(root, journal),
-            make_write_file_tool(root, journal),
+            make_list_directory_tool(root, context_tokens=context_tokens, authorizer=authorizer),
+            make_search_files_tool(root, context_tokens=context_tokens, authorizer=authorizer),
+            make_read_file_tool(root, context_tokens=context_tokens, authorizer=authorizer),
+            make_replace_in_file_tool(root, journal, authorizer=authorizer),
+            make_write_file_tool(root, journal, authorizer=authorizer),
             make_run_command_tool(root, context_tokens=context_tokens),
         ],
     )

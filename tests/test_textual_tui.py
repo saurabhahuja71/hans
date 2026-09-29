@@ -205,6 +205,27 @@ def test_textual_chrome_is_compact_data_driven_and_preserves_composer_keys(tmp_p
     asyncio.run(scenario())
 
 
+def test_textual_enter_on_empty_composer_neither_exits_nor_submits(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            composer = app.query_one("#composer", TextArea)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert runtime.prompts == []
+            assert composer.text == ""
+
+            await pilot.press(*"still open", "enter")
+            await pilot.pause()
+            assert runtime.prompts == ["still open"]
+            assert composer.text == ""
+
+        assert runtime.closed == 1
+
+    asyncio.run(scenario())
+
+
 def test_empty_exit_and_ctrl_q_do_not_submit(tmp_path: Path) -> None:
     async def scenario(keys: tuple[str, ...]) -> None:
         runtime = FakeRuntime()
@@ -289,9 +310,24 @@ def test_textual_theme_and_todo_shortcuts_do_not_bypass_active_or_approval_input
 
 
 def approval_event(
-    request_id: str, call_id: str, tool_name: str, category: str, fields: tuple[tuple[str, str], ...] = ()
+    request_id: str,
+    call_id: str,
+    tool_name: str,
+    category: str,
+    fields: tuple[tuple[str, str], ...] = (),
+    *,
+    external: bool = False,
+    external_path: str | None = None,
 ) -> ToolApprovalRequested:
-    return ToolApprovalRequested(request_id, call_id, tool_name, category, ToolApprovalDisplay(fields))
+    return ToolApprovalRequested(
+        request_id,
+        call_id,
+        tool_name,
+        category,
+        ToolApprovalDisplay(fields),
+        external,
+        external_path,
+    )
 
 
 @pytest.mark.parametrize(("key", "approved"), (("y", True), ("n", False)))
@@ -331,6 +367,47 @@ def test_textual_resolves_tool_approval_without_leaving_a_stale_prompt(
             assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
             if not approved:
                 assert "Write file was not approved; it did not run." in transcript_text(app)
+
+    asyncio.run(scenario())
+
+
+def test_textual_renders_external_access_approval_and_denial(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.approval_events = [ToolApprovalResolved("request-1", "call-1", False), RequestCompleted(None)]
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(
+                approval_event(
+                    "request-1",
+                    "call-1",
+                    "read_file",
+                    "read",
+                    (("path", "/actual/outside.txt"), ("scope", "outside workspace")),
+                    external=True,
+                    external_path="/actual/outside.txt",
+                )
+            )
+            text = transcript_text(app)
+            assert "EXTERNAL ACCESS REQUEST" in text
+            assert "Operation: Read file" in text
+            assert "Path: /actual/outside.txt" in text
+            assert "outside the current workspace" in text
+            assert "APPROVAL REQUIRED" not in text
+
+            await pilot.press("n")
+            await asyncio.wait_for(runtime.approval_started.wait(), timeout=1)
+            runtime.approval_release.set()
+            await pilot.pause()
+            await pilot.pause()
+
+            assert runtime.approval_calls == [("request-1", "call-1", False)]
+            denied = transcript_text(app)
+            assert "EXTERNAL ACCESS" in denied
+            assert "Access denied" in denied
+            assert "Path: /actual/outside.txt" in denied
+            assert "Reason: Path is outside the current workspace." in denied
+            assert "No changes were made." in denied
 
     asyncio.run(scenario())
 

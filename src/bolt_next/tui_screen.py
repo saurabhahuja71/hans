@@ -88,7 +88,22 @@ def footer_text(
     return "Enter send · Shift+Enter newline · Ctrl-D send / empty exit · Ctrl-Q quit"
 
 
-def format_approval_request(tool_name: str, category: str, fields: tuple[tuple[str, str], ...]) -> str:
+def format_approval_request(
+    tool_name: str,
+    category: str,
+    fields: tuple[tuple[str, str], ...],
+    *,
+    external: bool = False,
+) -> str:
+    if external:
+        path = dict(fields).get("path", ".")
+        return (
+            "EXTERNAL ACCESS REQUEST\n"
+            f"Operation: {human_tool_name(tool_name)}\n"
+            f"Path: {path}\n"
+            "This path is outside the current workspace.\n"
+            "Y Allow · N Deny · Ctrl-C Cancel"
+        )
     details = "\n".join(f"{name}: {value}" for name, value in fields)
     prompt = f"APPROVAL REQUIRED\nApprove {human_tool_name(tool_name)} ({category})? y / n"
     return f"{prompt}\n{details}" if details else prompt
@@ -111,7 +126,17 @@ def format_tool_label(name: str, detail: str = "") -> str:
     return f"{label} {detail}".rstrip()
 
 
-def format_approval_denied(tool_name: str) -> str:
+def format_approval_denied(
+    tool_name: str, *, external: bool = False, external_path: str | None = None
+) -> str:
+    if external:
+        return (
+            "EXTERNAL ACCESS\n"
+            "✗ Access denied\n"
+            f"Path: {external_path or '.'}\n"
+            "Reason: Path is outside the current workspace.\n"
+            "No changes were made."
+        )
     return f"APPROVAL\n✗ {human_tool_name(tool_name)} was not approved; it did not run."
 
 
@@ -121,6 +146,7 @@ class Piece:
     text: str
     detail: str = ""
     fields: tuple[tuple[str, str], ...] = ()
+    external: bool = False
 
 
 @dataclass
@@ -169,17 +195,27 @@ class Transcript:
         fields = (("reason", reason),) if reason else ()
         self.pieces.append(Piece("tool", label, "ok" if ok else "fail", fields))
 
-    def approval_denied(self, tool_name: str) -> None:
+    def approval_denied(
+        self, tool_name: str, *, external: bool = False, external_path: str | None = None
+    ) -> None:
         self._drop_status()
-        self.pieces.append(Piece("approval-denied", tool_name))
+        fields = (("path", external_path),) if external_path else ()
+        self.pieces.append(Piece("approval-denied", tool_name, fields=fields, external=external))
 
     def verification(self, command: str, *, ok: bool) -> None:
         marker = "passed" if ok else "failed"
         self.pieces.append(Piece("verification", command, marker))
 
-    def approval(self, tool_name: str, category: str, fields: tuple[tuple[str, str], ...]) -> None:
+    def approval(
+        self,
+        tool_name: str,
+        category: str,
+        fields: tuple[tuple[str, str], ...],
+        *,
+        external: bool = False,
+    ) -> None:
         self._drop_status()
-        self.pieces.append(Piece("approval", tool_name, category, fields))
+        self.pieces.append(Piece("approval", tool_name, category, fields, external))
 
     def change(self, text: str, *, title: str = "CHANGES") -> None:
         self._drop_status()
@@ -239,12 +275,20 @@ def _render_piece(piece: Piece, width: int) -> list[str]:
             rows.extend(_wrap(f"Reason: {reason}", width, "    "))
         return rows
     if piece.kind == "approval-denied":
-        return _wrap(format_approval_denied(piece.text), width, "  ")
+        return _wrap(
+            format_approval_denied(
+                piece.text, external=piece.external, external_path=dict(piece.fields).get("path")
+            ),
+            width,
+            "  ",
+        )
     if piece.kind == "verification":
         mark = "✓" if piece.detail == "passed" else "✗"
         return _wrap(f"VERIFICATION\n{mark} {piece.text} {piece.detail}", width, "  ")
     if piece.kind == "approval":
-        return _wrap(format_approval_request(piece.text, piece.detail, piece.fields), width, "  ")
+        return _wrap(
+            format_approval_request(piece.text, piece.detail, piece.fields, external=piece.external), width, "  "
+        )
     if piece.kind == "change":
         return _wrap(f"{piece.detail}\n{piece.text}", width, "  ")
     if piece.kind == "diff":

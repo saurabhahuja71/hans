@@ -326,7 +326,7 @@ class HansTextualApp(App[None]):
     MAX_COMMAND_SUGGESTIONS = 7
 
     BINDINGS = [
-        Binding("enter", "submit_or_exit", "send", show=False, priority=True),
+        Binding("enter", "submit", "send", show=False, priority=True),
         Binding("shift+enter", "insert_newline", "newline", show=False, priority=True),
         Binding("ctrl+d", "submit_or_exit", "send", show=False),
         Binding("ctrl+c", "cancel_active", "cancel", show=False),
@@ -365,7 +365,7 @@ class HansTextualApp(App[None]):
         self._verification_failed = False
         self._request_active = False
         self._approval_pending: tuple[str, str] | None = None
-        self._approval_tools: dict[tuple[str, str], str] = {}
+        self._approval_tools: dict[tuple[str, str], tuple[str, bool, str | None]] = {}
         self._approval_resolving = False
         self._has_task_changes = False
         self._state = "IDLE"
@@ -828,20 +828,28 @@ class HansTextualApp(App[None]):
         elif isinstance(event, ToolApprovalRequested):
             key = (event.request_id, event.call_id)
             self._approval_pending = key
-            self._approval_tools[key] = event.tool_name
+            self._approval_tools[key] = (event.tool_name, event.external, event.external_path)
             self._request_active = True
             self._hide_command_suggestions()
             self._set_state("APPROVAL REQUIRED")
             await self._append_transcript(
-                format_approval_request(event.tool_name, event.category, event.display.fields), "change"
+                format_approval_request(
+                    event.tool_name, event.category, event.display.fields, external=event.external
+                ),
+                "change",
             )
         elif isinstance(event, ToolApprovalResolved):
             key = (event.request_id, event.call_id)
-            tool_name = self._approval_tools.pop(key, "tool")
+            tool_name, external, external_path = self._approval_tools.pop(key, ("tool", False, None))
             if self._approval_pending == key:
                 self._approval_pending = None
             if not event.approved:
-                await self._append_transcript(format_approval_denied(tool_name), "change")
+                await self._append_transcript(
+                    format_approval_denied(
+                        tool_name, external=external, external_path=external_path
+                    ),
+                    "change",
+                )
         elif isinstance(event, ToolStarted):
             self._tool_names[event.call_id] = event.name
             self._tool_details[event.call_id] = self._compact(event.detail, self.MAX_TOOL_DETAIL_CHARS)
@@ -1000,6 +1008,11 @@ class HansTextualApp(App[None]):
         elif isinstance(event, ConnectionChanged):
             self._connected = event.connected
             self.query_one("#hans-header", Static).update(self._header_text())
+
+    def action_submit(self) -> None:
+        if not self.query_one("#composer", TextArea).text.strip():
+            return
+        self.action_submit_or_exit()
 
     def action_submit_or_exit(self) -> None:
         if self._approval_pending is not None or self._approval_resolving:

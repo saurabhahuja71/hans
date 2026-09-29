@@ -20,9 +20,9 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.1**.
+branding are HANS. Current release: **0.7.2**.
 
-## What 0.7.1 provides
+## What 0.7.2 provides
 
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
@@ -36,7 +36,9 @@ branding are HANS. Current release: **0.7.1**.
 - `/mode` validates a session-scoped reasoning override against declared model capabilities and
   applies it only to later requests. `/compact` remains unimplemented.
 - The `ask` permission policy pauses eligible tools for an explicit terminal approval. Approval prompts
-  show bounded, redacted tool details rather than tool payloads.
+  show bounded, redacted tool details rather than tool payloads. Paths resolving outside the workspace
+  require a separate, exact-operation approval even when the corresponding permission is `allow`; no
+  permanent external-path trust is retained.
 - Failed tool rows identify the safe operation/target and a bounded, redacted reason. HANS does not
   automatically retry failed or denied tools; inspect output and submit a new task as needed.
 - `/help` is a local guide to configuration, session, safety, and workspace controls. In an idle
@@ -218,12 +220,14 @@ Git commands for this operation.
 
 ## Workspace safety and tool limits
 
-All workspace file paths resolve against the workspace root. Traversal (`../`) and symlinks that
-resolve outside the workspace are rejected. Missing, unreadable, and non-UTF-8 reads are returned
-as tool errors rather than raised out of the SDK loop. `list_directory` reports only direct entries,
-in deterministic sorted order, as `directory`, `file`, `symlink`, or `other`; its output is bounded
-to the tool-result context budget. A symlink is reported as a symlink rather than followed during
-listing.
+The workspace is the default boundary for filesystem tools. Paths that resolve within it work
+normally. An external path, including traversal (`../`) or a symlink that resolves outside the
+workspace, requires explicit approval for that exact operation even when the corresponding permission
+policy is `allow`; approval creates no permanent trust. Missing, unreadable, and non-UTF-8 reads are
+returned as tool errors rather than raised out of the SDK loop. `list_directory` reports only direct
+entries, in deterministic sorted order, as `directory`, `file`, `symlink`, or `other`; its output is
+bounded to the tool-result context budget. A symlink is reported as a symlink rather than followed
+during listing.
 
 `search_files` performs literal, line-by-line search with sorted traversal. `max_results` defaults
 to `50` and must be from `1` through `100`; results are additionally constrained by the tool-result
@@ -239,6 +243,11 @@ smaller fitting end line instead of silently returning partial source.
 `replace_in_file` requires exactly one literal occurrence and uses a temporary-file replacement for
 targeted edits. `write_file` creates parent directories inside the workspace and replaces the target
 file. Successful mutations participate in the task-local change journal described above.
+
+The five filesystem tools can use a path that resolves outside the workspace only after explicit
+per-operation approval. Approval applies only to that exact invocation; prompts use bounded, redacted
+paths and access is never persisted or automatically trusted. External file mutations are not included
+in the task journal or diff. This does not change `run_command`, which remains workspace constrained.
 
 `run_command` does not use a shell and will not grow one silently. The command string is rejected
 if it contains shell metacharacters, including pipes, redirects, `&` (`&&` / `||`), `;`, substitution

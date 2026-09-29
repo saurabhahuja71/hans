@@ -171,7 +171,7 @@ class _Display:
         self._started = False
         self._verification_failed = False
         self._tool_purposes: dict[str, str] = {}
-        self._approval_tools: dict[tuple[str, str], str] = {}
+        self._approval_tools: dict[tuple[str, str], tuple[str, bool, str | None]] = {}
         self.tool_outputs: dict[str, str] = {}
         self.latest_tool_call_id: str | None = None
         self.max_tool_outputs = 100
@@ -229,23 +229,35 @@ class _Display:
         elif isinstance(event, ToolApprovalRequested):
             key = (event.request_id, event.call_id)
             self.approval_pending = key
-            self._approval_tools[key] = event.tool_name
+            self._approval_tools[key] = (event.tool_name, event.external, event.external_path)
             self.request_active = True
             self._set_state("APPROVAL REQUIRED")
             if self.transcript is not None:
-                self.transcript.approval(event.tool_name, event.category, event.display.fields)
+                self.transcript.approval(event.tool_name, event.category, event.display.fields, external=event.external)
             else:
-                print("\n" + format_approval_request(event.tool_name, event.category, event.display.fields), flush=True)
+                print(
+                    "\n" + format_approval_request(
+                        event.tool_name, event.category, event.display.fields, external=event.external
+                    ),
+                    flush=True,
+                )
         elif isinstance(event, ToolApprovalResolved):
             key = (event.request_id, event.call_id)
-            tool_name = self._approval_tools.pop(key, "tool")
+            tool_name, external, external_path = self._approval_tools.pop(key, ("tool", False, None))
             if self.approval_pending == key:
                 self.approval_pending = None
             if not event.approved:
                 if self.transcript is not None:
-                    self.transcript.approval_denied(tool_name)
+                    self.transcript.approval_denied(
+                        tool_name, external=external, external_path=external_path
+                    )
                 else:
-                    print("\n" + format_approval_denied(tool_name), flush=True)
+                    print(
+                        "\n" + format_approval_denied(
+                            tool_name, external=external, external_path=external_path
+                        ),
+                        flush=True,
+                    )
         elif isinstance(event, ToolStarted):
             label = format_tool_label(event.name, self._compact(event.detail))
             self._tool_purposes[event.call_id] = event.purpose

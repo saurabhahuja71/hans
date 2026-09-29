@@ -180,7 +180,7 @@ def test_create_agent_binds_selected_profile_without_mutating_environment(
             captured["openai_client"] = self
 
     def record_capacity(name: str):
-        def tool(_root: Path, *, context_tokens: int | None = None) -> str:
+        def tool(_root: Path, *, context_tokens: int | None = None, authorizer: object = None) -> str:
             captured["tool_capacities"].append((name, context_tokens))
             return name
 
@@ -193,8 +193,8 @@ def test_create_agent_binds_selected_profile_without_mutating_environment(
     monkeypatch.setattr(agent_module, "make_search_files_tool", record_capacity("search"))
     monkeypatch.setattr(agent_module, "make_read_file_tool", record_capacity("read"))
     monkeypatch.setattr(agent_module, "make_run_command_tool", record_capacity("command"))
-    monkeypatch.setattr(agent_module, "make_replace_in_file_tool", lambda *_args: "replace")
-    monkeypatch.setattr(agent_module, "make_write_file_tool", lambda *_args: "write")
+    monkeypatch.setattr(agent_module, "make_replace_in_file_tool", lambda *_args, **_kwargs: "replace")
+    monkeypatch.setattr(agent_module, "make_write_file_tool", lambda *_args, **_kwargs: "write")
 
     agent = agent_module.create_agent(tmp_path, profile="selected")
 

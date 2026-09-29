@@ -203,6 +203,124 @@ def test_tool_approval_requests_expose_only_bounded_redacted_semantic_display_da
     runtime.close()
 
 
+def test_external_path_approval_displays_entered_path_and_revokes_denial(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("outside", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    item = SimpleNamespace(
+        tool_name="read_file",
+        call_id="external-read",
+        raw_item=SimpleNamespace(arguments={"path": entered_path}),
+    )
+    state = _ApprovalState()
+    runtime = HansRuntime(
+        workspace=str(tmp_path),
+        agent=SimpleNamespace(tools=()),
+        session=object(),
+        runner=_ApprovalRunner(_PausedApprovalResult(item, state), _FinishedResult()),
+        interactive=lambda: True,
+    )
+    access = runtime._external_path_authorizer.propose("read_file", "external-read", entered_path)
+    assert access is not None
+    assert access.path == outside.resolve()
+
+    request = next(event for event in run(collect(runtime, "Read the external file.")) if isinstance(event, ToolApprovalRequested))
+
+    assert request.external is True
+    assert request.external_path == entered_path
+    assert request.display == ToolApprovalDisplay(
+        (("path", entered_path), ("range", "1+"), ("scope", "outside workspace"))
+    )
+    assert run(collect_approval_resolution(runtime, request.request_id, request.call_id, False))[0] == ToolApprovalResolved(
+        request.request_id, request.call_id, False
+    )
+    assert state.rejected == [item]
+    assert runtime._external_path_authorizer.proposal_for("read_file", "external-read") is None
+    runtime.close()
+
+
+@pytest.mark.parametrize("policy", ("allow", "ask", "deny"))
+def test_external_read_permission_policies_require_at_most_one_approval(tmp_path: Path, policy: str) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("external contents", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_file", {"path": entered_path}, call_id="external-read")]),
+            ModelStep(output=[assistant_message("Read completed.")]),
+        ]
+    )
+
+    def factory(workspace: Path, *, journal: object, profile: object, authorizer: object) -> Agent:
+        return Agent(
+            name="external permission test agent",
+            instructions="Use the provided tools.",
+            model=model,
+            tools=[make_read_file_tool(workspace, authorizer=authorizer)],
+        )
+
+    runtime = HansRuntime(
+        workspace=str(tmp_path),
+        session=SQLiteSession(f"external-read-{policy}"),
+        agent_factory=factory,
+        interactive=lambda: True,
+    )
+    assert runtime.set_permission("read", policy) == PermissionPolicyChanged("read", policy)
+    events = run(collect(runtime, "Read the external file."))
+    requests = [event for event in events if isinstance(event, ToolApprovalRequested)]
+
+    if policy == "deny":
+        assert requests == []
+        assert ToolOutput("external-read", "Permission denied: read operations are disabled.") in events
+    else:
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.external is True
+        assert request.external_path == entered_path
+        assert ToolStarted("external-read", "read_file", entered_path) in events
+        assert not any(isinstance(event, ToolOutput) for event in events)
+        resolved = run(collect_approval_resolution(runtime, request.request_id, request.call_id, True))
+        assert not any(isinstance(event, ToolApprovalRequested) for event in resolved)
+        assert ToolOutput("external-read", "external contents") in resolved
+        assert ToolCompleted("external-read", "read_file", entered_path, True) in resolved
+    runtime.close()
+
+
+def test_noninteractive_external_read_fails_closed_without_a_ui_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("must not be read", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_file", {"path": entered_path}, call_id="external-read")]),
+            ModelStep(output=[assistant_message("Read completed.")]),
+        ]
+    )
+
+    def factory(workspace: Path, *, journal: object, profile: object, authorizer: object) -> Agent:
+        return Agent(
+            name="noninteractive external permission test agent",
+            instructions="Use the provided tools.",
+            model=model,
+            tools=[make_read_file_tool(workspace, authorizer=authorizer)],
+        )
+
+    runtime = HansRuntime(
+        workspace=str(tmp_path),
+        session=SQLiteSession("external-read-noninteractive"),
+        agent_factory=factory,
+        interactive=lambda: False,
+    )
+
+    events = run(collect(runtime, "Read the external file."))
+
+    assert not any(isinstance(event, ToolApprovalRequested) for event in events)
+    assert ToolOutput("external-read", "Tool execution was not approved.") in events
+    assert ToolOutput("external-read", "must not be read") not in events
+    assert "must not be read" not in repr(events)
+    runtime.close()
+
+
 def test_tool_approval_display_bounds_command_values() -> None:
     command = "x" * 300
     item = SimpleNamespace(
@@ -540,12 +658,12 @@ def test_runtime_reports_journal_changes_and_exposes_safe_undo(
         ]
     )
 
-    def fake_create_agent(workspace: Path, *, journal: object, profile: object) -> Agent:
+    def fake_create_agent(workspace: Path, *, journal: object, profile: object, authorizer: object) -> Agent:
         return Agent(
             name="journal test agent",
             instructions="Use the provided tools.",
             model=model,
-            tools=[make_write_file_tool(workspace, journal), make_run_command_tool(workspace)],
+            tools=[make_write_file_tool(workspace, journal, authorizer=authorizer), make_run_command_tool(workspace)],
         )
 
     monkeypatch.setattr(runtime_module, "create_agent", fake_create_agent)
@@ -909,12 +1027,12 @@ def test_clear_session_history_removes_sdk_history_and_preserves_runtime_control
     )
     session = SQLiteSession("runtime-clear-history")
 
-    def fake_create_agent(workspace: Path, *, journal: object, profile: object) -> Agent:
+    def fake_create_agent(workspace: Path, *, journal: object, profile: object, authorizer: object) -> Agent:
         return Agent(
             name="clear history test agent",
             instructions="Use the provided tools.",
             model=model,
-            tools=[make_write_file_tool(workspace, journal)],
+            tools=[make_write_file_tool(workspace, journal, authorizer=authorizer)],
         )
 
     original_create_agent = runtime_module.create_agent

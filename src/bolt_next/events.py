@@ -175,6 +175,8 @@ class ToolApprovalRequested:
     tool_name: str
     category: str
     display: ToolApprovalDisplay
+    external: bool = False
+    external_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
