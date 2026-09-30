@@ -255,6 +255,10 @@ class HansTextualApp(App[None]):
 
     ALLOW_SELECT = True
 
+    @staticmethod
+    def mouse_enabled_from_environment() -> bool:
+        return os.environ.get("HANS_MOUSE", "").strip().lower() in {"1", "true", "yes", "on"}
+
     CSS = """
     Screen {
         layout: vertical;
@@ -384,11 +388,12 @@ class HansTextualApp(App[None]):
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
-    def __init__(self, runtime: Runtime, model: str, workspace: Path) -> None:
+    def __init__(self, runtime: Runtime, model: str, workspace: Path, *, mouse_enabled: bool = False) -> None:
         super().__init__()
         self.runtime = runtime
         self.model = model
         self.workspace = workspace
+        self._mouse_enabled = mouse_enabled
         self._connected = False
         self._assistant_text = ""
         self._assistant_widget: Static | None = None
@@ -494,16 +499,18 @@ class HansTextualApp(App[None]):
         return False
 
     def on_mouse_down(self, event: MouseDown) -> None:
-        if event.button == 1:
+        if self._mouse_enabled and event.button == 1:
             self._last_selected_transcript_text = None
 
     def on_text_selected(self, event: TextSelected) -> None:
+        if not self._mouse_enabled:
+            return
         text = self._selected_transcript_text()
         if text:
             self._last_selected_transcript_text = text
 
     def on_click(self, event: Click) -> None:
-        if event.button != 3 or self._approval_pending is not None or self._approval_resolving:
+        if not self._mouse_enabled or event.button != 3 or self._approval_pending is not None or self._approval_resolving:
             return
         if not self._is_transcript_target(event.widget):
             return
@@ -1267,4 +1274,5 @@ class HansTextualApp(App[None]):
 
 async def run_textual_tui(runtime: Runtime, model: str, workspace: Path) -> None:
     """Run the Textual application without exposing SDK runtime details."""
-    await HansTextualApp(runtime, model, workspace).run_async()
+    mouse_enabled = HansTextualApp.mouse_enabled_from_environment()
+    await HansTextualApp(runtime, model, workspace, mouse_enabled=mouse_enabled).run_async(mouse=mouse_enabled)

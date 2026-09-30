@@ -257,9 +257,25 @@ def test_textual_selected_text_menu_copy_button_uses_existing_safe_callback(tmp_
     asyncio.run(scenario())
 
 
-def test_textual_right_click_selected_transcript_opens_copy_menu(tmp_path: Path) -> None:
+def test_textual_default_mouse_mode_does_not_consume_right_clicks(tmp_path: Path) -> None:
     async def scenario() -> None:
         app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            transcript = app.query_one("#transcript", VerticalScroll)
+            row = Static("visible safe output", markup=False)
+            await transcript.mount(row)
+            app.screen.selections = {row: Selection(None, None)}
+            app.on_text_selected(TextSelected())
+            await pilot.click(row, button=3)
+            await pilot.pause()
+            assert not isinstance(app.screen, SelectedTextScreen)
+
+    asyncio.run(scenario())
+
+
+def test_textual_mouse_mode_right_click_selected_transcript_opens_copy_menu(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path, mouse_enabled=True)
         async with app.run_test() as pilot:
             transcript = app.query_one("#transcript", VerticalScroll)
             row = Static("visible safe output", markup=False)
@@ -1203,6 +1219,39 @@ def test_copy_reports_clipboard_failure_without_runtime_submission(tmp_path: Pat
             await pilot.press("ctrl+y")
             await pilot.pause()
             assert "clipboard unavailable" in rendered(app.query_one("#state-line", Static))
+            assert runtime.prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_textual_mouse_mode_is_opt_in(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("HANS_MOUSE", raising=False)
+    assert HansTextualApp.mouse_enabled_from_environment() is False
+    assert HansTextualApp(FakeRuntime(), "test-model", tmp_path)._mouse_enabled is False
+
+    monkeypatch.setenv("HANS_MOUSE", "true")
+    assert HansTextualApp.mouse_enabled_from_environment() is True
+    assert HansTextualApp(FakeRuntime(), "test-model", tmp_path, mouse_enabled=True)._mouse_enabled is True
+
+
+@pytest.mark.parametrize("value", ["1", "yes", "on", "TRUE"])
+def test_textual_mouse_environment_accepts_true_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("HANS_MOUSE", value)
+    assert HansTextualApp.mouse_enabled_from_environment() is True
+
+
+def test_ctrl_y_requests_copy_of_displayed_assistant_output(tmp_path: Path, monkeypatch) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        copied: list[str] = []
+        monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+        async with app.run_test() as pilot:
+            await app._render_event(AssistantMessageComplete("plain assistant text"))
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert copied == ["plain assistant text"]
+            assert "clipboard copy requested" in rendered(app.query_one("#state-line", Static))
             assert runtime.prompts == []
 
     asyncio.run(scenario())
