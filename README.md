@@ -20,13 +20,13 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.6**.
+branding are HANS. Current release: **0.7.7**.
 
-## What 0.7.6 provides
+## What 0.7.7 provides
 
 - `Ctrl+R` temporarily allows all read, write, and execute permissions while HANS is idle; press it
   again to restore the previous process-local per-category policy. It never bypasses external-path
-  approval. `Ctrl+A` retains its normal text-selection behavior.
+  approval. In the Textual composer, `Ctrl+A` selects the full draft so it can be replaced.
 - The Textual `/` command-completion panel includes every registered command, stays bounded and
   scrollable, and follows Up/Down keyboard selection.
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
@@ -200,11 +200,11 @@ The footer shows only controls relevant to the current semantic task state:
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
 - **Copying response text (Textual UI):** Drag to select any visible transcript text, then press
-  Ctrl-C to copy the selection. Without a selection, Ctrl-C retains its normal cancel behavior.
-  Ctrl-Y copies the bounded, displayed representation of the most recent assistant response or open
-  detail view. The `HANS_TUI=curses` fallback sends the same text through terminal OSC 52; HANS
-  reports that the copy was sent to the terminal, rather than claiming a terminal accepted it into the
-  desktop clipboard.
+  Ctrl-C or right-click and choose `Copy selected text`. Without a selection, Ctrl-C retains its
+  normal cancel behavior. Ctrl-Y copies the bounded, displayed representation of the most recent
+  assistant response or open detail view. The `HANS_TUI=curses` fallback sends the same text through
+  terminal OSC 52; HANS reports that the copy was sent to the terminal, rather than claiming a
+  terminal accepted it into the desktop clipboard.
 - **Completed task with HANS-owned changes:** Ctrl-G opens the bounded task diff and Ctrl-Z requests
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded

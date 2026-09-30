@@ -13,7 +13,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
-from textual.events import Click, Key
+from textual.events import Click, Key, MouseDown, TextSelected
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Static, TextArea
@@ -170,8 +170,39 @@ class ToolRow(Static):
         self.call_id = call_id
 
     def on_click(self, event: Click) -> None:
+        if event.button != 1:
+            return
         event.stop()
         self.app.open_tool_output(self.call_id)
+
+
+class SelectedTextScreen(ModalScreen[None]):
+    BINDINGS = [
+        Binding("enter,c", "copy", "copy", show=False),
+        Binding("escape", "close", "back", show=False),
+    ]
+
+    CSS = """
+    SelectedTextScreen { background: $background 80%; align: center middle; }
+    #selected-text-menu { width: auto; height: auto; border: heavy $accent; background: $surface; padding: 1 2; }
+    #selected-text-menu-title { color: $accent; text-style: bold; }
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+    def compose(self) -> ComposeResult:
+        with Container(id="selected-text-menu"):
+            yield Static("COPY SELECTED TEXT", id="selected-text-menu-title", markup=False)
+            yield Static("Enter/C copy  ·  Esc back", markup=False)
+
+    def action_copy(self) -> None:
+        self.app.copy_plain_text(self.text)
+        self.dismiss()
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 class ThemeScreen(ModalScreen[None]):
@@ -203,6 +234,8 @@ class ThemeScreen(ModalScreen[None]):
 
 
 class ComposerTextArea(TextArea):
+    BINDINGS = [Binding("ctrl+a", "select_all", show=False)]
+
     def on_key(self, event: Key) -> None:
         handler = getattr(self.app, "_handle_approval_key", None)
         if handler is not None and handler(event):
@@ -374,6 +407,7 @@ class HansTextualApp(App[None]):
         self._approval_pending: tuple[str, str] | None = None
         self._approval_tools: dict[tuple[str, str], tuple[str, bool, str | None]] = {}
         self._approval_resolving = False
+        self._last_selected_transcript_text: str | None = None
         self._has_task_changes = False
         self._state = "IDLE"
         self._closed = False
@@ -440,6 +474,42 @@ class HansTextualApp(App[None]):
             return False
         self._set_state("IDLE", "clipboard copy requested")
         return True
+
+    def _selected_transcript_text(self) -> str | None:
+        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript_rows = set(transcript.children)
+        if not any(widget in transcript_rows for widget in self.screen.selections):
+            return None
+        return self.screen.get_selected_text()
+
+    def _is_transcript_target(self, widget: object | None) -> bool:
+        transcript = self.query_one("#transcript", VerticalScroll)
+        while widget is not None:
+            if widget is transcript:
+                return True
+            widget = getattr(widget, "parent", None)
+        return False
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        if event.button == 1:
+            self._last_selected_transcript_text = None
+
+    def on_text_selected(self, event: TextSelected) -> None:
+        text = self._selected_transcript_text()
+        if text:
+            self._last_selected_transcript_text = text
+
+    def on_click(self, event: Click) -> None:
+        if event.button != 3 or self._approval_pending is not None or self._approval_resolving:
+            return
+        if not self._is_transcript_target(event.widget):
+            return
+        text = self._selected_transcript_text() or self._last_selected_transcript_text
+        if not text:
+            return
+        self._last_selected_transcript_text = None
+        event.stop()
+        self.push_screen(SelectedTextScreen(text))
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "composer":

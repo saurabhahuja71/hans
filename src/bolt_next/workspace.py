@@ -645,8 +645,8 @@ def _webp_dimensions(content: bytes) -> tuple[int, int] | None:
     return vp8x_dimensions or image_dimensions
 
 
-def _image_error(path: str, target: Path, content: bytes) -> str:
-    if _image_type(target, content) is not None:
+def _image_error(path: str, target: Path, content: bytes, *, read_image_available: bool) -> str:
+    if _image_type(target, content) is not None and read_image_available:
         return f"Error reading {path!r}: file is binary or an image; use read_image for PNG, JPEG, WebP, or GIF files"
     return f"Error reading {path!r}: file cannot be read as text; supported image formats are PNG, JPEG, WebP, and GIF"
 
@@ -694,6 +694,7 @@ def make_read_file_tool(
     *,
     context_tokens: int | None = None,
     authorizer: ExternalPathAuthorizer | None = None,
+    read_image_available: bool = False,
 ):
     @function_tool
     async def read_file(context: ToolContext, path: str, start_line: int = 1, end_line: int = 0) -> str:
@@ -718,9 +719,9 @@ def make_read_file_tool(
             try:
                 text = content.decode("utf-8")
             except UnicodeError:
-                return _image_error(path, target, content)
+                return _image_error(path, target, content, read_image_available=read_image_available)
             if "\x00" in text:
-                return _image_error(path, target, content)
+                return _image_error(path, target, content, read_image_available=read_image_available)
             lines = text.splitlines()
             total = len(lines)
             if total == 0:

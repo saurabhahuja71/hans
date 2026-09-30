@@ -180,7 +180,7 @@ def test_create_agent_binds_selected_profile_without_mutating_environment(
             captured["openai_client"] = self
 
     def record_capacity(name: str):
-        def tool(_root: Path, *, context_tokens: int | None = None, authorizer: object = None) -> str:
+        def tool(_root: Path, *, context_tokens: int | None = None, authorizer: object = None, **_kwargs: object) -> str:
             captured["tool_capacities"].append((name, context_tokens))
             return name
 
@@ -238,14 +238,23 @@ def test_create_agent_selects_configured_transport_and_image_tool(
     monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_API_KEY", "selected-key")
     monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_TRANSPORT", transport)
     monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_SUPPORTS_IMAGE_INPUT", image_support)
+    read_file_capabilities: list[bool] = []
+    original_read_file_tool = agent_module.make_read_file_tool
+
+    def record_read_file_capability(*args: object, read_image_available: bool = False, **kwargs: object):
+        read_file_capabilities.append(read_image_available)
+        return original_read_file_tool(*args, read_image_available=read_image_available, **kwargs)
+
     monkeypatch.setattr(agent_module, "AsyncOpenAI", lambda **_kwargs: object())
     monkeypatch.setattr(agent_module, "OpenAIChatCompletionsModel", lambda **_kwargs: "chat")
     monkeypatch.setattr(agent_module, "OpenAIResponsesModel", lambda **_kwargs: "responses")
+    monkeypatch.setattr(agent_module, "make_read_file_tool", record_read_file_capability)
     monkeypatch.setattr(agent_module, "Agent", lambda **kwargs: kwargs)
 
     agent = agent_module.create_agent(tmp_path)
 
     assert agent["model"] == expected_model
+    assert read_file_capabilities == [has_image_tool]
     assert ("read_image" in [tool.name for tool in agent["tools"]]) is has_image_tool
 
 

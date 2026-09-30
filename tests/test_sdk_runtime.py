@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import os
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ from bolt_next.agent import STAGE_4_INSTRUCTIONS
 from bolt_next.workspace import (
     make_list_directory_tool,
     make_read_file_tool,
+    make_read_image_tool,
     make_replace_in_file_tool,
     make_run_command_tool,
     make_search_files_tool,
@@ -74,6 +77,49 @@ def test_structured_read_file_call_executes_and_reaches_next_model_turn(tmp_path
     assert "HANS_KAGGLE_READ_TEST_123" in result.final_output
     assert len(model.calls) == 2
     assert "HANS_KAGGLE_READ_TEST_123" in repr(model.calls[1].input)
+    session.close()
+
+
+def test_read_image_tool_call_supplies_input_image_to_the_next_model_turn(tmp_path: Path) -> None:
+    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return len(data).to_bytes(4, "big") + chunk_type + data + zlib.crc32(chunk_type + data).to_bytes(4, "big")
+
+    image = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00")
+        + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+        + png_chunk(b"IEND", b"")
+    )
+    (tmp_path / "sample.png").write_bytes(image)
+    expected_image_url = f"data:image/png;base64,{base64.b64encode(image).decode('ascii')}"
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_image", {"path": "sample.png"}, call_id="image-1")]),
+            ModelStep(output=[assistant_message("The image was received.")]),
+        ]
+    )
+    agent = Agent(
+        name="HANS image test agent",
+        instructions="Use read_image when asked to inspect an image.",
+        model=model,
+        tools=[make_read_image_tool(tmp_path)],
+    )
+    session = SQLiteSession("sdk-image-tool-test")
+
+    result = run(Runner.run(agent, "Read sample.png.", session=session))
+
+    def contains_input_image(value: object) -> bool:
+        if isinstance(value, dict):
+            return (
+                value.get("type") == "input_image" and value.get("image_url") == expected_image_url
+            ) or any(contains_input_image(child) for child in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_input_image(child) for child in value)
+        return False
+
+    assert result.final_output == "The image was received."
+    assert len(model.calls) == 2
+    assert contains_input_image(model.calls[1].input)
     session.close()
 
 

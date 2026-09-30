@@ -230,7 +230,12 @@ def create_agent(
         tools=[
             make_list_directory_tool(root, context_tokens=context_tokens, authorizer=authorizer),
             make_search_files_tool(root, context_tokens=context_tokens, authorizer=authorizer),
-            make_read_file_tool(root, context_tokens=context_tokens, authorizer=authorizer),
+            make_read_file_tool(
+                root,
+                context_tokens=context_tokens,
+                authorizer=authorizer,
+                read_image_available=selected_profile.supports_image_input,
+            ),
             *(
                 [make_read_image_tool(root, authorizer=authorizer)]
                 if selected_profile.supports_image_input

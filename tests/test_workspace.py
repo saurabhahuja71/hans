@@ -110,7 +110,18 @@ def test_read_image_returns_a_data_url_and_read_file_rejects_binary_without_muta
     assert result.image_url is not None
     assert result.image_url.startswith("data:image/png;base64,")
     assert hashlib.sha256(target.read_bytes()).hexdigest() == before
-    assert "binary or an image" in invoke(make_read_file_tool(tmp_path), '{"path":"sample.png"}')
+    assert "binary or an image" in invoke(
+        make_read_file_tool(tmp_path, read_image_available=True), '{"path":"sample.png"}'
+    )
+
+
+def test_read_file_hides_read_image_guidance_when_image_input_is_unavailable(tmp_path: Path) -> None:
+    (tmp_path / "sample.png").write_bytes(valid_png())
+
+    result = invoke(make_read_file_tool(tmp_path), '{"path":"sample.png"}')
+
+    assert "cannot be read as text" in result
+    assert "read_image" not in result
 
 
 def test_read_image_uses_sdk_structured_image_output(tmp_path: Path) -> None:

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 from textual.containers import VerticalScroll
+from textual.events import TextSelected
+from textual.selection import Selection
 from textual.widgets import Static, TextArea
 
 from bolt_next.events import (
@@ -42,7 +44,7 @@ from bolt_next.events import (
 )
 from bolt_next.commands import command_names, format_help
 from bolt_next.model_catalog import ModelInfo
-from bolt_next.textual_tui import DetailScreen, HansTextualApp, TaskDiffScreen, ThemeScreen
+from bolt_next.textual_tui import DetailScreen, HansTextualApp, SelectedTextScreen, TaskDiffScreen, ThemeScreen
 
 
 class FakeRuntime:
@@ -219,6 +221,54 @@ def test_textual_chrome_is_compact_data_driven_and_preserves_composer_keys(tmp_p
             assert composer.text == ""
 
         assert runtime.closed == 1
+
+    asyncio.run(scenario())
+
+
+def test_textual_composer_ctrl_a_selects_all_and_replaces_draft(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            composer = app.query_one("#composer", TextArea)
+            await pilot.press(*"first", "shift+enter", *"second", "ctrl+a")
+            await pilot.pause()
+            assert composer.selected_text == "first\nsecond"
+            await pilot.press(*"replacement")
+            await pilot.pause()
+            assert composer.text == "replacement"
+
+    asyncio.run(scenario())
+
+
+def test_textual_selected_text_menu_copies_with_existing_safe_callback(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        copied: list[str] = []
+        async with app.run_test() as pilot:
+            app.copy_to_clipboard = copied.append
+            app.push_screen(SelectedTextScreen("visible safe output"))
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert copied == ["visible safe output"]
+            assert "clipboard copy requested" in rendered(app.query_one("#state-line", Static))
+
+    asyncio.run(scenario())
+
+
+def test_textual_right_click_selected_transcript_opens_copy_menu(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            transcript = app.query_one("#transcript", VerticalScroll)
+            row = Static("visible safe output", markup=False)
+            await transcript.mount(row)
+            app.screen.selections = {row: Selection(None, None)}
+            app.on_text_selected(TextSelected())
+            await pilot.click(row, button=3)
+            await pilot.pause()
+            assert isinstance(app.screen, SelectedTextScreen)
+            assert app.screen.text == "visible safe output"
 
     asyncio.run(scenario())
 
