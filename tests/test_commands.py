@@ -61,6 +61,8 @@ def test_registry_generated_help_covers_commands_categories_and_keyboard_shortcu
     assert "Ctrl+R" in help_text
     assert "Ctrl+Shift+A" not in help_text
     assert "Ctrl+Y" in help_text
+    assert "Ctrl+M" in help_text
+    assert "Toggle terminal selection / mouse scrolling (idle)" in help_text
     assert "Allow all including external paths / restore previous (idle)" in help_text
 
 

@@ -295,3 +295,4 @@ def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> Non
     assert "verification evidence" in instructions
     assert "Never use run_command to list, find, or inspect" in instructions
     assert "including for a literal ~/ path" in instructions
+    assert "invoke the appropriate filesystem tool immediately" in instructions

@@ -41,6 +41,7 @@ KEYBOARD_SHORTCUTS = (
     ("Ctrl+B", "Cycle theme"),
     ("Ctrl+T", "Toggle TODO view"),
     ("Ctrl+R", "Allow all including external paths / restore previous (idle)"),
+    ("Ctrl+M", "Toggle terminal selection / mouse scrolling (idle)"),
     ("Ctrl+D", "Send / exit when empty"),
     ("Ctrl+C", "Cancel"),
     ("Ctrl+Y", "Copy displayed output"),

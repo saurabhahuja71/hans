@@ -20,12 +20,13 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.7**.
+branding are HANS. Current release: **0.7.8**.
 
-## What 0.7.7 provides
+## What 0.7.8 provides
 
 - `Ctrl+R` temporarily allows all read, write, execute, and external-path permissions while HANS is
-  idle; press it again to restore the previous process-local per-category policy. In the Textual
+  idle; press it again to restore the previous process-local per-category policy. `Ctrl+M` switches
+  between native terminal selection/copy mode and HANS mouse-wheel scrolling mode. In the Textual
   composer, `Ctrl+A` selects the full draft so it can be replaced.
 - The Textual `/` command-completion panel includes every registered command, stays bounded and
   scrollable, follows Up/Down selection, and supports PageUp/PageDown selection jumps.
@@ -203,15 +204,15 @@ The footer shows only controls relevant to the current semantic task state:
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
-- **Copying and scrolling response text (Textual UI):** Mouse-wheel scrolling is enabled by default.
-  Terminals that reserve mouse reporting for the application may require their selection override
-  modifier (commonly Shift) for native drag selection/right-click copy. Set `HANS_MOUSE=1` to enable
-  HANS's selected-text copy dialog. Set `HANS_MOUSE=0` when native terminal selection is more important
-  than in-app mouse-wheel scrolling. Without a selection, Ctrl-C retains its normal cancel behavior.
-  Ctrl-Y copies the bounded, displayed representation of the most recent assistant response or open
-  detail view through Textual's terminal clipboard request. HANS reports that request rather than
-  claiming desktop clipboard acceptance. The `HANS_TUI=curses` fallback sends the same text through
-  terminal OSC 52 and likewise reports only that it sent the request to the terminal.
+- **Copying and scrolling response text (Textual UI):** HANS starts in **selection mode**, which
+  disables application mouse reporting so MATE/native drag selection, right-click Copy, and the
+  terminal's usual Ctrl+Shift+C can work. Press **Ctrl+M** to enter **scroll mode**, which enables
+  HANS mouse-wheel scrolling; press it again to return to native selection mode. `HANS_MOUSE=1`
+  starts in scroll mode. Ctrl-Y copies the bounded, displayed representation of the most recent
+  assistant response or open detail view through Textual's terminal clipboard request. HANS reports
+  that request rather than claiming desktop clipboard acceptance. The `HANS_TUI=curses` fallback
+  sends the same text through terminal OSC 52 and likewise reports only that it sent the request to
+  the terminal.
 - **Completed task with HANS-owned changes:** Ctrl-G opens the bounded task diff and Ctrl-Z requests
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded

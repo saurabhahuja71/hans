@@ -1246,9 +1246,9 @@ def test_textual_terminal_mouse_defaults_to_enabled(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("value", ["0", "false", "no", "OFF"])
-def test_textual_terminal_mouse_can_be_disabled_for_native_selection(monkeypatch, value: str) -> None:
+def test_textual_terminal_mouse_starts_for_runtime_mode_toggling(monkeypatch, value: str) -> None:
     monkeypatch.setenv("HANS_MOUSE", value)
-    assert HansTextualApp.terminal_mouse_enabled_from_environment() is False
+    assert HansTextualApp.terminal_mouse_enabled_from_environment() is True
 
 
 def test_ctrl_y_requests_copy_of_displayed_assistant_output(tmp_path: Path, monkeypatch) -> None:
@@ -1264,5 +1264,34 @@ def test_ctrl_y_requests_copy_of_displayed_assistant_output(tmp_path: Path, monk
             assert copied == ["plain assistant text"]
             assert "clipboard copy requested" in rendered(app.query_one("#state-line", Static))
             assert runtime.prompts == []
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_m_switches_between_native_selection_and_scroll_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            calls: list[str] = []
+            monkeypatch.setattr(
+                app._driver, "_enable_mouse_support", lambda: calls.append("enable"), raising=False
+            )
+            monkeypatch.setattr(
+                app._driver, "_disable_mouse_support", lambda: calls.append("disable"), raising=False
+            )
+
+            await pilot.press("ctrl+m")
+            await pilot.pause()
+            assert app._mouse_enabled is True
+            assert calls == ["enable"]
+            assert "mouse scroll mode" in rendered(app.query_one("#state-line", Static))
+
+            await pilot.press("ctrl+m")
+            await pilot.pause()
+            assert app._mouse_enabled is False
+            assert calls == ["enable", "disable"]
+            assert "mouse selection mode" in rendered(app.query_one("#state-line", Static))
 
     asyncio.run(scenario())

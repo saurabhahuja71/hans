@@ -146,6 +146,7 @@ STAGE_4_INSTRUCTIONS = (
     "and run_command only for a direct workspace command. Never use run_command to list, find, or inspect "
     "filesystem paths: use list_directory, search_files, or read_file instead, including for a literal ~/ path. "
     "Filesystem paths outside the workspace follow the current external-path policy; the default allows them, ask requires exact approval, and deny blocks them. "
+    "When a user supplies a literal external path and the external-path policy is allow, invoke the appropriate filesystem tool immediately using that exact path; do not ask the user to approve, repeat, or translate a path that the tool can resolve. "
     "Do not invent patch syntax. When read_file "
     "reports remaining_ranges, request the next start_line instead of assuming the rest of the file."
 )

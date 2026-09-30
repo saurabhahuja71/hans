@@ -261,7 +261,7 @@ class HansTextualApp(App[None]):
 
     @staticmethod
     def terminal_mouse_enabled_from_environment() -> bool:
-        return os.environ.get("HANS_MOUSE", "").strip().lower() not in {"0", "false", "no", "off"}
+        return True
 
     CSS = """
     Screen {
@@ -389,6 +389,7 @@ class HansTextualApp(App[None]):
         Binding("ctrl+b", "cycle_theme", "theme", show=False),
         Binding("ctrl+t", "toggle_todos", "todos", show=False),
         Binding("ctrl+r", "toggle_permissions", "permissions", show=False, priority=True),
+        Binding("ctrl+m", "toggle_mouse_mode", "mouse mode", show=False, priority=True),
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
@@ -445,7 +446,18 @@ class HansTextualApp(App[None]):
     def on_mount(self) -> None:
         self._register_themes()
         self.apply_theme(self._theme_name, announce=False)
+        if not self._mouse_enabled:
+            self._set_terminal_mouse_reporting(False)
         self.query_one("#composer", TextArea).focus()
+
+    def _set_terminal_mouse_reporting(self, enabled: bool) -> bool:
+        driver = self._driver
+        method_name = "_enable_mouse_support" if enabled else "_disable_mouse_support"
+        method = getattr(driver, method_name, None)
+        if not callable(method):
+            return False
+        method()
+        return True
 
     def _register_themes(self) -> None:
         palettes = {
@@ -672,6 +684,7 @@ class HansTextualApp(App[None]):
             "ctrl+b": self.action_cycle_theme,
             "ctrl+t": self.action_toggle_todos,
             "ctrl+r": self.action_toggle_permissions,
+            "ctrl+m": self.action_toggle_mouse_mode,
             "ctrl+q": self.action_exit_app,
         }
         action = actions.get(event.key)
@@ -1185,6 +1198,15 @@ class HansTextualApp(App[None]):
             group="runtime-controls",
             exclusive=True,
         )
+
+    def action_toggle_mouse_mode(self) -> None:
+        if self._request_active or self._approval_pending is not None or self._approval_resolving:
+            return
+        self._mouse_enabled = not self._mouse_enabled
+        self._last_selected_transcript_text = None
+        self._set_terminal_mouse_reporting(self._mouse_enabled)
+        mode = "scroll mode" if self._mouse_enabled else "selection mode"
+        self._set_state("IDLE", f"mouse {mode}")
 
     def action_show_latest_output(self) -> None:
         if self._request_active:
