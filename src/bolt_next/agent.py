@@ -53,6 +53,7 @@ def apply_tool_permission_policy(
     get_policy: Callable[[str], str],
     *,
     authorizer: ExternalPathAuthorizer | None = None,
+    get_external_policy: Callable[[], str] | None = None,
 ) -> None:
     """Install runtime-owned dynamic policy hooks on HANS workspace tools."""
     for tool in getattr(agent, "tools", ()):
@@ -90,16 +91,25 @@ def apply_tool_permission_policy(
                     and path is not None
                 ):
                     try:
-                        proposal = active_authorizer.propose(
-                            tool_name,
-                            call_id,
+                        _target, external = active_authorizer.classify(
                             path,
                             mutation=tool_name in {"write_file", "replace_in_file"},
                         )
                     except (OSError, ValueError):
-                        proposal = None
-                    if proposal is not None:
-                        return True
+                        external = False
+                    if external:
+                        external_policy = getattr(tool, "_hans_get_external_policy")()
+                        if external_policy == "deny":
+                            return False
+                        if external_policy == "ask":
+                            proposal = active_authorizer.propose(
+                                tool_name,
+                                call_id,
+                                path,
+                                mutation=tool_name in {"write_file", "replace_in_file"},
+                            )
+                            if proposal is not None:
+                                return True
                 if policy == "ask":
                     return True
                 original = getattr(tool, "_hans_original_needs_approval")
@@ -111,6 +121,7 @@ def apply_tool_permission_policy(
             tool.on_invoke_tool = invoke
             tool.needs_approval = needs_approval
         setattr(tool, "_hans_get_policy", get_policy)
+        setattr(tool, "_hans_get_external_policy", get_external_policy or (lambda: "ask"))
         setattr(tool, "_hans_authorizer", authorizer)
 
 
@@ -134,7 +145,7 @@ STAGE_4_INSTRUCTIONS = (
     "Use replace_in_file for one precise edit and write_file only to create or replace an entire file. "
     "and run_command only for a direct workspace command. Never use run_command to list, find, or inspect "
     "filesystem paths: use list_directory, search_files, or read_file instead, including for a literal ~/ path. "
-    "Any filesystem path that resolves outside the workspace requires explicit approval for that exact tool call. "
+    "Filesystem paths outside the workspace follow the current external-path policy; the default allows them, ask requires exact approval, and deny blocks them. "
     "Do not invent patch syntax. When read_file "
     "reports remaining_ranges, request the next start_line instead of assuming the rest of the file."
 )

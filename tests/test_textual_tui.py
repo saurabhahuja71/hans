@@ -55,7 +55,7 @@ class FakeRuntime:
         self.closed = 0
         self.task_diff_calls: list[int | None] = []
         self.undo_calls = 0
-        self.permissions = {"read": "allow", "write": "allow", "execute": "allow"}
+        self.permissions = {"read": "allow", "write": "allow", "execute": "allow", "external": "allow"}
         self.permission_snapshot: dict[str, str] | None = None
         self.control_calls: list[tuple[object, ...]] = []
         self.models = (
@@ -118,6 +118,7 @@ class FakeRuntime:
             read_policy=self.permissions["read"],
             write_policy=self.permissions["write"],
             execute_policy=self.permissions["execute"],
+            external_policy=self.permissions["external"],
         )
 
     def toggle_permissions(self) -> RuntimeControlStatus:
@@ -285,10 +286,10 @@ def test_textual_permission_quick_toggle_is_idle_only(tmp_path: Path) -> None:
             await pilot.pause()
             assert composer.text == "keep this draft"
             assert runtime.control_calls[-1] == ("toggle_permissions",)
-            assert runtime.permissions == {"read": "allow", "write": "allow", "execute": "allow"}
+            assert runtime.permissions == {"read": "allow", "write": "allow", "execute": "allow", "external": "allow"}
             rendered_transcript = transcript_text(app)
-            assert "Ctrl+R: allow all / restore previous." in rendered_transcript
-            assert "External paths still require approval" in rendered_transcript
+            assert "Ctrl+R: allow all including external paths / restore previous." in rendered_transcript
+            assert "external   allow" in rendered_transcript
 
             calls_before = len(runtime.control_calls)
             app._request_active = True
@@ -1106,7 +1107,7 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             await submit(pilot, "/todo list")
             await submit(pilot, "/unknown")
             assert runtime.prompts == []
-            assert runtime.permissions == {"read": "allow", "write": "deny", "execute": "allow"}
+            assert runtime.permissions == {"read": "allow", "write": "deny", "execute": "allow", "external": "allow"}
             assert runtime.control_calls == [
                 ("permission", "write", "deny"),
                 ("clear", None, None),
@@ -1157,9 +1158,9 @@ def test_slash_commands_are_local_and_themes_are_session_only(tmp_path: Path) ->
             assert (
                 "MODELS\n* Active: Configured Model (configured-model)\nEndpoint: configured endpoint"
                 "\nContext: 128,000 tokens\nReasoning support: none, high"
-                "\nCurrent reasoning: configured default\n- Large Model (large)"
+                "\nImage input: not supported\nCurrent reasoning: configured default\n- Large Model (large)"
                 "\n  Endpoint: configured endpoint\n  Context: 256,000 tokens"
-                "\n  Reasoning support: none, low"
+                "\n  Reasoning support: none, low\n  Image input: not supported"
             ) in text
             assert "REASONING MODE\nCurrent: configured default\nSupported: none, high" in text
             assert "REASONING\n✓ Mode set to high." in text

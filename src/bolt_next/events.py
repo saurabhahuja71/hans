@@ -128,6 +128,7 @@ class RuntimeControlStatus:
     read_policy: str
     write_policy: str
     execute_policy: str
+    external_policy: str
 
 
 @dataclass(frozen=True, slots=True)

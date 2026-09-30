@@ -222,10 +222,12 @@ def test_read_image_requires_its_own_exact_external_approval(tmp_path: Path) -> 
 
 
 def test_external_path_tilde_uses_the_runtime_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     runtime_home = tmp_path / "runtime-home"
     target = runtime_home / "Desktop" / "chart.png"
     monkeypatch.setenv("HOME", str(runtime_home))
-    authorizer = ExternalPathAuthorizer(tmp_path)
+    authorizer = ExternalPathAuthorizer(workspace)
 
     access = authorizer.propose("read_image", "home-image", "~/Desktop/chart.png")
 
@@ -570,7 +572,7 @@ def test_run_command_routes_home_paths_to_approved_filesystem_tools(tmp_path: Pa
 
     assert "does not expand `~`" in result
     assert "list_directory, search_files, or read_file" in result
-    assert "explicit approval for external access" in result
+    assert "external access follows the current external-path policy" in result
     assert "exit_code" not in result
 
 

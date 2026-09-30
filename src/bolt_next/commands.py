@@ -24,7 +24,7 @@ COMMANDS = (
     CommandSpec(
         "/permissions",
         "Permissions",
-        "/permissions [read|write|execute] [allow|deny|ask]",
+        "/permissions [read|write|execute|external] [allow|deny|ask]",
         "Show or set local tool permissions.",
     ),
     CommandSpec("/todo", "Workspace / productivity", "/todo [list|add|done|remove|clear]", "Manage the local TODO list."),
@@ -33,14 +33,14 @@ COMMANDS = (
 
 COMMAND_BY_NAME = {command.name: command for command in COMMANDS}
 TODO_VERBS = ("list", "add", "done", "remove", "clear")
-PERMISSION_CATEGORIES = ("read", "write", "execute")
+PERMISSION_CATEGORIES = ("read", "write", "execute", "external")
 PERMISSION_POLICIES = ("allow", "deny", "ask")
 KEYBOARD_SHORTCUTS = (
     ("Enter", "Send"),
     ("Shift+Enter", "New line"),
     ("Ctrl+B", "Cycle theme"),
     ("Ctrl+T", "Toggle TODO view"),
-    ("Ctrl+R", "Allow all permissions / restore previous (idle)"),
+    ("Ctrl+R", "Allow all including external paths / restore previous (idle)"),
     ("Ctrl+D", "Send / exit when empty"),
     ("Ctrl+C", "Cancel"),
     ("Ctrl+Y", "Copy displayed output"),

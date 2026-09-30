@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import zlib
 from pathlib import Path
+from uuid import uuid4
 from types import SimpleNamespace
 
 import pytest
@@ -281,18 +282,7 @@ def test_external_approval_uses_the_native_sdk_call_id_for_the_exact_canonical_t
     runtime.close()
 
 
-@pytest.mark.parametrize("policy", ("allow", "ask", "deny"))
-def test_external_read_permission_policies_require_at_most_one_approval(tmp_path: Path, policy: str) -> None:
-    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
-    outside.write_text("external contents", encoding="utf-8")
-    entered_path = f"../{outside.name}"
-    model = ScriptedModel(
-        [
-            ModelStep(output=[function_call("read_file", {"path": entered_path}, call_id="external-read")]),
-            ModelStep(output=[assistant_message("Read completed.")]),
-        ]
-    )
-
+def _external_read_runtime(tmp_path: Path, model: ScriptedModel, *, interactive=lambda: True) -> HansRuntime:
     def factory(workspace: Path, *, journal: object, profile: object, authorizer: object) -> Agent:
         return Agent(
             name="external permission test agent",
@@ -301,30 +291,84 @@ def test_external_read_permission_policies_require_at_most_one_approval(tmp_path
             tools=[make_read_file_tool(workspace, authorizer=authorizer)],
         )
 
-    runtime = HansRuntime(
+    return HansRuntime(
         workspace=str(tmp_path),
-        session=SQLiteSession(f"external-read-{policy}"),
+        session=SQLiteSession(f"external-read-{uuid4()}"),
         agent_factory=factory,
-        interactive=lambda: True,
+        interactive=interactive,
     )
-    assert runtime.set_permission("read", policy) == PermissionPolicyChanged("read", policy)
+
+
+def _external_read_model(entered_path: str) -> ScriptedModel:
+    return ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_file", {"path": entered_path}, call_id="external-read")]),
+            ModelStep(output=[assistant_message("Read completed.")]),
+        ]
+    )
+
+
+def test_external_allow_reads_canonical_target_without_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("external contents", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    runtime = _external_read_runtime(tmp_path, _external_read_model(entered_path))
+
+    events = run(collect(runtime, "Read the external file."))
+
+    assert not any(isinstance(event, ToolApprovalRequested) for event in events)
+    assert ToolOutput("external-read", "external contents") in events
+    assert ToolCompleted("external-read", "read_file", entered_path, True) in events
+    runtime.close()
+
+
+def test_external_ask_requires_one_exact_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("external contents", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    runtime = _external_read_runtime(tmp_path, _external_read_model(entered_path))
+    assert runtime.set_permission("external", "ask") == PermissionPolicyChanged("external", "ask")
+
     events = run(collect(runtime, "Read the external file."))
     requests = [event for event in events if isinstance(event, ToolApprovalRequested)]
 
-    if policy == "deny":
-        assert requests == []
-        assert ToolOutput("external-read", "Permission denied: read operations are disabled.") in events
-    else:
-        assert len(requests) == 1
-        request = requests[0]
-        assert request.external is True
-        assert request.external_path == entered_path
-        assert ToolStarted("external-read", "read_file", entered_path) in events
-        assert not any(isinstance(event, ToolOutput) for event in events)
-        resolved = run(collect_approval_resolution(runtime, request.request_id, request.call_id, True))
-        assert not any(isinstance(event, ToolApprovalRequested) for event in resolved)
-        assert ToolOutput("external-read", "external contents") in resolved
-        assert ToolCompleted("external-read", "read_file", entered_path, True) in resolved
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.external is True
+    assert request.external_path == entered_path
+    resolved = run(collect_approval_resolution(runtime, request.request_id, request.call_id, True))
+    assert not any(isinstance(event, ToolApprovalRequested) for event in resolved)
+    assert ToolOutput("external-read", "external contents") in resolved
+    runtime.close()
+
+
+def test_external_deny_blocks_io_without_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("must not be read", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    runtime = _external_read_runtime(tmp_path, _external_read_model(entered_path))
+    assert runtime.set_permission("external", "deny") == PermissionPolicyChanged("external", "deny")
+
+    events = run(collect(runtime, "Read the external file."))
+
+    assert not any(isinstance(event, ToolApprovalRequested) for event in events)
+    assert ToolOutput("external-read", f"Error reading {entered_path!r}: External path access is disabled") in events
+    assert "must not be read" not in repr(events)
+    runtime.close()
+
+
+def test_category_deny_prevails_over_external_allow(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("must not be read", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    runtime = _external_read_runtime(tmp_path, _external_read_model(entered_path))
+    assert runtime.set_permission("read", "deny") == PermissionPolicyChanged("read", "deny")
+
+    events = run(collect(runtime, "Read the external file."))
+
+    assert not any(isinstance(event, ToolApprovalRequested) for event in events)
+    assert ToolOutput("external-read", "Permission denied: read operations are disabled.") in events
+    assert "must not be read" not in repr(events)
     runtime.close()
 
 
@@ -385,6 +429,7 @@ def test_external_image_approval_resumes_once_with_model_visible_image_input(
         session=session,
         interactive=lambda: True,
     )
+    assert runtime.set_permission("external", "ask") == PermissionPolicyChanged("external", "ask")
 
     events = run(collect(runtime, "Inspect the image."))
     requests = [event for event in events if isinstance(event, ToolApprovalRequested)]
@@ -442,6 +487,7 @@ def test_noninteractive_external_read_fails_closed_without_a_ui_approval(tmp_pat
         agent_factory=factory,
         interactive=lambda: False,
     )
+    assert runtime.set_permission("external", "ask") == PermissionPolicyChanged("external", "ask")
 
     events = run(collect(runtime, "Read the external file."))
 
@@ -1213,15 +1259,17 @@ def assert_path_text(path: Path, expected: str | None) -> None:
 def test_permission_quick_toggle_restores_snapshot_invalidates_stale_state_and_rejects_active() -> None:
     runtime = HansRuntime(agent=SimpleNamespace(tools=()), session=object(), runner=object())
 
+    assert runtime.get_control_status() == RuntimeControlStatus("allow", "allow", "allow", "allow")
     assert runtime.set_permission("read", "deny") == PermissionPolicyChanged("read", "deny")
     assert runtime.set_permission("execute", "ask") == PermissionPolicyChanged("execute", "ask")
-    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow")
-    assert runtime.toggle_permissions() == RuntimeControlStatus("deny", "allow", "ask")
+    assert runtime.set_permission("external", "deny") == PermissionPolicyChanged("external", "deny")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("deny", "allow", "ask", "deny")
 
-    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow", "allow")
     assert runtime.set_permission("write", "deny") == PermissionPolicyChanged("write", "deny")
-    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow")
-    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "deny", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "deny", "allow", "allow")
 
     runtime._request_active = True
     assert runtime.toggle_permissions() == RuntimeControlRejected(
@@ -1260,7 +1308,7 @@ def test_clear_session_history_removes_sdk_history_and_preserves_runtime_control
 
     assert run(runtime.clear_session_history()) == SessionCleared()
     assert session_items(session) == []
-    assert runtime.get_control_status() == RuntimeControlStatus("allow", "deny", "allow")
+    assert runtime.get_control_status() == RuntimeControlStatus("allow", "deny", "allow", "allow")
     assert "task.txt" in runtime.task_diff().diff
     follow_up_events = run(collect(runtime, "What was the remembered value?"))
 

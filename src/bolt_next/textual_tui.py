@@ -565,14 +565,26 @@ class HansTextualApp(App[None]):
 
     def _render_command_suggestions(self) -> None:
         widget = self.query_one("#command-suggestions", Static)
+        suggestions = self._command_suggestions
+        selected_index = self._command_suggestion_index
         widget.update(
             "\n".join(
-                f"{'›' if index == self._command_suggestion_index else ' '} {suggestion}"
-                for index, suggestion in enumerate(self._command_suggestions)
+                f"{'›' if index == selected_index else ' '} {suggestion}"
+                for index, suggestion in enumerate(suggestions)
             )
         )
         widget.styles.display = "block"
-        widget.scroll_to(y=self._command_suggestion_index, animate=False)
+
+        def scroll_selected_suggestion() -> None:
+            if (
+                self._command_suggestions != suggestions
+                or self._command_suggestion_index != selected_index
+                or widget.styles.display != "block"
+            ):
+                return
+            widget.scroll_to(y=selected_index, animate=False, force=True, immediate=True)
+
+        self.call_after_refresh(scroll_selected_suggestion)
 
     def _hide_command_suggestions(self) -> None:
         self._command_suggestions = ()
@@ -1090,7 +1102,11 @@ class HansTextualApp(App[None]):
             self.query_one("#hans-header", Static).update(self._header_text())
 
     def action_submit(self) -> None:
-        if not self.query_one("#composer", TextArea).text.strip():
+        composer = self.query_one("#composer", TextArea)
+        if self._command_suggestions and not is_complete_command(composer.text):
+            self._accept_command_suggestion()
+            return
+        if not composer.text.strip():
             return
         self.action_submit_or_exit()
 

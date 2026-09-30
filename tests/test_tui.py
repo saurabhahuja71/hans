@@ -589,6 +589,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     todos = TodoList()
     status = handle_local_command("/permissions", todos)
     changed = handle_local_command("/permissions WRITE deny", todos)
+    external = handle_local_command("/permissions EXTERNAL ask", todos)
     quick_toggle = LocalControl("toggle_permissions")
     clear = handle_local_command("/clear", todos)
     model_status = handle_local_command("/models", todos)
@@ -601,6 +602,8 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert status.control is not None and status.control.kind == "permissions_status"
     assert changed.control is not None
     assert (changed.control.kind, changed.control.category, changed.control.policy) == ("set_permission", "write", "deny")
+    assert external.control is not None
+    assert (external.control.kind, external.control.category, external.control.policy) == ("set_permission", "external", "ask")
     assert clear.control is not None and clear.control.kind == "clear_session"
     assert model_status.control is not None and model_status.control.kind == "model_status"
     assert reasoning_status.control is not None and reasoning_status.control.kind == "reasoning_mode_status"
@@ -614,13 +617,13 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert handle_local_command("/permissions foo allow", todos).text == "Unknown permission: foo"
     assert handle_local_command("/permissions write maybe", todos).text == "Expected allow, deny, or ask."
     assert handle_local_command("/permissions write", todos).text == (
-        "Usage: /permissions [read|write|execute] [allow|deny|ask]"
+        "Usage: /permissions [read|write|execute|external] [allow|deny|ask]"
     )
     assert handle_local_command("/clear now", todos).text == "Usage: /clear"
 
     class Runtime:
         def __init__(self) -> None:
-            self.permissions = {"read": "allow", "write": "allow", "execute": "allow"}
+            self.permissions = {"read": "allow", "write": "allow", "execute": "allow", "external": "allow"}
             self.calls: list[tuple[object, ...]] = []
             self.models = (
                 ModelInfo(
@@ -650,6 +653,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
                 read_policy=self.permissions["read"],
                 write_policy=self.permissions["write"],
                 execute_policy=self.permissions["execute"],
+                external_policy=self.permissions["external"],
             )
 
         def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged:
@@ -706,6 +710,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
         for local in (
             status,
             changed,
+            external,
             quick_toggle,
             clear,
             model_status,
@@ -715,13 +720,16 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
             model_changed,
             unknown_model,
         ):
-            await _dispatch_control(runtime, local, display)
+            control = local.control if hasattr(local, "control") else local
+            assert control is not None
+            await _dispatch_control(runtime, control, display)
 
     asyncio.run(scenario())
     rendered = "\n".join(transcript.render(120))
     assert runtime.calls == [
         ("status",),
         ("permission", "write", "deny"),
+        ("permission", "external", "ask"),
         ("toggle_permissions",),
         ("status",),
         ("clear",),
@@ -735,9 +743,10 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert shown_models == ["Configured Model", "Large Model"]
     assert "model: Large Model" in format_header(shown_models[-1], Path.cwd())
     assert "Permissions" in rendered
-    assert "Ctrl+R: allow all / restore previous." in rendered
-    assert "External paths still require approval" in rendered
+    assert "Ctrl+R: allow all including external paths / restore previous." in rendered
+    assert "external   allow" in rendered
     assert "✓ write permission set to deny." in rendered
+    assert "✓ external permission set to ask." in rendered
     assert "✓ Conversation history cleared." in rendered
     assert "LOCAL\n  MODELS\n  * Active: Configured Model (configured-model)" in rendered
     assert "Context: 128,000 tokens" in rendered

@@ -74,8 +74,8 @@ def format_permission_status(status: RuntimeControlStatus) -> str:
             f"{'read':<10} {status.read_policy}",
             f"{'write':<10} {status.write_policy}",
             f"{'execute':<10} {status.execute_policy}",
-            "Ctrl+R: allow all / restore previous.",
-            "External paths still require approval.",
+            f"{'external':<10} {status.external_policy}",
+            "Ctrl+R: allow all including external paths / restore previous.",
         ]
     )
 
@@ -614,7 +614,7 @@ def handle_local_command(prompt: str, todos: TodoList) -> LocalCommand:
         if not values:
             return LocalCommand(True, control=LocalControl("permissions_status"))
         if len(values) != 2:
-            return LocalCommand(True, "Usage: /permissions [read|write|execute] [allow|deny|ask]")
+            return LocalCommand(True, "Usage: /permissions [read|write|execute|external] [allow|deny|ask]")
         category, value = values
         if category not in PERMISSION_CATEGORIES:
             return LocalCommand(True, f"Unknown permission: {category}")

@@ -35,6 +35,7 @@ def test_configured_model_info_is_deterministic_non_secret_and_normalized(monkey
         context_tokens=32768,
         supported_reasoning_modes=("low", "none", "high"),
         none_semantics="omit",
+        supports_image_input=True,
     )
     assert second == first
     assert configured_model_catalog() == (first,)
@@ -130,6 +131,7 @@ def test_catalog_defaults_to_one_model_with_undeclared_reasoning_modes(monkeypat
         "BOLT_MODEL_REASONING_MODES",
         "BOLT_MODEL_REASONING_NONE_SEMANTICS",
         "BOLT_MODEL_CONTEXT_TOKENS",
+        "BOLT_MODEL_SUPPORTS_IMAGE_INPUT",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -142,7 +144,8 @@ def test_catalog_defaults_to_one_model_with_undeclared_reasoning_modes(monkeypat
     assert info.supported_reasoning_modes == ()
     assert info.none_semantics == "literal"
     assert profile.transport == "chat_completions"
-    assert profile.supports_image_input is False
+    assert info.supports_image_input is True
+    assert profile.supports_image_input is True
 
 
 @pytest.mark.parametrize("transport", ("chat_completions", "responses"))

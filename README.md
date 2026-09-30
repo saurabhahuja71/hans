@@ -24,16 +24,17 @@ branding are HANS. Current release: **0.7.7**.
 
 ## What 0.7.7 provides
 
-- `Ctrl+R` temporarily allows all read, write, and execute permissions while HANS is idle; press it
-  again to restore the previous process-local per-category policy. It never bypasses external-path
-  approval. In the Textual composer, `Ctrl+A` selects the full draft so it can be replaced.
+- `Ctrl+R` temporarily allows all read, write, execute, and external-path permissions while HANS is
+  idle; press it again to restore the previous process-local per-category policy. In the Textual
+  composer, `Ctrl+A` selects the full draft so it can be replaced.
 - The Textual `/` command-completion panel includes every registered command, stays bounded and
   scrollable, follows Up/Down selection, and supports PageUp/PageDown selection jumps.
-- Runtime-enforced, session-scoped read, write, and execute permissions through the local
-  `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
-- Filesystem discovery and inspection use `list_directory`, `search_files`, and `read_file`; a literal
-  `~/...` path is routed through the existing explicit external-path approval. `run_command` remains a
-  direct, workspace-confined command runner and does not expand shell syntax or home paths.
+- Runtime-enforced, session-scoped read, write, execute, and external-path permissions through the
+  local `/permissions` command. All four default to `allow`; existing workspace and command safety
+  restrictions remain mandatory.
+- Filesystem discovery and inspection use `list_directory`, `search_files`, and `read_file`; external
+  paths follow the current external-path policy. `run_command` remains a direct, workspace-confined
+  command runner and does not expand shell syntax or home paths.
 - `/clear` clears the active SDK `SQLiteSession` conversation history while preserving workspace
   files and local HANS controls.
 - A local, secret-free configured model catalog: `/models` shows configured profiles and
@@ -43,10 +44,11 @@ branding are HANS. Current release: **0.7.7**.
   unchanged.
 - `/mode` validates a session-scoped reasoning override against declared model capabilities and
   applies it only to later requests. `/compact` remains unimplemented.
-- The `ask` permission policy pauses eligible tools for an explicit terminal approval. Approval prompts
-  show bounded, redacted tool details rather than tool payloads. Paths resolving outside the workspace
-  require a separate, exact-operation approval even when the corresponding permission is `allow`; no
-  permanent external-path trust is retained.
+- The `ask` category policy pauses eligible tools for an explicit terminal approval. Approval prompts
+  show bounded, redacted tool details rather than tool payloads. External paths use their own policy:
+  `ask` requires one exact-operation approval with no permanent trust, `deny` blocks I/O without a
+  prompt, and `allow` runs canonical external filesystem targets without external approval unless the
+  category or original SDK policy requires one.
 - Failed tool rows identify the safe operation/target and a bounded, redacted reason. HANS does not
   automatically retry failed or denied tools; inspect output and submit a new task as needed.
 - `/help` is a local guide to configuration, session, safety, and workspace controls. In an idle
@@ -88,10 +90,10 @@ The following suffixes are optional:
 | `MAX_RETRIES` | Non-negative request retry count; defaults to `0`. |
 
 When `BOLT_MODEL_PROFILES` is unset, HANS retains its legacy single-profile configuration using
-`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. Set the generic
-`BOLT_MODEL_SUPPORTS_IMAGE_INPUT=true` only when that legacy model and its configured transport accept
-image input; it enables the SDK-native `read_image` tool without identifying a provider. `BOLT_WORKSPACE`
-is optional and defaults to the current directory.
+`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. Legacy configuration
+enables image input by default; set `BOLT_MODEL_SUPPORTS_IMAGE_INPUT=false` only when the configured
+model or transport cannot accept image input. This generic setting enables the SDK-native `read_image`
+tool without identifying a provider. `BOLT_WORKSPACE` is optional and defaults to the current directory.
 
 `/models` displays only safe, local catalog metadata: the active profile, display name, endpoint
 profile, context limit, declared reasoning modes, image-input support, and the active effective
@@ -195,9 +197,9 @@ The footer shows only controls relevant to the current semantic task state:
 - **Idle/composer:** Enter submits, Shift+Enter inserts a newline, and Ctrl-D submits. Ctrl-D on an
   empty composer exits. Ctrl-Q exits immediately. Ctrl-C clears an idle draft. Ctrl-B cycles session
   themes and Ctrl-T toggles the compact local TODO view; neither submits a request. Ctrl+R
-  temporarily allows read, write, and execute permissions; press it again to restore the previous
-  process-local per-category policy. It is disabled during requests and approvals, and never bypasses
-  external-path approval.
+  temporarily allows read, write, execute, and external-path permissions; press it again to restore
+  the previous process-local per-category policy, including external paths. It is disabled during
+  requests and approvals.
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
@@ -242,13 +244,12 @@ Git commands for this operation.
 
 ## Workspace safety and tool limits
 
-The workspace is the default boundary for filesystem tools. Paths that resolve within it work
-normally. An external path, including traversal (`../`), a `~/...` path expanded from the runtime
-`HOME`, or a symlink that resolves outside the workspace, requires explicit approval for that exact
-operation even when the corresponding permission policy is `allow`. HANS resolves the target
-canonically before granting approval, so approval applies to that exact canonical target and creates
-no permanent trust. Missing, unreadable, and non-UTF-8 reads are returned as tool errors rather than
-raised out of the SDK loop. `list_directory` reports only direct
+The workspace is the default boundary for filesystem tools. Paths resolving within it work normally.
+HANS canonically resolves traversal (`../`), `~/...` paths expanded from the runtime `HOME`, and
+symlinks before applying the external-path policy. An external target runs by default under `allow`,
+requires one bounded, redacted approval for that exact canonical tool call under `ask`, and is blocked
+before I/O under `deny`. A category-level `deny` always wins. Missing, unreadable, and non-UTF-8 reads
+are returned as tool errors rather than raised out of the SDK loop. `list_directory` reports only direct
 entries, in deterministic sorted order, as `directory`, `file`, `symlink`, or `other`; its output is
 bounded to the tool-result context budget. A symlink is reported as a symlink rather than followed
 during listing.
@@ -269,17 +270,17 @@ files return a safe error rather than a UTF-8 decoder exception.
 WebP, and GIF after matching the filename extension and file signature, limits input to 10 MiB, 8192
 pixels per dimension, and 32 million pixels total, then passes a bounded local data URL to the OpenAI
 Agents SDK as actual image input. It does not OCR or modify the original file. Image token use is
-provider-dependent and is not fabricated by HANS's text context accounting. An external image still
-requires exact external-path approval even if read permission or the allow-all toggle is active.
+provider-dependent and is not fabricated by HANS's text context accounting. An external image follows
+the external-path policy: `ask` requires exact approval, `allow` reads directly, and `deny` blocks it.
 
 `replace_in_file` requires exactly one literal occurrence and uses a temporary-file replacement for
 targeted edits. `write_file` creates parent directories inside the workspace and replaces the target
-file. Successful mutations participate in the task-local change journal described above.
+file. Successful mutations participate in the task-local change journal described above. External
+writes are revalidated before mutation and are excluded from the task journal and diff.
 
-The five filesystem tools can use a path that resolves outside the workspace only after explicit
-per-operation approval. Approval applies only to that exact invocation; prompts use bounded, redacted
-paths and access is never persisted or automatically trusted. External file mutations are not included
-in the task journal or diff. This does not change `run_command`, which remains workspace constrained.
+The five filesystem tools apply this policy to paths resolving outside the workspace. `ask` approval
+applies only to that exact invocation and creates no permanent trust. This does not change
+`run_command`, which remains workspace constrained.
 
 `run_command` does not use a shell and will not grow one silently. The command string is rejected
 if it contains shell metacharacters, including pipes, redirects, `&` (`&&` / `||`), `;`, substitution

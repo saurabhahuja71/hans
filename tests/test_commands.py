@@ -61,7 +61,7 @@ def test_registry_generated_help_covers_commands_categories_and_keyboard_shortcu
     assert "Ctrl+R" in help_text
     assert "Ctrl+Shift+A" not in help_text
     assert "Ctrl+Y" in help_text
-    assert "Allow all permissions / restore previous (idle)" in help_text
+    assert "Allow all including external paths / restore previous (idle)" in help_text
 
 
 def test_command_suggestions_are_canonical_bounded_and_contextual() -> None:
@@ -88,6 +88,7 @@ def test_command_suggestions_are_canonical_bounded_and_contextual() -> None:
         "/permissions read",
         "/permissions write",
         "/permissions execute",
+        "/permissions external",
     )
     assert command_suggestions("/permissions write", context) == (
         "/permissions write allow",

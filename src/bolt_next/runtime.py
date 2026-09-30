@@ -419,14 +419,17 @@ class HansRuntime:
         # Python traceback before the user sees HANS.
         self._agent = agent
         self._workspace = resolve_workspace(workspace or os.environ.get("BOLT_WORKSPACE"))
-        self._external_path_authorizer = ExternalPathAuthorizer(self._workspace)
+        self._permissions = {"read": "allow", "write": "allow", "execute": "allow", "external": "allow"}
+        self._external_path_authorizer = ExternalPathAuthorizer(
+            self._workspace,
+            get_external_policy=self._external_permission_policy,
+        )
         self._journal = TaskMutationJournal(self._workspace)
         self._agent_factory = agent_factory or create_agent
         self._session_factory = session_factory or SQLiteSession
         self._session = session if session is not None else self._session_factory("hans-tui")
         self._owns_session = session is None
         self._runner = runner
-        self._permissions = {"read": "allow", "write": "allow", "execute": "allow"}
         self._permission_toggle_snapshot: dict[str, str] | None = None
         self._interactive = interactive or (lambda: sys.stdin.isatty() and sys.stdout.isatty())
         self._request_active = False
@@ -447,7 +450,12 @@ class HansRuntime:
         self._reasoning_mode_override: str | None = None
         self._base_model_settings: Any | None = None
         if self._agent is not None:
-            apply_tool_permission_policy(self._agent, self._permission_allowed, authorizer=self._external_path_authorizer)
+            apply_tool_permission_policy(
+                self._agent,
+                self._permission_allowed,
+                authorizer=self._external_path_authorizer,
+                get_external_policy=self._external_permission_policy,
+            )
             self._snapshot_model_settings()
 
     def get_control_status(self) -> RuntimeControlStatus:
@@ -455,6 +463,7 @@ class HansRuntime:
             read_policy=self._permissions["read"],
             write_policy=self._permissions["write"],
             execute_policy=self._permissions["execute"],
+            external_policy=self._permissions["external"],
         )
 
     def _active_profile(self) -> ConfiguredModelProfile:
@@ -532,7 +541,12 @@ class HansRuntime:
             )
             if target_agent is None:
                 raise RuntimeError("target agent is unavailable")
-            apply_tool_permission_policy(target_agent, self._permission_allowed, authorizer=self._external_path_authorizer)
+            apply_tool_permission_policy(
+                target_agent,
+                self._permission_allowed,
+                authorizer=self._external_path_authorizer,
+                get_external_policy=self._external_permission_policy,
+            )
             target_base_settings = self._model_settings_snapshot(target_agent)
             target_context_filter = make_fit_model_input(target_profile.info.context_tokens)
             target_session = self._session_factory(self._new_session_id())
@@ -634,6 +648,9 @@ class HansRuntime:
 
     def _permission_allowed(self, category: str) -> str:
         return self._permissions[category]
+
+    def _external_permission_policy(self) -> str:
+        return self._permissions["external"]
 
     def _invalidate_pending_approvals(self) -> None:
         self._pending_approvals.clear()
@@ -863,6 +880,7 @@ class HansRuntime:
                     self._agent,
                     self._permission_allowed,
                     authorizer=self._external_path_authorizer,
+                    get_external_policy=self._external_permission_policy,
                 )
                 self._snapshot_model_settings()
             self._apply_effective_model_settings()

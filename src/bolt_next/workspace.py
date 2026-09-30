@@ -11,6 +11,7 @@ import tempfile
 import time
 import zlib
 from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 
 from agents import ToolOutputImage, function_tool
@@ -257,10 +258,11 @@ class ExternalPathAccess:
 
 
 class ExternalPathAuthorizer:
-    """Holds exact, one-use approvals for filesystem targets outside the workspace."""
+    """Applies external-path policy and holds exact, one-use approvals when required."""
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, *, get_external_policy: Callable[[], str] | None = None) -> None:
         self.workspace = resolve_workspace(workspace)
+        self._get_external_policy = get_external_policy or (lambda: "ask")
         self._proposals: dict[tuple[str, str], ExternalPathAccess] = {}
         self._grants: dict[tuple[str, str], ExternalPathAccess] = {}
 
@@ -314,17 +316,25 @@ class ExternalPathAuthorizer:
         *,
         mutation: bool = False,
     ) -> tuple[Path, bool]:
+        target, external = self.classify(path, mutation=mutation)
+        if not external:
+            call_id = getattr(context, "tool_call_id", None)
+            if isinstance(call_id, str) and call_id:
+                granted = self._grants.get((tool_name, call_id))
+                if granted is not None:
+                    self._grants.pop((tool_name, call_id), None)
+                    raise WorkspaceError("External path requires approval")
+            return target, False
+        policy = self._get_external_policy()
+        if policy == "deny":
+            raise WorkspaceError("External path access is disabled")
+        if policy == "allow":
+            return target, True
         call_id = getattr(context, "tool_call_id", None)
         if not isinstance(call_id, str) or not call_id:
             raise WorkspaceError("External path requires approval")
-        target, external = self.classify(path, mutation=mutation)
         key = (tool_name, call_id)
         granted = self._grants.get(key)
-        if not external:
-            if granted is not None:
-                self._grants.pop(key, None)
-                raise WorkspaceError("External path requires approval")
-            return target, False
         if granted is None or granted.path != target:
             self._grants.pop(key, None)
             raise WorkspaceError("External path requires approval")
@@ -656,10 +666,10 @@ def make_read_image_tool(workspace: Path, *, authorizer: ExternalPathAuthorizer 
     async def read_image(context: ToolContext, path: str) -> ToolOutputImage | str:
         """Read a PNG, JPEG, WebP, or GIF image as model-visible image data.
 
-        The path is inside the workspace unless this exact call is approved for an external path that resolves outside the workspace. The image is not OCR'd.
+        Paths outside the workspace follow the active external-path policy. The image is not OCR'd.
 
         Args:
-            path: A workspace-relative image path, or an approved external image path.
+            path: A workspace-relative image path, or an external image path allowed by the external-path policy.
         """
         try:
             target, _external = _tool_target(workspace, authorizer, context, "read_image", path)
@@ -698,14 +708,14 @@ def make_read_file_tool(
 ):
     @function_tool
     async def read_file(context: ToolContext, path: str, start_line: int = 1, end_line: int = 0) -> str:
-        """Read a UTF-8 text file inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
+        """Read a UTF-8 text file inside the workspace unless an external path is allowed by the current external-path policy.
 
         Small files are returned in full. A large file is returned as an explicit
         line range, never as a summary. Use start_line and end_line to inspect
         another range. end_line 0 means "as far as the context budget allows".
 
         Args:
-            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
+            path: A workspace-relative path, or an external path allowed by the current external-path policy.
             start_line: First line to return, starting at 1.
             end_line: Last line to return, inclusive. 0 selects a budget-sized range.
         """
@@ -776,10 +786,10 @@ def make_write_file_tool(
 ):
     @function_tool
     async def write_file(context: ToolContext, path: str, content: str) -> str:
-        """Create or replace a UTF-8 text file inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
+        """Create or replace a UTF-8 text file inside the workspace unless an external path is allowed by the current external-path policy.
 
         Args:
-            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
+            path: A workspace-relative path, or an external path allowed by the current external-path policy.
             content: The full file contents to write.
         """
         try:
@@ -885,10 +895,10 @@ def make_list_directory_tool(
 ):
     @function_tool
     async def list_directory(context: ToolContext, path: str = ".") -> str:
-        """List direct directory entries in sorted order inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
+        """List direct directory entries in sorted order inside the workspace unless an external path is allowed by the current external-path policy.
 
         Args:
-            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
+            path: A workspace-relative path, or an external path allowed by the current external-path policy.
         """
         try:
             target, _external = _tool_target(workspace, authorizer, context, "list_directory", path)
@@ -924,13 +934,13 @@ def make_search_files_tool(
     async def search_files(context: ToolContext, query: str, path: str = ".", max_results: int = 50) -> str:
         """Search UTF-8 text files and return matching path:line text.
 
-        The path is inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
+        The path is inside the workspace unless an external path is allowed by the current external-path policy.
         Binary and unreadable files are skipped. Results are sorted and constrained by both
         max_results and the tool result context budget.
 
         Args:
             query: Literal text to find. It must not be empty.
-            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
+            path: A workspace-relative path, or an external path allowed by the current external-path policy.
             max_results: Maximum matching lines to return, from 1 through 100.
         """
         if not query:
@@ -981,10 +991,10 @@ def make_replace_in_file_tool(
 ):
     @function_tool
     async def replace_in_file(context: ToolContext, path: str, old_text: str, new_text: str) -> str:
-        """Replace exactly one literal text occurrence in an existing UTF-8 file inside the workspace unless this exact call is approved for an external path that resolves outside the workspace.
+        """Replace exactly one literal text occurrence in an existing UTF-8 file inside the workspace unless an external path is allowed by the current external-path policy.
 
         Args:
-            path: A workspace-relative path, or an external path that resolves outside the workspace and is approved for this exact call.
+            path: A workspace-relative path, or an external path allowed by the current external-path policy.
             old_text: Existing text that must occur exactly once.
             new_text: Replacement text.
         """
@@ -1083,7 +1093,7 @@ def reject_shell_syntax(command: str) -> str | None:
             return (
                 "Error: run_command does not expand `~` and only runs direct workspace commands. "
                 "Use list_directory, search_files, or read_file with the literal `~/...` path; "
-                "HANS will request explicit approval for external access."
+                "external access follows the current external-path policy."
             )
         if argument == "./...":
             continue
