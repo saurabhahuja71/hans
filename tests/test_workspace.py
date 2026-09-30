@@ -221,6 +221,20 @@ def test_read_image_requires_its_own_exact_external_approval(tmp_path: Path) -> 
     assert invoke(tool, arguments, call_id="external-image").type == "image"
 
 
+def test_external_path_tilde_uses_the_runtime_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime_home = tmp_path / "runtime-home"
+    target = runtime_home / "Desktop" / "chart.png"
+    monkeypatch.setenv("HOME", str(runtime_home))
+    authorizer = ExternalPathAuthorizer(tmp_path)
+
+    access = authorizer.propose("read_image", "home-image", "~/Desktop/chart.png")
+
+    assert access is not None
+    assert access.path == target.resolve(strict=False)
+    assert access.display_path == "~/Desktop/chart.png"
+    assert str(access.path) != "/home/oai/Desktop/chart.png"
+
+
 def test_path_traversal_rejected(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceError):
         resolve_workspace_path(tmp_path, "../secret.txt")

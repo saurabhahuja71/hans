@@ -722,9 +722,14 @@ async def _run_curses(runtime: HansRuntime) -> None:
             stdscr.addnstr(3 + offset, 0, line, width - 1)
         todo_at = 3 + conversation
         suggestions = state["command_suggestions"]
-        available_suggestion_rows = max(0, todo_at - 3)
-        visible_suggestions = suggestions[-available_suggestion_rows:] if available_suggestion_rows else ()
-        first_suggestion = len(suggestions) - len(visible_suggestions)
+        available_suggestion_rows = min(8, max(0, todo_at - 3))
+        visible_count = min(len(suggestions), available_suggestion_rows)
+        selected_suggestion = state["command_suggestion_index"]
+        first_suggestion = min(
+            max(0, selected_suggestion - visible_count // 2),
+            max(0, len(suggestions) - visible_count),
+        )
+        visible_suggestions = suggestions[first_suggestion : first_suggestion + visible_count]
         for offset, suggestion in enumerate(visible_suggestions):
             index = first_suggestion + offset
             marker = ">" if index == state["command_suggestion_index"] else " "
@@ -873,8 +878,15 @@ async def _run_curses(runtime: HansRuntime) -> None:
             return False
         suggestions = state["command_suggestions"]
         if suggestions:
-            if name in {"up", "down"}:
-                step = -1 if name == "up" else 1
+            if name in {"up", "down", "pageup", "pagedown"}:
+                if name == "up":
+                    step = -1
+                elif name == "down":
+                    step = 1
+                elif name == "pageup":
+                    step = -8
+                else:
+                    step = 8
                 state["command_suggestion_index"] = (
                     state["command_suggestion_index"] + step
                 ) % len(suggestions)

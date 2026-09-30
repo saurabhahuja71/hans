@@ -28,7 +28,7 @@ branding are HANS. Current release: **0.7.7**.
   again to restore the previous process-local per-category policy. It never bypasses external-path
   approval. In the Textual composer, `Ctrl+A` selects the full draft so it can be replaced.
 - The Textual `/` command-completion panel includes every registered command, stays bounded and
-  scrollable, and follows Up/Down keyboard selection.
+  scrollable, follows Up/Down selection, and supports PageUp/PageDown selection jumps.
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
 - Filesystem discovery and inspection use `list_directory`, `search_files`, and `read_file`; a literal
@@ -51,8 +51,8 @@ branding are HANS. Current release: **0.7.7**.
   automatically retry failed or denied tools; inspect output and submit a new task as needed.
 - `/help` is a local guide to configuration, session, safety, and workspace controls. In an idle
   Textual or curses composer, type `/` for bounded local command and argument suggestions, including
-  `/exit` and `/quit`; use Up/Down and Enter or Tab to select, or Esc to dismiss. Configured model IDs
-  and declared reasoning modes are suggested without sending a model request.
+  `/exit` and `/quit`; use Up/Down or PageUp/PageDown and Enter or Tab to select, or Esc to dismiss.
+  Configured model IDs and declared reasoning modes are suggested without sending a model request.
 
 ## Configuration
 
@@ -76,8 +76,8 @@ The following suffixes are optional:
 | --- | --- |
 | `DISPLAY_NAME` | Safe human-readable name shown by `/models`; defaults to the profile ID. |
 | `ENDPOINT_PROFILE` | Safe endpoint label shown by `/models`; use this rather than the base URL. |
-| `TRANSPORT` | `chat_completions` (default) or `responses`. Image input requires `responses`. |
-| `SUPPORTS_IMAGE_INPUT` | `true` or `false` (default). Set `true` only for a `responses` profile whose model accepts image input. |
+| `TRANSPORT` | `chat_completions` (default) or `responses`. Select the transport required by the configured provider endpoint. |
+| `SUPPORTS_IMAGE_INPUT` | `true` or `false` (default). Set `true` for any configured profile whose selected model and transport accept image input. |
 | `CONTEXT_TOKENS` | Context limit used by HANS's conservative request guard; defaults to `16384` and must be at least `1024`. |
 | `MAX_COMPLETION_TOKENS` | Optional positive completion limit, capped to the available completion reserve. |
 | `REASONING_MODES` | Comma-separated declared reasoning modes. If unset, `/mode` reports support as not declared and does not permit overrides. |
@@ -199,12 +199,13 @@ The footer shows only controls relevant to the current semantic task state:
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
-- **Copying response text (Textual UI):** Drag to select any visible transcript text, then press
-  Ctrl-C or right-click and choose `Copy selected text`. Without a selection, Ctrl-C retains its
-  normal cancel behavior. Ctrl-Y copies the bounded, displayed representation of the most recent
-  assistant response or open detail view. The `HANS_TUI=curses` fallback sends the same text through
-  terminal OSC 52; HANS reports that the copy was sent to the terminal, rather than claiming a
-  terminal accepted it into the desktop clipboard.
+- **Copying response text (Textual UI):** Drag to select visible transcript text, then press Ctrl-C
+  or right-click the selected transcript and click `Copy selected text`. Without a selection, Ctrl-C
+  retains its normal cancel behavior. Ctrl-Y copies the bounded, displayed representation of the most
+  recent assistant response or open detail view. Textual asks its clipboard integration to copy and
+  reports that request; HANS cannot verify desktop clipboard acceptance. The `HANS_TUI=curses`
+  fallback sends the same text through terminal OSC 52 and likewise reports only that it sent the
+  request to the terminal.
 - **Completed task with HANS-owned changes:** Ctrl-G opens the bounded task diff and Ctrl-Z requests
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded
@@ -240,10 +241,12 @@ Git commands for this operation.
 ## Workspace safety and tool limits
 
 The workspace is the default boundary for filesystem tools. Paths that resolve within it work
-normally. An external path, including traversal (`../`) or a symlink that resolves outside the
-workspace, requires explicit approval for that exact operation even when the corresponding permission
-policy is `allow`; approval creates no permanent trust. Missing, unreadable, and non-UTF-8 reads are
-returned as tool errors rather than raised out of the SDK loop. `list_directory` reports only direct
+normally. An external path, including traversal (`../`), a `~/...` path expanded from the runtime
+`HOME`, or a symlink that resolves outside the workspace, requires explicit approval for that exact
+operation even when the corresponding permission policy is `allow`. HANS resolves the target
+canonically before granting approval, so approval applies to that exact canonical target and creates
+no permanent trust. Missing, unreadable, and non-UTF-8 reads are returned as tool errors rather than
+raised out of the SDK loop. `list_directory` reports only direct
 entries, in deterministic sorted order, as `directory`, `file`, `symlink`, or `other`; its output is
 bounded to the tool-result context budget. A symlink is reported as a symlink rather than followed
 during listing.

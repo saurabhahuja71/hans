@@ -145,17 +145,20 @@ def test_catalog_defaults_to_one_model_with_undeclared_reasoning_modes(monkeypat
     assert profile.supports_image_input is False
 
 
-def test_configured_responses_image_profile_requires_explicit_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("transport", ("chat_completions", "responses"))
+def test_configured_image_profile_accepts_explicit_capability_for_any_supported_transport(
+    monkeypatch: pytest.MonkeyPatch, transport: str
+) -> None:
     monkeypatch.setenv("BOLT_MODEL_PROFILES", "vision")
     monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_MODEL", "vision-model")
     monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_BASE_URL", "https://vision.example.test/v1")
     monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_API_KEY", "vision-key")
-    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_TRANSPORT", " responses ")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_TRANSPORT", f" {transport} ")
     monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_SUPPORTS_IMAGE_INPUT", " TRUE ")
 
     profile = configured_model_profile()
 
-    assert profile.transport == "responses"
+    assert profile.transport == transport
     assert profile.supports_image_input is True
     assert profile.info.supports_image_input is True
 
@@ -165,10 +168,9 @@ def test_configured_responses_image_profile_requires_explicit_capability(monkeyp
     [
         ("BOLT_MODEL_PROFILE_VISION_TRANSPORT", "other", "chat_completions.*responses"),
         ("BOLT_MODEL_PROFILE_VISION_SUPPORTS_IMAGE_INPUT", "yes", "true.*false"),
-        ("BOLT_MODEL_PROFILE_VISION_SUPPORTS_IMAGE_INPUT", "true", "requires"),
     ],
 )
-def test_configured_image_profile_rejects_invalid_or_incompatible_capabilities(
+def test_configured_image_profile_rejects_invalid_capabilities(
     monkeypatch: pytest.MonkeyPatch, name: str, value: str, message: str
 ) -> None:
     monkeypatch.setenv("BOLT_MODEL_PROFILES", "vision")

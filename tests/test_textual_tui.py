@@ -240,7 +240,7 @@ def test_textual_composer_ctrl_a_selects_all_and_replaces_draft(tmp_path: Path) 
     asyncio.run(scenario())
 
 
-def test_textual_selected_text_menu_copies_with_existing_safe_callback(tmp_path: Path) -> None:
+def test_textual_selected_text_menu_copy_button_uses_existing_safe_callback(tmp_path: Path) -> None:
     async def scenario() -> None:
         app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
         copied: list[str] = []
@@ -248,7 +248,7 @@ def test_textual_selected_text_menu_copies_with_existing_safe_callback(tmp_path:
             app.copy_to_clipboard = copied.append
             app.push_screen(SelectedTextScreen("visible safe output"))
             await pilot.pause()
-            await pilot.press("c")
+            await pilot.click("#copy-selected-text")
             await pilot.pause()
             assert copied == ["visible safe output"]
             assert "clipboard copy requested" in rendered(app.query_one("#state-line", Static))
@@ -967,6 +967,38 @@ def test_textual_command_completion_keeps_all_commands_selectable_beyond_visible
             await pilot.press(*("down" for _ in range(7)), "enter")
             await pilot.pause()
             assert app.query_one("#composer", TextArea).text == "/todo"
+            assert app._command_suggestions == ()
+
+    asyncio.run(scenario())
+
+
+def test_textual_command_completion_pages_scrolls_and_accepts_the_selected_row(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        suggestions = tuple(f"/command-{number}" for number in range(20))
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._command_suggestions = suggestions
+            app._command_suggestion_index = 0
+            app._render_command_suggestions()
+            widget = app.query_one("#command-suggestions", Static)
+            await pilot.pause()
+            assert "> /command-0" not in rendered(widget)
+            assert "› /command-0" in rendered(widget)
+
+            await pilot.press("pagedown")
+            await pilot.pause()
+            assert app._command_suggestion_index == 8
+            assert "› /command-8" in rendered(widget)
+            assert widget.scroll_y > 0
+
+            await pilot.press("pageup")
+            await pilot.pause()
+            assert app._command_suggestion_index == 0
+            assert "› /command-0" in rendered(widget)
+
+            await pilot.press("pagedown", "enter")
+            await pilot.pause()
+            assert app.query_one("#composer", TextArea).text == "/command-8"
             assert app._command_suggestions == ()
 
     asyncio.run(scenario())

@@ -188,8 +188,6 @@ def _profile_from_environment(profile_id: str) -> ConfiguredModelProfile:
     supports_image_input = _profile_image_support(
         prefix + "SUPPORTS_IMAGE_INPUT", _optional_value(prefix + "SUPPORTS_IMAGE_INPUT")
     )
-    if supports_image_input and transport != "responses":
-        raise ConfigurationError(f"{prefix}SUPPORTS_IMAGE_INPUT requires {prefix}TRANSPORT='responses'")
     return ConfiguredModelProfile(
         info=ModelInfo(
             id=profile_id,

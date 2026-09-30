@@ -1,9 +1,13 @@
 import asyncio
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from bolt_next.commands import format_help
+import bolt_next.tui as tui_module
+
+from bolt_next.commands import command_names, format_help
 from bolt_next.events import (
     AssistantMessageDelta,
     ModelChanged,
@@ -795,6 +799,85 @@ def test_osc52_copy_is_plain_text_bounded_and_failure_safe() -> None:
         raise RuntimeError("no clipboard")
 
     assert copy_osc52("text", fail) == (False, "Clipboard unavailable")
+
+
+def test_curses_completion_viewport_keeps_the_paged_selection_visible(monkeypatch: pytest.MonkeyPatch) -> None:
+    class CursesError(Exception):
+        pass
+
+    class Screen:
+        def __init__(self) -> None:
+            self.keys = iter(["/", 338, "\x11"])
+            self.current: list[tuple[int, str]] = []
+            self.frames: list[list[tuple[int, str]]] = []
+
+        def getmaxyx(self) -> tuple[int, int]:
+            return (24, 80)
+
+        def erase(self) -> None:
+            self.current = []
+
+        def addnstr(self, row: int, _column: int, text: str, _width: int, *_attributes: int) -> None:
+            self.current.append((row, text))
+
+        def hline(self, *_args: object) -> None:
+            pass
+
+        def refresh(self) -> None:
+            self.frames.append(list(self.current))
+
+        def keypad(self, _enabled: bool) -> None:
+            pass
+
+        def nodelay(self, _enabled: bool) -> None:
+            pass
+
+        def get_wch(self) -> str | int:
+            return next(self.keys)
+
+    screen = Screen()
+    fake_curses = SimpleNamespace(
+        error=CursesError,
+        A_REVERSE=1,
+        A_NORMAL=0,
+        A_BOLD=2,
+        ACS_HLINE=0,
+        KEY_UP=259,
+        KEY_DOWN=258,
+        KEY_PPAGE=339,
+        KEY_NPAGE=338,
+        KEY_RESIZE=410,
+        initscr=lambda: screen,
+        curs_set=lambda _visibility: None,
+        noecho=lambda: None,
+        cbreak=lambda: None,
+        nocbreak=lambda: None,
+        echo=lambda: None,
+        endwin=lambda: None,
+    )
+
+    class Runtime:
+        def cancel_active(self) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setitem(sys.modules, "curses", fake_curses)
+    monkeypatch.setattr(tui_module.termios, "tcgetattr", lambda _stream: [0, 0, 0, 0])
+    monkeypatch.setattr(tui_module.termios, "tcsetattr", lambda *_args: None)
+    monkeypatch.setattr(tui_module.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(tui_module, "_set_enhanced_input", lambda _enabled: None)
+
+    asyncio.run(tui_module._run_curses(Runtime()))
+
+    paged_frame = next(frame for frame in reversed(screen.frames) if any(
+        text.startswith("> /theme") for _, text in frame
+    ))
+    suggestion_rows = [text for _, text in paged_frame if text[2:] in command_names()]
+    assert "> /theme" in suggestion_rows
+    assert "  /help" not in suggestion_rows
+    assert len(suggestion_rows) == 8
 
 
 def test_detail_window_decoder_and_retention_bounds() -> None:

@@ -84,6 +84,7 @@ class _PendingApproval:
     session_generation: int
     external: bool = False
     external_path: str | None = None
+    external_call_id: str | None = None
 
 
 _TOOL_CATEGORIES = {
@@ -161,6 +162,11 @@ def _approval_call_id(item: Any, request_generation: int, index: int) -> str:
             if isinstance(candidate, str) and candidate.strip():
                 return candidate
     return f"missing-call-{request_generation}-{index}"
+
+
+def _sdk_approval_call_id(item: Any) -> str | None:
+    candidate = _member(item, "call_id")
+    return candidate if isinstance(candidate, str) and candidate.strip() else None
 
 
 def _redact_approval_text(value: str) -> str:
@@ -321,7 +327,7 @@ def _workspace_failure_reason(name: str, output: str) -> str | None:
     prefix = prefixes.get(name)
     if prefix is None:
         return None
-    if output.startswith("Error: file does not exist:"):
+    if output.startswith(("Error: file does not exist:", "Error: image file does not exist:")):
         return "File does not exist."
     if output.startswith(f"{prefix}:"):
         return _failure_reason_text(output[len(prefix) + 1 :])
@@ -432,6 +438,7 @@ class HansRuntime:
         self._session_generation = 0
         self._pending_approvals: list[_PendingApproval] = []
         self._tool_calls: dict[str, _ToolCall] = {}
+        self._tool_failure: str | None = None
         self._evidence: VerificationEvidence | None = None
         self._assistant_text: list[str] = []
         self._profile: ConfiguredModelProfile | None = None
@@ -689,17 +696,25 @@ class HansRuntime:
             tool_name = tool_name if isinstance(tool_name, str) and tool_name else "tool"
             arguments = _call_arguments(item)
             call_id = _approval_call_id(item, self._request_generation, index)
-            access = self._external_path_authorizer.proposal_for(tool_name, call_id)
+            sdk_call_id = _sdk_approval_call_id(item)
+            access = (
+                self._external_path_authorizer.proposal_for(tool_name, sdk_call_id)
+                if sdk_call_id is not None
+                else None
+            )
+            if access is not None:
+                call_id = sdk_call_id
             external_path = _bounded_approval_text(access.display_path) if access is not None else None
             display = _approval_display(tool_name, arguments)
-            if external_path is not None:
-                display = ToolApprovalDisplay(
-                    tuple(
-                        (name, external_path if name == "path" else value)
-                        for name, value in display.fields
-                    )
-                    + (("scope", "outside workspace"),)
+            if access is not None:
+                resolved_path = _bounded_approval_text(str(access.path))
+                display_fields = tuple(
+                    (name, external_path if name == "path" else value)
+                    for name, value in display.fields
                 )
+                if resolved_path and resolved_path != external_path:
+                    display_fields += (("resolved", resolved_path),)
+                display = ToolApprovalDisplay(display_fields + (("scope", "outside workspace"),))
             pending.append(
                 _PendingApproval(
                     request_id=request_id,
@@ -716,6 +731,7 @@ class HansRuntime:
                     session_generation=self._session_generation,
                     external=access is not None,
                     external_path=external_path,
+                    external_call_id=sdk_call_id if access is not None else None,
                 )
             )
         self._pending_approvals = pending
@@ -777,7 +793,9 @@ class HansRuntime:
                 yield approval_event
                 return
             for pending in self._pending_approvals:
-                self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
+                self._external_path_authorizer.revoke(
+                    pending.tool_name, pending.external_call_id or pending.call_id
+                )
                 pending.state.reject(pending.item)
             state = self._pending_approvals[0].state
             self._invalidate_pending_approvals()
@@ -791,6 +809,9 @@ class HansRuntime:
     async def _terminal_events(self) -> AsyncIterator[HansEvent]:
         if self._cancel_requested:
             yield RequestCancelled()
+        elif self._tool_failure is not None:
+            yield RequestFailed(FailureCategory.TOOL, self._tool_failure, self._tool_failure)
+            yield ConnectionChanged(True)
         else:
             yield AssistantMessageComplete("".join(self._assistant_text))
             yield RequestCompleted(self._evidence)
@@ -825,6 +846,7 @@ class HansRuntime:
             self._cancel_requested = False
             self._journal.begin_task()
             self._tool_calls = {}
+            self._tool_failure = None
             self._evidence = None
             self._assistant_text = []
             yield UserMessageSubmitted(message)
@@ -879,9 +901,10 @@ class HansRuntime:
             return
         try:
             granted = False
+            external_call_id = pending.external_call_id or pending.call_id
             if approved:
                 if pending.external:
-                    if self._external_path_authorizer.approve_exact(pending.tool_name, pending.call_id) is None:
+                    if self._external_path_authorizer.approve_exact(pending.tool_name, external_call_id) is None:
                         yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
                         return
                     granted = True
@@ -889,14 +912,14 @@ class HansRuntime:
                     pending.state.approve(pending.item)
                 except Exception:
                     if granted:
-                        self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
+                        self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
                     raise
             else:
-                self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
+                self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
                 pending.state.reject(pending.item)
             if not self._approval_is_current(pending, request_id, call_id):
                 if granted:
-                    self._external_path_authorizer.revoke(pending.tool_name, pending.call_id)
+                    self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
                 yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
                 return
             self._pending_approvals.pop(0)
@@ -1001,6 +1024,8 @@ class HansRuntime:
             return tuple(events)
         failure_reason = _tool_failure_reason(call.name, rendered_output)
         success = failure_reason is None
+        if failure_reason is not None and self._tool_failure is None:
+            self._tool_failure = failure_reason
         events = [ToolOutput(call_id, _safe_tool_output(rendered_output, failed=not success))]
         if call.name in {"write_file", "replace_in_file"} and success:
             self._evidence = None

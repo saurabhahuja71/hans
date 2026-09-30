@@ -16,7 +16,7 @@ from textual.containers import Container, VerticalScroll
 from textual.events import Click, Key, MouseDown, TextSelected
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Static, TextArea
+from textual.widgets import Button, Static, TextArea
 
 from bolt_next.commands import CompletionContext, command_suggestions, is_complete_command
 from bolt_next.events import (
@@ -185,7 +185,7 @@ class SelectedTextScreen(ModalScreen[None]):
     CSS = """
     SelectedTextScreen { background: $background 80%; align: center middle; }
     #selected-text-menu { width: auto; height: auto; border: heavy $accent; background: $surface; padding: 1 2; }
-    #selected-text-menu-title { color: $accent; text-style: bold; }
+    #copy-selected-text { width: auto; }
     """
 
     def __init__(self, text: str) -> None:
@@ -194,8 +194,13 @@ class SelectedTextScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Container(id="selected-text-menu"):
-            yield Static("COPY SELECTED TEXT", id="selected-text-menu-title", markup=False)
+            yield Button("Copy selected text", id="copy-selected-text", variant="primary")
             yield Static("Enter/C copy  ·  Esc back", markup=False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "copy-selected-text":
+            event.stop()
+            self.action_copy()
 
     def action_copy(self) -> None:
         self.app.copy_plain_text(self.text)
@@ -299,7 +304,7 @@ class HansTextualApp(App[None]):
     #command-suggestions {
         display: none;
         height: auto;
-        max-height: 7;
+        max-height: 11;
         margin: 0 1;
         padding: 0 1;
         border: round $secondary;
@@ -476,9 +481,7 @@ class HansTextualApp(App[None]):
         return True
 
     def _selected_transcript_text(self) -> str | None:
-        transcript = self.query_one("#transcript", VerticalScroll)
-        transcript_rows = set(transcript.children)
-        if not any(widget in transcript_rows for widget in self.screen.selections):
+        if not any(self._is_transcript_target(widget) for widget in self.screen.selections):
             return None
         return self.screen.get_selected_text()
 
@@ -586,8 +589,15 @@ class HansTextualApp(App[None]):
     def _handle_completion_key(self, event: Key) -> bool:
         if not self._command_suggestions:
             return False
-        if event.key in {"up", "down"}:
-            step = -1 if event.key == "up" else 1
+        if event.key in {"up", "down", "pageup", "pagedown"}:
+            if event.key == "up":
+                step = -1
+            elif event.key == "down":
+                step = 1
+            elif event.key == "pageup":
+                step = -8
+            else:
+                step = 8
             self._command_suggestion_index = (
                 self._command_suggestion_index + step
             ) % len(self._command_suggestions)

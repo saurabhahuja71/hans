@@ -267,7 +267,7 @@ class ExternalPathAuthorizer:
     def classify(self, path: str, *, mutation: bool = False) -> tuple[Path, bool]:
         if not isinstance(path, str) or not path or "\x00" in path:
             raise WorkspaceError("Path must be a non-empty relative path")
-        candidate = Path(path).expanduser()
+        candidate = Path(os.path.expanduser(path))
         target = (
             candidate.resolve(strict=False)
             if candidate.is_absolute()

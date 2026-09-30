@@ -45,6 +45,7 @@ from bolt_next.runtime import HansRuntime
 from bolt_next.workspace import (
     make_list_directory_tool,
     make_read_file_tool,
+    make_read_image_tool,
     make_replace_in_file_tool,
     make_run_command_tool,
     make_search_files_tool,
@@ -230,13 +231,51 @@ def test_external_path_approval_displays_entered_path_and_revokes_denial(tmp_pat
     assert request.external is True
     assert request.external_path == entered_path
     assert request.display == ToolApprovalDisplay(
-        (("path", entered_path), ("range", "1+"), ("scope", "outside workspace"))
+        (
+            ("path", entered_path),
+            ("range", "1+"),
+            ("resolved", str(outside.resolve())),
+            ("scope", "outside workspace"),
+        )
     )
     assert run(collect_approval_resolution(runtime, request.request_id, request.call_id, False))[0] == ToolApprovalResolved(
         request.request_id, request.call_id, False
     )
     assert state.rejected == [item]
     assert runtime._external_path_authorizer.proposal_for("read_file", "external-read") is None
+    runtime.close()
+
+
+def test_external_approval_uses_the_native_sdk_call_id_for_the_exact_canonical_target(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-chart.png"
+    outside.write_bytes(b"image")
+    entered_path = f"../{outside.name}"
+    item = SimpleNamespace(
+        tool_name="read_image",
+        call_id="native-call-id",
+        raw_item=SimpleNamespace(call_id="conflicting-wrapper-id", arguments={"path": entered_path}),
+    )
+    state = _ApprovalState()
+    runtime = HansRuntime(
+        workspace=str(tmp_path),
+        agent=SimpleNamespace(tools=()),
+        session=object(),
+        runner=_ApprovalRunner(_PausedApprovalResult(item, state), _FinishedResult()),
+        interactive=lambda: True,
+    )
+    proposal = runtime._external_path_authorizer.propose("read_image", item.call_id, entered_path)
+    assert proposal is not None
+
+    request = next(event for event in run(collect(runtime, "Read the chart.")) if isinstance(event, ToolApprovalRequested))
+
+    assert request.call_id == item.call_id
+    assert request.external is True
+    assert runtime._external_path_authorizer.proposal_for("read_image", item.call_id) == proposal
+    assert runtime._external_path_authorizer.proposal_for("read_image", "conflicting-wrapper-id") is None
+    resolved = run(collect_approval_resolution(runtime, request.request_id, request.call_id, True))
+    assert state.approved == [item]
+    assert runtime._external_path_authorizer.proposal_for("read_image", item.call_id) is None
+    assert any(isinstance(event, RequestCompleted) for event in resolved)
     runtime.close()
 
 
@@ -319,6 +358,34 @@ def test_noninteractive_external_read_fails_closed_without_a_ui_approval(tmp_pat
     assert ToolOutput("external-read", "Tool execution was not approved.") in events
     assert ToolOutput("external-read", "must not be read") not in events
     assert "must not be read" not in repr(events)
+    runtime.close()
+
+
+def test_missing_image_finishes_as_failed_not_complete(tmp_path: Path) -> None:
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_image", {"path": "missing.png"}, call_id="missing-image")]),
+            ModelStep(output=[assistant_message("I could not inspect the image.")]),
+        ]
+    )
+    runtime = HansRuntime(
+        agent=Agent(
+            name="image failure test agent",
+            instructions="Use the provided tools.",
+            model=model,
+            tools=[make_read_image_tool(tmp_path)],
+        ),
+        session=SQLiteSession("missing-image-failure"),
+    )
+
+    events = run(collect(runtime, "Inspect missing.png."))
+
+    assert ToolCompleted("missing-image", "read_image", "missing.png", False, failure_reason="File does not exist.") in events
+    failure = next(event for event in events if isinstance(event, RequestFailed))
+    assert failure.category == "tool"
+    assert failure.message == "File does not exist."
+    assert not any(isinstance(event, RequestCompleted) for event in events)
+    assert not any(isinstance(event, AssistantMessageComplete) for event in events)
     runtime.close()
 
 
