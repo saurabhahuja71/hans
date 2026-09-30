@@ -203,15 +203,15 @@ The footer shows only controls relevant to the current semantic task state:
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
-- **Copying response text (Textual UI):** HANS leaves terminal mouse handling disabled by default so
-  MATE Terminal and other terminal emulators retain native drag selection and right-click copy. Select
-  visible output with the mouse, then use the terminal's normal right-click **Copy** action or
-  Ctrl+Shift+C. Set `HANS_MOUSE=1` only when you want Textual's own mouse interactions, including its
-  selected-text copy dialog. Without a selection, Ctrl-C retains its normal cancel behavior. Ctrl-Y
-  copies the bounded, displayed representation of the most recent assistant response or open detail
-  view through Textual's terminal clipboard request. HANS reports that request rather than claiming
-  desktop clipboard acceptance. The `HANS_TUI=curses` fallback sends the same text through terminal
-  OSC 52 and likewise reports only that it sent the request to the terminal.
+- **Copying and scrolling response text (Textual UI):** Mouse-wheel scrolling is enabled by default.
+  Terminals that reserve mouse reporting for the application may require their selection override
+  modifier (commonly Shift) for native drag selection/right-click copy. Set `HANS_MOUSE=1` to enable
+  HANS's selected-text copy dialog. Set `HANS_MOUSE=0` when native terminal selection is more important
+  than in-app mouse-wheel scrolling. Without a selection, Ctrl-C retains its normal cancel behavior.
+  Ctrl-Y copies the bounded, displayed representation of the most recent assistant response or open
+  detail view through Textual's terminal clipboard request. HANS reports that request rather than
+  claiming desktop clipboard acceptance. The `HANS_TUI=curses` fallback sends the same text through
+  terminal OSC 52 and likewise reports only that it sent the request to the terminal.
 - **Completed task with HANS-owned changes:** Ctrl-G opens the bounded task diff and Ctrl-Z requests
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded

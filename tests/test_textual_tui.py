@@ -1240,6 +1240,17 @@ def test_textual_mouse_environment_accepts_true_values(monkeypatch, value: str) 
     assert HansTextualApp.mouse_enabled_from_environment() is True
 
 
+def test_textual_terminal_mouse_defaults_to_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("HANS_MOUSE", raising=False)
+    assert HansTextualApp.terminal_mouse_enabled_from_environment() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "OFF"])
+def test_textual_terminal_mouse_can_be_disabled_for_native_selection(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("HANS_MOUSE", value)
+    assert HansTextualApp.terminal_mouse_enabled_from_environment() is False
+
+
 def test_ctrl_y_requests_copy_of_displayed_assistant_output(tmp_path: Path, monkeypatch) -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()

@@ -259,6 +259,10 @@ class HansTextualApp(App[None]):
     def mouse_enabled_from_environment() -> bool:
         return os.environ.get("HANS_MOUSE", "").strip().lower() in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def terminal_mouse_enabled_from_environment() -> bool:
+        return os.environ.get("HANS_MOUSE", "").strip().lower() not in {"0", "false", "no", "off"}
+
     CSS = """
     Screen {
         layout: vertical;
@@ -1275,4 +1279,5 @@ class HansTextualApp(App[None]):
 async def run_textual_tui(runtime: Runtime, model: str, workspace: Path) -> None:
     """Run the Textual application without exposing SDK runtime details."""
     mouse_enabled = HansTextualApp.mouse_enabled_from_environment()
-    await HansTextualApp(runtime, model, workspace, mouse_enabled=mouse_enabled).run_async(mouse=mouse_enabled)
+    terminal_mouse_enabled = HansTextualApp.terminal_mouse_enabled_from_environment()
+    await HansTextualApp(runtime, model, workspace, mouse_enabled=mouse_enabled).run_async(mouse=terminal_mouse_enabled)
