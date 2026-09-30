@@ -20,9 +20,9 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.3**.
+branding are HANS. Current release: **0.7.4**.
 
-## What 0.7.3 provides
+## What 0.7.4 provides
 
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
@@ -189,6 +189,10 @@ The footer shows only controls relevant to the current semantic task state:
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
+- **Copying response text (Textual UI):** Drag to select any visible transcript text, then press
+  Ctrl-C to copy the selection. Without a selection, Ctrl-C retains its normal cancel behavior.
+  Ctrl-Y copies the most recent assistant response. The `HANS_TUI=curses` fallback supports
+  Ctrl-Y for whole-response copying.
 - **Completed task with HANS-owned changes:** Ctrl-G opens the bounded task diff and Ctrl-Z requests
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded

@@ -168,6 +168,12 @@ def transcript_text(app: HansTextualApp) -> str:
     return "\n".join(rendered(child) for child in transcript.children if isinstance(child, Static))
 
 
+def test_textual_allows_drag_selection_for_transcript_copying(tmp_path: Path) -> None:
+    app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+
+    assert app.ALLOW_SELECT is True
+
+
 def test_textual_chrome_is_compact_data_driven_and_preserves_composer_keys(tmp_path: Path) -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()

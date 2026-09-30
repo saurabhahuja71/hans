@@ -1,10 +1,10 @@
 [project]
 name = "hans"
-version = "0.7.3"
+version = "0.7.4"
 requires-python = ">=3.12"
 dependencies = [
     "openai-agents>=0.22.3",
-    "textual>=0.58.0",
+    "textual>=2.0.0",
 ]
 
 [project.scripts]

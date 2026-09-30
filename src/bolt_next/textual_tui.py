@@ -211,6 +211,8 @@ class ComposerTextArea(TextArea):
 class HansTextualApp(App[None]):
     """A semantic-event-only Textual UI for a HANS runtime."""
 
+    ALLOW_SELECT = True
+
     CSS = """
     Screen {
         layout: vertical;
