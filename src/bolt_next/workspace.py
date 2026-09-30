@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import hashlib
 import os
@@ -8,10 +9,11 @@ import shlex
 import subprocess
 import tempfile
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from agents import function_tool
+from agents import ToolOutputImage, function_tool
 from agents.tool_context import ToolContext
 
 from bolt_next.context_budget import estimate_tokens, tool_result_token_budget
@@ -403,6 +405,290 @@ def _fitting_end(
     return best
 
 
+_IMAGE_TYPES = {
+    ".png": ("image/png", b"\x89PNG\r\n\x1a\n"),
+    ".jpg": ("image/jpeg", b"\xff\xd8\xff"),
+    ".jpeg": ("image/jpeg", b"\xff\xd8\xff"),
+    ".webp": ("image/webp", b"RIFF"),
+    ".gif": ("image/gif", b"GIF"),
+}
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_IMAGE_DIMENSION = 8_192
+_MAX_IMAGE_PIXELS = 32_000_000
+
+
+def _image_type(path: Path, content: bytes) -> str | None:
+    configured = _IMAGE_TYPES.get(path.suffix.lower())
+    if configured is None:
+        return None
+    mime_type, signature = configured
+    if not content.startswith(signature):
+        return None
+    if mime_type == "image/webp" and content[8:12] != b"WEBP":
+        return None
+    if mime_type == "image/gif" and not content.startswith((b"GIF87a", b"GIF89a")):
+        return None
+    return mime_type
+
+
+def _image_dimensions(mime_type: str, content: bytes) -> tuple[int, int] | None:
+    if mime_type == "image/png":
+        return _png_dimensions(content)
+    if mime_type == "image/jpeg":
+        return _jpeg_dimensions(content)
+    if mime_type == "image/gif":
+        return _gif_dimensions(content)
+    return _webp_dimensions(content)
+
+
+def _png_dimensions(content: bytes) -> tuple[int, int] | None:
+    position = 8
+    dimensions: tuple[int, int] | None = None
+    saw_idat = False
+    while position + 12 <= len(content):
+        length = int.from_bytes(content[position : position + 4], "big")
+        chunk_type = content[position + 4 : position + 8]
+        data_start = position + 8
+        data_end = data_start + length
+        crc_end = data_end + 4
+        if data_end > len(content) - 4 or not all(65 <= byte <= 90 or 97 <= byte <= 122 for byte in chunk_type):
+            return None
+        if zlib.crc32(content[position + 4 : data_end]) & 0xFFFFFFFF != int.from_bytes(content[data_end:crc_end], "big"):
+            return None
+        if dimensions is None:
+            if chunk_type != b"IHDR" or length != 13:
+                return None
+            width = int.from_bytes(content[data_start : data_start + 4], "big")
+            height = int.from_bytes(content[data_start + 4 : data_start + 8], "big")
+            bit_depth, color_type, compression, filter_method, interlace = content[data_start + 8 : data_end]
+            valid_depths = {0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8}, 4: {8, 16}, 6: {8, 16}}
+            if bit_depth not in valid_depths.get(color_type, set()) or compression or filter_method or interlace > 1:
+                return None
+            dimensions = width, height
+        elif chunk_type == b"IHDR":
+            return None
+        if chunk_type == b"IDAT":
+            saw_idat = True
+        if chunk_type == b"IEND":
+            return dimensions if length == 0 and saw_idat and crc_end == len(content) else None
+        position = crc_end
+    return None
+
+
+def _jpeg_dimensions(content: bytes) -> tuple[int, int] | None:
+    position = 2
+    dimensions: tuple[int, int] | None = None
+    saw_scan_data = False
+    sof_markers = {*range(0xC0, 0xC4), *range(0xC5, 0xC8), *range(0xC9, 0xCC), *range(0xCD, 0xD0)}
+    while position < len(content):
+        if content[position] != 0xFF:
+            return None
+        while position < len(content) and content[position] == 0xFF:
+            position += 1
+        if position >= len(content):
+            return None
+        marker = content[position]
+        position += 1
+        if marker == 0xD9:
+            return dimensions if dimensions is not None and saw_scan_data and position == len(content) else None
+        if marker in {0x00, 0xD8} or 0xD0 <= marker <= 0xD7:
+            return None
+        if position + 2 > len(content):
+            return None
+        length = int.from_bytes(content[position : position + 2], "big")
+        end = position + length
+        if length < 2 or end > len(content):
+            return None
+        if marker in sof_markers:
+            components = content[position + 7] if length >= 8 else 0
+            if components == 0 or length != 8 + 3 * components:
+                return None
+            dimensions = (
+                int.from_bytes(content[position + 5 : position + 7], "big"),
+                int.from_bytes(content[position + 3 : position + 5], "big"),
+            )
+        if marker != 0xDA:
+            position = end
+            continue
+        components = content[position + 2] if length >= 3 else 0
+        if dimensions is None or components == 0 or length != 6 + 2 * components:
+            return None
+        position = end
+        scan_has_entropy = False
+        while position < len(content):
+            if content[position] != 0xFF:
+                scan_has_entropy = True
+                position += 1
+                continue
+            marker_start = position
+            while position < len(content) and content[position] == 0xFF:
+                position += 1
+            if position >= len(content):
+                return None
+            marker = content[position]
+            position += 1
+            if marker == 0x00:
+                scan_has_entropy = True
+                continue
+            if 0xD0 <= marker <= 0xD7:
+                continue
+            if marker == 0xD9:
+                return dimensions if scan_has_entropy and position == len(content) else None
+            position = marker_start
+            break
+        else:
+            return None
+        saw_scan_data = saw_scan_data or scan_has_entropy
+    return None
+
+
+def _gif_sub_blocks(content: bytes, position: int) -> int | None:
+    while position < len(content):
+        length = content[position]
+        position += 1
+        if length == 0:
+            return position
+        if position + length > len(content):
+            return None
+        position += length
+    return None
+
+
+def _gif_dimensions(content: bytes) -> tuple[int, int] | None:
+    if len(content) < 13:
+        return None
+    width = int.from_bytes(content[6:8], "little")
+    height = int.from_bytes(content[8:10], "little")
+    position = 13
+    if content[10] & 0x80:
+        position += 3 * (1 << ((content[10] & 0x07) + 1))
+    if position > len(content):
+        return None
+    saw_image = False
+    while position < len(content):
+        introducer = content[position]
+        position += 1
+        if introducer == 0x3B:
+            return (width, height) if saw_image and position == len(content) else None
+        if introducer == 0x21:
+            if position >= len(content):
+                return None
+            label = content[position]
+            position += 1
+            if label == 0xF9:
+                if position + 6 > len(content) or content[position] != 4 or content[position + 5] != 0:
+                    return None
+                position += 6
+            else:
+                if label == 0xFF and (position >= len(content) or content[position] != 11):
+                    return None
+                if label == 0x01 and (position >= len(content) or content[position] != 12):
+                    return None
+                position = _gif_sub_blocks(content, position)
+                if position is None:
+                    return None
+            continue
+        if introducer != 0x2C or position + 9 > len(content):
+            return None
+        packed = content[position + 8]
+        position += 9
+        if packed & 0x80:
+            position += 3 * (1 << ((packed & 0x07) + 1))
+        if position >= len(content) or not 2 <= content[position] <= 8:
+            return None
+        position = _gif_sub_blocks(content, position + 1)
+        if position is None:
+            return None
+        saw_image = True
+    return None
+
+
+def _webp_dimensions(content: bytes) -> tuple[int, int] | None:
+    if len(content) < 12 or int.from_bytes(content[4:8], "little") != len(content) - 8:
+        return None
+    position = 12
+    vp8x_dimensions: tuple[int, int] | None = None
+    image_dimensions: tuple[int, int] | None = None
+    while position < len(content):
+        if position + 8 > len(content):
+            return None
+        chunk_type = content[position : position + 4]
+        length = int.from_bytes(content[position + 4 : position + 8], "little")
+        data_start = position + 8
+        data_end = data_start + length
+        next_position = data_end + (length & 1)
+        if next_position > len(content):
+            return None
+        data = content[data_start:data_end]
+        if chunk_type == b"VP8X":
+            if len(data) != 10 or data[1:4] != b"\x00\x00\x00":
+                return None
+            vp8x_dimensions = int.from_bytes(data[4:7], "little") + 1, int.from_bytes(data[7:10], "little") + 1
+        elif chunk_type == b"VP8 ":
+            first_partition_size = int.from_bytes(data[:3], "little") >> 5
+            if (
+                len(data) < 11
+                or data[0] & 1
+                or data[3:6] != b"\x9d\x01\x2a"
+                or len(data) < 10 + first_partition_size
+            ):
+                return None
+            image_dimensions = int.from_bytes(data[6:8], "little") & 0x3FFF, int.from_bytes(data[8:10], "little") & 0x3FFF
+        elif chunk_type == b"VP8L":
+            if len(data) < 6 or data[0] != 0x2F:
+                return None
+            packed = int.from_bytes(data[1:5], "little")
+            image_dimensions = (packed & 0x3FFF) + 1, ((packed >> 14) & 0x3FFF) + 1
+        position = next_position
+    if position != len(content) or image_dimensions is None:
+        return None
+    return vp8x_dimensions or image_dimensions
+
+
+def _image_error(path: str, target: Path, content: bytes) -> str:
+    if _image_type(target, content) is not None:
+        return f"Error reading {path!r}: file is binary or an image; use read_image for PNG, JPEG, WebP, or GIF files"
+    return f"Error reading {path!r}: file cannot be read as text; supported image formats are PNG, JPEG, WebP, and GIF"
+
+
+def make_read_image_tool(workspace: Path, *, authorizer: ExternalPathAuthorizer | None = None):
+    @function_tool
+    async def read_image(context: ToolContext, path: str) -> ToolOutputImage | str:
+        """Read a PNG, JPEG, WebP, or GIF image as model-visible image data.
+
+        The path is inside the workspace unless this exact call is approved for an external path that resolves outside the workspace. The image is not OCR'd.
+
+        Args:
+            path: A workspace-relative image path, or an approved external image path.
+        """
+        try:
+            target, _external = _tool_target(workspace, authorizer, context, "read_image", path)
+            if target.is_dir():
+                return f"Error reading image {path!r}: path is a directory; use list_directory instead"
+            if not target.is_file():
+                return f"Error: image file does not exist: {path}"
+            if target.stat().st_size > _MAX_IMAGE_BYTES:
+                return f"Error reading image {path!r}: image exceeds {_MAX_IMAGE_BYTES} bytes"
+            content = target.read_bytes()
+            if len(content) > _MAX_IMAGE_BYTES:
+                return f"Error reading image {path!r}: image exceeds {_MAX_IMAGE_BYTES} bytes"
+            mime_type = _image_type(target, content)
+            if mime_type is None:
+                return f"Error reading image {path!r}: only PNG, JPEG, WebP, and GIF files with matching file signatures are supported"
+            dimensions = _image_dimensions(mime_type, content)
+            if dimensions is None:
+                return f"Error reading image {path!r}: invalid or truncated {mime_type.removeprefix('image/').upper()} image data"
+            width, height = dimensions
+            if not width or not height or width > _MAX_IMAGE_DIMENSION or height > _MAX_IMAGE_DIMENSION or width * height > _MAX_IMAGE_PIXELS:
+                return f"Error reading image {path!r}: image dimensions exceed limits"
+            encoded = base64.b64encode(content).decode("ascii")
+            return ToolOutputImage(image_url=f"data:{mime_type};base64,{encoded}")
+        except (OSError, WorkspaceError) as exc:
+            return f"Error reading image {path!r}: {exc}"
+
+    return read_image
+
+
 def make_read_file_tool(
     workspace: Path,
     *,
@@ -428,7 +714,13 @@ def make_read_file_tool(
                 return f"Error reading {path!r}: path is a directory; use list_directory instead"
             if not target.is_file():
                 return f"Error: file does not exist: {path}"
-            text = target.read_text(encoding="utf-8")
+            content = target.read_bytes()
+            try:
+                text = content.decode("utf-8")
+            except UnicodeError:
+                return _image_error(path, target, content)
+            if "\x00" in text:
+                return _image_error(path, target, content)
             lines = text.splitlines()
             total = len(lines)
             if total == 0:
@@ -469,7 +761,7 @@ def make_read_file_tool(
             if fitted == total and start_line == 1 and estimate_tokens(text) <= tool_result_token_budget(context_tokens):
                 return text
             return _range_result(path, lines, start_line, fitted)
-        except (OSError, UnicodeError, WorkspaceError) as exc:
+        except (OSError, WorkspaceError) as exc:
             return f"Error reading {path!r}: {exc}"
 
     return read_file

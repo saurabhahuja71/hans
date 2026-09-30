@@ -134,12 +134,51 @@ def test_catalog_defaults_to_one_model_with_undeclared_reasoning_modes(monkeypat
         monkeypatch.delenv(variable, raising=False)
 
     info = configured_model_info()
+    profile = configured_model_profile()
 
     assert info.id == "qwen3.6-27b"
     assert info.display_name == "qwen3.6-27b"
     assert info.context_tokens == 16384
     assert info.supported_reasoning_modes == ()
     assert info.none_semantics == "literal"
+    assert profile.transport == "chat_completions"
+    assert profile.supports_image_input is False
+
+
+def test_configured_responses_image_profile_requires_explicit_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOLT_MODEL_PROFILES", "vision")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_MODEL", "vision-model")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_BASE_URL", "https://vision.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_API_KEY", "vision-key")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_TRANSPORT", " responses ")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_SUPPORTS_IMAGE_INPUT", " TRUE ")
+
+    profile = configured_model_profile()
+
+    assert profile.transport == "responses"
+    assert profile.supports_image_input is True
+    assert profile.info.supports_image_input is True
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("BOLT_MODEL_PROFILE_VISION_TRANSPORT", "other", "chat_completions.*responses"),
+        ("BOLT_MODEL_PROFILE_VISION_SUPPORTS_IMAGE_INPUT", "yes", "true.*false"),
+        ("BOLT_MODEL_PROFILE_VISION_SUPPORTS_IMAGE_INPUT", "true", "requires"),
+    ],
+)
+def test_configured_image_profile_rejects_invalid_or_incompatible_capabilities(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str, message: str
+) -> None:
+    monkeypatch.setenv("BOLT_MODEL_PROFILES", "vision")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_MODEL", "vision-model")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_BASE_URL", "https://vision.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_VISION_API_KEY", "vision-key")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ConfigurationError, match=message):
+        configured_model_profile()
 
 
 def test_catalog_rejects_unknown_none_semantics(monkeypatch: pytest.MonkeyPatch) -> None:

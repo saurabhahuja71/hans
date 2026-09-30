@@ -217,6 +217,38 @@ def test_create_agent_binds_selected_profile_without_mutating_environment(
     assert dict(os.environ) == environment_before
 
 
+@pytest.mark.parametrize(
+    ("transport", "image_support", "expected_model", "has_image_tool"),
+    [
+        ("chat_completions", "false", "chat", False),
+        ("responses", "true", "responses", True),
+    ],
+)
+def test_create_agent_selects_configured_transport_and_image_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    transport: str,
+    image_support: str,
+    expected_model: str,
+    has_image_tool: bool,
+) -> None:
+    monkeypatch.setenv("BOLT_MODEL_PROFILES", "selected")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_MODEL", "selected-model")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_BASE_URL", "https://selected.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_API_KEY", "selected-key")
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_TRANSPORT", transport)
+    monkeypatch.setenv("BOLT_MODEL_PROFILE_SELECTED_SUPPORTS_IMAGE_INPUT", image_support)
+    monkeypatch.setattr(agent_module, "AsyncOpenAI", lambda **_kwargs: object())
+    monkeypatch.setattr(agent_module, "OpenAIChatCompletionsModel", lambda **_kwargs: "chat")
+    monkeypatch.setattr(agent_module, "OpenAIResponsesModel", lambda **_kwargs: "responses")
+    monkeypatch.setattr(agent_module, "Agent", lambda **kwargs: kwargs)
+
+    agent = agent_module.create_agent(tmp_path)
+
+    assert agent["model"] == expected_model
+    assert ("read_image" in [tool.name for tool in agent["tools"]]) is has_image_tool
+
+
 def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> None:
     instructions = agent_module.STAGE_4_INSTRUCTIONS
 

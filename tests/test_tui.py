@@ -51,6 +51,7 @@ from bolt_next.tui import (
 )
 from bolt_next.tui_screen import (
     Editor,
+    LocalControl,
     TodoList,
     Transcript,
     copy_osc52,
@@ -272,6 +273,9 @@ def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
     assert decoder.feed("\x02") == ["ctrl-b"]
     assert decoder.feed("\x14") == ["ctrl-t"]
     assert decoder.feed("\x11") == ["ctrl-q"]
+    assert decoder.feed("\x1b[97;6u") == ["ctrl-shift-a"]
+    assert decoder.feed("\x01") == ["ctrl-shift-a"]
+    assert decoder.feed("a") == ["char:a"]
     assert decoder.feed("\t") == ["tab"]
 
     message = "line one\nline two"
@@ -401,6 +405,24 @@ def test_curses_debug_tool_output_is_explicit_and_bounded(monkeypatch) -> None:
     rendered = "\n".join(transcript.render(8_000))
     assert "display truncated (1 characters omitted)" in rendered
     assert "x" * 4_001 not in rendered
+
+
+def test_curses_image_tool_uses_read_semantics_and_hides_data_url(monkeypatch) -> None:
+    monkeypatch.setenv("HANS_DEBUG", "1")
+    transcript = Transcript()
+    display = _Display(transcript)
+
+    display.event(ToolStarted("image-1", "read_image", "chart.png"))
+    assert display.state == "INVESTIGATING"
+    display.event(ToolOutput("image-1", "data:image/png;base64,aGVsbG8="))
+    display.event(ToolCompleted("image-1", "read_image", "chart.png", True))
+
+    rendered = "\n".join(transcript.render(120))
+    assert "TOOL Read image chart.png" in rendered
+    assert "Image loaded for model input (image/png)." in rendered
+    assert "data:image" not in rendered
+    assert "aGVsbG8=" not in rendered
+    assert display.latest_tool_output() == "Image loaded for model input (image/png)."
 
 
 def test_curses_changes_diff_undo_and_errors_are_task_scoped() -> None:
@@ -563,6 +585,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     todos = TodoList()
     status = handle_local_command("/permissions", todos)
     changed = handle_local_command("/permissions WRITE deny", todos)
+    quick_toggle = LocalControl("toggle_permissions")
     clear = handle_local_command("/clear", todos)
     model_status = handle_local_command("/models", todos)
     reasoning_status = handle_local_command("/mode", todos)
@@ -611,6 +634,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
                     context_tokens=256_000,
                     supported_reasoning_modes=("none", "low"),
                     none_semantics="literal",
+                    supports_image_input=True,
                 ),
             )
             self.model = self.models[0]
@@ -628,6 +652,10 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
             self.calls.append(("permission", category, policy))
             self.permissions[category] = policy
             return PermissionPolicyChanged(category, policy)
+
+        def toggle_permissions(self) -> RuntimeControlStatus:
+            self.calls.append(("toggle_permissions",))
+            return self.get_control_status()
 
         async def clear_session_history(self) -> SessionCleared:
             self.calls.append(("clear",))
@@ -674,6 +702,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
         for local in (
             status,
             changed,
+            quick_toggle,
             clear,
             model_status,
             reasoning_status,
@@ -682,14 +711,15 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
             model_changed,
             unknown_model,
         ):
-            assert local.control is not None
-            await _dispatch_control(runtime, local.control, display)
+            await _dispatch_control(runtime, local, display)
 
     asyncio.run(scenario())
     rendered = "\n".join(transcript.render(120))
     assert runtime.calls == [
         ("status",),
         ("permission", "write", "deny"),
+        ("toggle_permissions",),
+        ("status",),
         ("clear",),
         ("model_status",),
         ("reasoning_mode_status",),
@@ -701,6 +731,8 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert shown_models == ["Configured Model", "Large Model"]
     assert "model: Large Model" in format_header(shown_models[-1], Path.cwd())
     assert "Permissions" in rendered
+    assert "Ctrl+Shift+A: allow all / restore previous." in rendered
+    assert "External paths still require approval" in rendered
     assert "✓ write permission set to deny." in rendered
     assert "✓ Conversation history cleared." in rendered
     assert "LOCAL\n  MODELS\n  * Active: Configured Model (configured-model)" in rendered
@@ -708,6 +740,8 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert "Reasoning support: none, high" in rendered
     assert "Current reasoning: configured default" in rendered
     assert "Large Model (large)" in rendered
+    assert "Image input: not supported" in rendered
+    assert "Image input: supported" in rendered
     assert "Context: 256,000 tokens" in rendered
     assert "✓ Switched from configured-model to Large Model (large)." in rendered
     assert "✓ New conversation started." in rendered
@@ -750,11 +784,11 @@ def test_non_tty_local_commands_do_not_run_model_turns() -> None:
 def test_osc52_copy_is_plain_text_bounded_and_failure_safe() -> None:
     captured: list[bytes] = []
     ok, message = copy_osc52("a\nb", captured.append)
-    assert (ok, message) == (True, "Copied")
+    assert (ok, message) == (True, "Clipboard copy sent to terminal")
     assert captured == [b"\x1b]52;c;YQpi\x07"]
 
     ok, message = copy_osc52("abcdef", captured.append, max_chars=3)
-    assert (ok, message) == (True, "Copied")
+    assert (ok, message) == (True, "Clipboard copy sent to terminal")
     assert b"YWJjCuKApiBkaXNwbGF5IHRydW5jYXRlZCAoMyBjaGFyYWN0ZXJzIG9taXR0ZWQp" in captured[-1]
 
     def fail(_data: bytes) -> None:

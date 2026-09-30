@@ -55,6 +55,7 @@ from bolt_next.tui_screen import (
     LocalControl,
     TodoList,
     display_bounded,
+    display_tool_output,
     footer_text,
     format_approval_denied,
     format_approval_request,
@@ -64,6 +65,7 @@ from bolt_next.tui_screen import (
     format_todo_view,
     format_model_changed,
     format_model_status,
+    format_permission_status,
     format_reasoning_mode_changed,
     format_reasoning_mode_status,
     handle_local_command,
@@ -89,6 +91,8 @@ class Runtime(Protocol):
     def get_control_status(self) -> RuntimeControlStatus: ...
 
     def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged | RuntimeControlRejected: ...
+
+    def toggle_permissions(self) -> RuntimeControlStatus | RuntimeControlRejected: ...
 
     async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected: ...
 
@@ -338,6 +342,7 @@ class HansTextualApp(App[None]):
         Binding("ctrl+y", "copy_visible", "copy", show=False),
         Binding("ctrl+b", "cycle_theme", "theme", show=False),
         Binding("ctrl+t", "toggle_todos", "todos", show=False),
+        Binding("ctrl+shift+a", "toggle_permissions", "permissions", show=False),
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
@@ -433,7 +438,7 @@ class HansTextualApp(App[None]):
         except Exception:
             self._set_state("IDLE", "clipboard unavailable")
             return False
-        self._set_state("IDLE", "copied")
+        self._set_state("IDLE", "clipboard copy requested")
         return True
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
@@ -564,6 +569,7 @@ class HansTextualApp(App[None]):
             "ctrl+y": self.action_copy_visible,
             "ctrl+b": self.action_cycle_theme,
             "ctrl+t": self.action_toggle_todos,
+            "ctrl+shift+a": self.action_toggle_permissions,
             "ctrl+q": self.action_exit_app,
         }
         action = actions.get(event.key)
@@ -606,7 +612,7 @@ class HansTextualApp(App[None]):
 
     @staticmethod
     def _tool_stage(name: str, verification_failed: bool, purpose: str = "inspect") -> str:
-        if name in {"list_directory", "search_files", "read_file"}:
+        if name in {"list_directory", "search_files", "read_file", "read_image"}:
             return "INVESTIGATING"
         if name in {"replace_in_file", "write_file"}:
             return "CORRECTING" if verification_failed else "EDITING"
@@ -751,6 +757,8 @@ class HansTextualApp(App[None]):
                     return f"{line.partition(':')[2].strip()} lines"
             line_count = len(output.splitlines())
             return f"{line_count} line{'s' if line_count != 1 else ''}"
+        if name == "read_image":
+            return "loaded"
         if name == "search_files":
             matches = sum(1 for line in output.splitlines() if line and not line.startswith("..."))
             return f"{matches} match{'es' if matches != 1 else ''}"
@@ -864,7 +872,7 @@ class HansTextualApp(App[None]):
             summary = self._tool_result_summary(name, event.output)
             if summary:
                 self._tool_results[event.call_id] = summary
-            output = display_bounded(event.output, self.MAX_TOOL_OUTPUT_CHARS)
+            output = display_tool_output(event.output, self.MAX_TOOL_OUTPUT_CHARS)
             self._tool_outputs[event.call_id] = output
             self._latest_tool_call_id = event.call_id
             if self._debug_enabled():
@@ -961,16 +969,7 @@ class HansTextualApp(App[None]):
             self._set_state("IDLE", "undo refused")
             await self._append_transcript(f"UNDO\n✗ Undo refused\nConflicts: {conflicts}", "error")
         elif isinstance(event, RuntimeControlStatus):
-            lines = ["Permissions"]
-            lines.extend(
-                f"{name:<10} {policy}"
-                for name, policy in (
-                    ("read", event.read_policy),
-                    ("write", event.write_policy),
-                    ("execute", event.execute_policy),
-                )
-            )
-            await self._append_transcript("\n".join(lines), "change")
+            await self._append_transcript(format_permission_status(event), "change")
         elif isinstance(event, ModelStatus):
             self._set_model(event.model)
             await self._append_transcript(
@@ -1072,6 +1071,15 @@ class HansTextualApp(App[None]):
         self._todos_visible = not self._todos_visible
         self._render_todos()
 
+    def action_toggle_permissions(self) -> None:
+        if self._request_active or self._approval_pending is not None or self._approval_resolving:
+            return
+        self.run_worker(
+            self._dispatch_control(LocalControl("toggle_permissions")),
+            group="runtime-controls",
+            exclusive=True,
+        )
+
     def action_show_latest_output(self) -> None:
         if self._request_active:
             return
@@ -1116,6 +1124,8 @@ class HansTextualApp(App[None]):
     async def _dispatch_control(self, control: LocalControl) -> None:
         if control.kind == "permissions_status":
             event = self.runtime.get_control_status()
+        elif control.kind == "toggle_permissions":
+            event = self.runtime.toggle_permissions()
         elif control.kind == "set_permission":
             event = self.runtime.set_permission(control.category or "", control.policy or "")
         elif control.kind == "clear_session":

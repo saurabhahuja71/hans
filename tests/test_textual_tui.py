@@ -54,6 +54,7 @@ class FakeRuntime:
         self.task_diff_calls: list[int | None] = []
         self.undo_calls = 0
         self.permissions = {"read": "allow", "write": "allow", "execute": "allow"}
+        self.permission_snapshot: dict[str, str] | None = None
         self.control_calls: list[tuple[object, ...]] = []
         self.models = (
             ModelInfo(
@@ -117,9 +118,20 @@ class FakeRuntime:
             execute_policy=self.permissions["execute"],
         )
 
+    def toggle_permissions(self) -> RuntimeControlStatus:
+        self.control_calls.append(("toggle_permissions",))
+        if self.permission_snapshot is None:
+            self.permission_snapshot = dict(self.permissions)
+            self.permissions = {category: "allow" for category in self.permissions}
+        else:
+            self.permissions = self.permission_snapshot
+            self.permission_snapshot = None
+        return self.get_control_status()
+
     def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged:
         self.control_calls.append(("permission", category, policy))
         self.permissions[category] = policy
+        self.permission_snapshot = None
         return PermissionPolicyChanged(category, policy)
 
     async def clear_session_history(self) -> SessionCleared:
@@ -207,6 +219,30 @@ def test_textual_chrome_is_compact_data_driven_and_preserves_composer_keys(tmp_p
             assert composer.text == ""
 
         assert runtime.closed == 1
+
+    asyncio.run(scenario())
+
+
+def test_textual_permission_quick_toggle_is_idle_only(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.set_permission("write", "deny")
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+shift+a")
+            await pilot.pause()
+            await pilot.pause()
+            assert runtime.control_calls[-1] == ("toggle_permissions",)
+            assert runtime.permissions == {"read": "allow", "write": "allow", "execute": "allow"}
+            rendered_transcript = transcript_text(app)
+            assert "Ctrl+Shift+A: allow all / restore previous." in rendered_transcript
+            assert "External paths still require approval" in rendered_transcript
+
+            calls_before = len(runtime.control_calls)
+            app._request_active = True
+            await pilot.press("ctrl+shift+a")
+            await pilot.pause()
+            assert len(runtime.control_calls) == calls_before
 
     asyncio.run(scenario())
 
@@ -540,6 +576,27 @@ def test_textual_debug_output_is_gated_and_bounded(tmp_path: Path, monkeypatch) 
     assert "abcdefgh" in debug
     assert "display truncated (3 characters omitted)" in debug
     assert "ijk" not in debug
+
+
+def test_textual_image_tool_uses_read_semantics_and_hides_data_url(tmp_path: Path, monkeypatch) -> None:
+    async def scenario() -> str:
+        monkeypatch.setenv("HANS_DEBUG", "1")
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(ToolStarted("image-1", "read_image", "chart.png"))
+            assert rendered(app.query_one("#state-line", Static)) == "INVESTIGATING"
+            await app._render_event(ToolOutput("image-1", "data:image/png;base64,aGVsbG8="))
+            await app._render_event(ToolCompleted("image-1", "read_image", "chart.png", True))
+            await pilot.pause()
+            assert app._tool_outputs["image-1"] == "Image loaded for model input (image/png)."
+            return transcript_text(app)
+
+    text = asyncio.run(scenario())
+    assert "✓ Read image chart.png" in text
+    assert "loaded" in text
+    assert "Image loaded for model input (image/png)." in text
+    assert "data:image" not in text
+    assert "aGVsbG8=" not in text
 
 
 def test_completed_footer_uses_task_change_summary(tmp_path: Path) -> None:

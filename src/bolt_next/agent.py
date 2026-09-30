@@ -4,7 +4,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from agents import Agent, ModelSettings, OpenAIChatCompletionsModel
+from agents import Agent, ModelSettings, OpenAIChatCompletionsModel, OpenAIResponsesModel
 from agents.model_settings import Reasoning
 from openai import AsyncOpenAI
 
@@ -16,6 +16,7 @@ from bolt_next.workspace import (
     TaskMutationJournal,
     make_list_directory_tool,
     make_read_file_tool,
+    make_read_image_tool,
     make_replace_in_file_tool,
     make_run_command_tool,
     make_search_files_tool,
@@ -28,6 +29,7 @@ _TOOL_PERMISSION_GROUPS = {
     "list_directory": "read",
     "search_files": "read",
     "read_file": "read",
+    "read_image": "read",
     "write_file": "write",
     "replace_in_file": "write",
     "run_command": "execute",
@@ -83,7 +85,7 @@ def apply_tool_permission_policy(
                 active_authorizer = getattr(tool, "_hans_authorizer", None)
                 if (
                     active_authorizer is not None
-                    and tool_name in {"read_file", "list_directory", "search_files", "write_file", "replace_in_file"}
+                    and tool_name in {"read_file", "read_image", "list_directory", "search_files", "write_file", "replace_in_file"}
                     and isinstance(call_id, str)
                     and path is not None
                 ):
@@ -127,8 +129,8 @@ STAGE_4_INSTRUCTIONS = (
     "fails, diagnose, correct if appropriate, and verify again; do not modify tests merely to pass. "
     "Never claim a check passed without its tool result. Tool results are authoritative; if verification "
     "cannot run, say why. Final responses must be concise and state changes, verification evidence, "
-    "and remaining limits. Use list_directory and search_files to discover files, read_file to inspect "
-    "them, replace_in_file for one precise edit, write_file only to create or replace an entire file, "
+    "and remaining limits. Use list_directory and search_files to discover files, read_file to inspect text, "
+    "read_image for supported images when available, replace_in_file for one precise edit, write_file only to create or replace an entire file, "
     "and run_command only for a direct workspace command. Never use run_command to list, find, or inspect "
     "filesystem paths: use list_directory, search_files, or read_file instead, including for a literal ~/ path. "
     "Any filesystem path that resolves outside the workspace requires explicit approval for that exact tool call. "
@@ -212,7 +214,8 @@ def create_agent(
         timeout=selected_profile.timeout_seconds,
         max_retries=selected_profile.max_retries,
     )
-    model = OpenAIChatCompletionsModel(
+    model_class = OpenAIResponsesModel if selected_profile.transport == "responses" else OpenAIChatCompletionsModel
+    model = model_class(
         model=selected_profile.model,
         openai_client=client,
     )
@@ -228,6 +231,11 @@ def create_agent(
             make_list_directory_tool(root, context_tokens=context_tokens, authorizer=authorizer),
             make_search_files_tool(root, context_tokens=context_tokens, authorizer=authorizer),
             make_read_file_tool(root, context_tokens=context_tokens, authorizer=authorizer),
+            *(
+                [make_read_image_tool(root, authorizer=authorizer)]
+                if selected_profile.supports_image_input
+                else []
+            ),
             make_replace_in_file_tool(root, journal, authorizer=authorizer),
             make_write_file_tool(root, journal, authorizer=authorizer),
             make_run_command_tool(root, context_tokens=context_tokens),

@@ -23,6 +23,7 @@ class ModelInfo:
     context_tokens: int
     supported_reasoning_modes: tuple[str, ...]
     none_semantics: Literal["literal", "omit"]
+    supports_image_input: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,8 @@ class ConfiguredModelProfile:
     max_retries: int = field(repr=False)
     max_completion_tokens: int | None = field(repr=False)
     reasoning_effort: str | None = field(repr=False)
+    transport: Literal["chat_completions", "responses"] = field(repr=False)
+    supports_image_input: bool = field(repr=False)
 
 
 def _configured_model_id() -> str:
@@ -121,6 +124,22 @@ def _positive_integer(variable: str, value: str | None) -> int | None:
     return parsed
 
 
+def _profile_transport(variable: str, value: str | None) -> Literal["chat_completions", "responses"]:
+    transport = (value or "chat_completions").lower()
+    if transport not in {"chat_completions", "responses"}:
+        raise ConfigurationError(f"{variable} must be 'chat_completions' or 'responses'")
+    return transport  # type: ignore[return-value]
+
+
+def _profile_image_support(variable: str, value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.lower()
+    if normalized not in {"true", "false"}:
+        raise ConfigurationError(f"{variable} must be 'true' or 'false'")
+    return normalized == "true"
+
+
 def _profile_context_tokens(variable: str, value: str | None) -> int:
     if value is None:
         return DEFAULT_CONTEXT_TOKENS
@@ -155,6 +174,8 @@ def _legacy_profile() -> ConfiguredModelProfile:
         ),
         max_completion_tokens=max_completion,
         reasoning_effort=_optional_value("BOLT_MODEL_REASONING_EFFORT"),
+        transport="chat_completions",
+        supports_image_input=False,
     )
 
 
@@ -163,6 +184,12 @@ def _profile_from_environment(profile_id: str) -> ConfiguredModelProfile:
     model = _required_profile_value(profile_id, prefix, "MODEL")
     base_url = _required_profile_value(profile_id, prefix, "BASE_URL")
     api_key = _required_profile_value(profile_id, prefix, "API_KEY")
+    transport = _profile_transport(prefix + "TRANSPORT", _optional_value(prefix + "TRANSPORT"))
+    supports_image_input = _profile_image_support(
+        prefix + "SUPPORTS_IMAGE_INPUT", _optional_value(prefix + "SUPPORTS_IMAGE_INPUT")
+    )
+    if supports_image_input and transport != "responses":
+        raise ConfigurationError(f"{prefix}SUPPORTS_IMAGE_INPUT requires {prefix}TRANSPORT='responses'")
     return ConfiguredModelProfile(
         info=ModelInfo(
             id=profile_id,
@@ -173,6 +200,7 @@ def _profile_from_environment(profile_id: str) -> ConfiguredModelProfile:
             none_semantics=_configured_none_semantics(
                 _optional_value(prefix + "REASONING_NONE_SEMANTICS"), variable=prefix + "REASONING_NONE_SEMANTICS"
             ),
+            supports_image_input=supports_image_input,
         ),
         model=model,
         base_url=base_url,
@@ -186,6 +214,8 @@ def _profile_from_environment(profile_id: str) -> ConfiguredModelProfile:
             prefix + "MAX_COMPLETION_TOKENS", _optional_value(prefix + "MAX_COMPLETION_TOKENS")
         ),
         reasoning_effort=_optional_value(prefix + "REASONING_EFFORT"),
+        transport=transport,
+        supports_image_input=supports_image_input,
     )
 
 

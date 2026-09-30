@@ -90,6 +90,7 @@ _TOOL_CATEGORIES = {
     "list_directory": "read",
     "search_files": "read",
     "read_file": "read",
+    "read_image": "read",
     "write_file": "write",
     "replace_in_file": "write",
     "run_command": "execute",
@@ -113,6 +114,8 @@ def _tool_detail(name: str, arguments: Any) -> str:
         elif start and int(start) > 1:
             detail = f"{detail}:{start}"
         return _bounded_tool_text(detail)
+    if name == "read_image":
+        return _bounded_tool_text(arguments.get("path"))
     if name in {"list_directory", "write_file", "replace_in_file"}:
         return _bounded_tool_text(arguments.get("path"))
     if name == "search_files":
@@ -195,6 +198,8 @@ def _approval_display(tool_name: str, arguments: Any) -> ToolApprovalDisplay:
         if safe_range is not None:
             fields.append(("range", safe_range))
         return ToolApprovalDisplay(tuple(fields))
+    if tool_name == "read_image":
+        return ToolApprovalDisplay((("path", _safe_path(values)),))
     if tool_name == "list_directory":
         return ToolApprovalDisplay((("path", _safe_path(values)),))
     if tool_name == "search_files":
@@ -250,6 +255,7 @@ _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
 )
 _URL_USERINFO_PATTERN = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)([^\s/@:]+):[^\s/@]+@")
+_IMAGE_DATA_URL_PATTERN = re.compile(r"^data:([a-z0-9.+-]+/[a-z0-9.+-]+);base64,", re.IGNORECASE)
 
 
 def _redact_sensitive_text(value: str) -> str:
@@ -264,6 +270,24 @@ def _redact_sensitive_text(value: str) -> str:
 def _bounded_tool_text(value: Any, limit: int = _TOOL_DETAIL_MAX_CHARS) -> str:
     text = _redact_sensitive_text(" ".join(str(value or "").split()))
     return text if len(text) <= limit else f"{text[:limit - 1]}…"
+
+
+def _rendered_image_output(value: str) -> str | None:
+    match = _IMAGE_DATA_URL_PATTERN.match(value)
+    if match is None:
+        return None
+    return f"Image loaded for model input ({match.group(1).lower()})."
+
+
+def _render_tool_output(value: Any, tool_name: str | None = None) -> str:
+    if isinstance(value, str):
+        return _rendered_image_output(value) or value
+    image_url = _member(value, "image_url")
+    if isinstance(image_url, str):
+        return _rendered_image_output(image_url) or "Image loaded for model input."
+    if tool_name == "read_image":
+        return "Image loaded for model input."
+    return str(value)
 
 
 def _safe_tool_output(value: str, *, failed: bool) -> str:
@@ -288,6 +312,7 @@ def _failure_reason_text(value: str) -> str:
 def _workspace_failure_reason(name: str, output: str) -> str | None:
     prefixes = {
         "read_file": "Error reading",
+        "read_image": "Error reading image",
         "write_file": "Error writing",
         "replace_in_file": "Error replacing",
         "list_directory": "Error listing",
@@ -396,6 +421,7 @@ class HansRuntime:
         self._owns_session = session is None
         self._runner = runner
         self._permissions = {"read": "allow", "write": "allow", "execute": "allow"}
+        self._permission_toggle_snapshot: dict[str, str] | None = None
         self._interactive = interactive or (lambda: sys.stdin.isatty() and sys.stdout.isatty())
         self._request_active = False
         self._active_result: Any | None = None
@@ -566,6 +592,17 @@ class HansRuntime:
         self._apply_effective_model_settings()
         return ReasoningModeChanged(normalized_mode)
 
+    def toggle_permissions(self) -> RuntimeControlStatus | RuntimeControlRejected:
+        if self._request_active:
+            return RuntimeControlRejected("Permission changes are available when HANS is idle.")
+        if self._permission_toggle_snapshot is None:
+            self._permission_toggle_snapshot = dict(self._permissions)
+            self._permissions.update({category: "allow" for category in self._permissions})
+        else:
+            self._permissions.update(self._permission_toggle_snapshot)
+            self._permission_toggle_snapshot = None
+        return self.get_control_status()
+
     def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged | RuntimeControlRejected:
         if category not in self._permissions:
             raise ValueError(f"Unknown permission: {category}")
@@ -575,6 +612,7 @@ class HansRuntime:
         if self._request_active:
             return RuntimeControlRejected("Permission changes are available when HANS is idle.")
         self._permissions[category] = normalized_policy
+        self._permission_toggle_snapshot = None
         return PermissionPolicyChanged(category, normalized_policy)
 
     async def clear_session_history(self) -> SessionCleared | RuntimeControlRejected:
@@ -928,8 +966,8 @@ class HansRuntime:
         if not isinstance(call_id, str) or not call_id:
             return ()
         output = getattr(item, "output", "")
-        rendered_output = output if isinstance(output, str) else str(output)
         call = self._tool_calls.pop(call_id, None)
+        rendered_output = _render_tool_output(output, call.name if call is not None else None)
         if call is None:
             return (
                 ToolOutput(

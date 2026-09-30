@@ -1,12 +1,16 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
+from agents.items import ItemHelpers
 from agents.tool_context import ToolContext
 
+import bolt_next.workspace as workspace_module
 from bolt_next.context_budget import estimate_tokens, tool_result_token_budget
 from bolt_next.workspace import (
     ExternalPathAuthorizer,
@@ -15,6 +19,7 @@ from bolt_next.workspace import (
     _bounded_lines,
     make_list_directory_tool,
     make_read_file_tool,
+    make_read_image_tool,
     make_replace_in_file_tool,
     make_run_command_tool,
     make_search_files_tool,
@@ -51,6 +56,158 @@ def test_read_file_missing_file(tmp_path: Path) -> None:
     tool = make_read_file_tool(tmp_path)
     result = invoke(tool, '{"path":"missing.txt"}')
     assert "does not exist" in result
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return len(data).to_bytes(4, "big") + chunk_type + data + zlib.crc32(chunk_type + data).to_bytes(4, "big")
+
+
+def valid_png(width: int = 2, height: int = 3) -> bytes:
+    ihdr = width.to_bytes(4, "big") + height.to_bytes(4, "big") + b"\x08\x02\x00\x00\x00"
+    scanlines = b"".join(b"\x00" + b"\x00" * (width * 3) for _ in range(height))
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(scanlines)) + _png_chunk(b"IEND", b"")
+
+
+def valid_jpeg() -> bytes:
+    return b"\xff\xd8\xff\xc0\x00\x0b\x08\x00\x03\x00\x02\x01\x01\x11\x00\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x01\xff\xd9"
+
+
+def valid_gif() -> bytes:
+    return b"GIF89a\x02\x00\x03\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,\x00\x00\x00\x00\x02\x00\x03\x00\x00\x02\x02D\x01\x00;"
+
+
+def _webp_container(*chunks: tuple[bytes, bytes]) -> bytes:
+    payload = b"WEBP"
+    for chunk_type, data in chunks:
+        payload += chunk_type + len(data).to_bytes(4, "little") + data + (b"\x00" if len(data) & 1 else b"")
+    return b"RIFF" + len(payload).to_bytes(4, "little") + payload
+
+
+def valid_webp() -> bytes:
+    return _webp_container((b"VP8 ", b"\x20\x00\x00\x9d\x01\x2a\x02\x00\x03\x00\x00"))
+
+
+def valid_webp_lossless() -> bytes:
+    packed_dimensions = (1 | (2 << 14)).to_bytes(4, "little")
+    return _webp_container((b"VP8L", b"\x2f" + packed_dimensions + b"\x00"))
+
+
+def valid_webp_extended() -> bytes:
+    vp8x = b"\x00\x00\x00\x00\x01\x00\x00\x02\x00\x00"
+    vp8 = b"\x20\x00\x00\x9d\x01\x2a\x02\x00\x03\x00\x00"
+    return _webp_container((b"VP8X", vp8x), (b"VP8 ", vp8))
+
+
+def test_read_image_returns_a_data_url_and_read_file_rejects_binary_without_mutation(tmp_path: Path) -> None:
+    image = valid_png()
+    target = tmp_path / "sample.png"
+    target.write_bytes(image)
+    before = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    result = invoke(make_read_image_tool(tmp_path), '{"path":"sample.png"}')
+
+    assert result.type == "image"
+    assert result.image_url is not None
+    assert result.image_url.startswith("data:image/png;base64,")
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == before
+    assert "binary or an image" in invoke(make_read_file_tool(tmp_path), '{"path":"sample.png"}')
+
+
+def test_read_image_uses_sdk_structured_image_output(tmp_path: Path) -> None:
+    (tmp_path / "sample.png").write_bytes(valid_png())
+    tool = make_read_image_tool(tmp_path)
+    arguments = '{"path":"sample.png"}'
+    context = ToolContext(None, tool_name=tool.name, tool_call_id="image-sdk", tool_arguments=arguments)
+
+    result = asyncio.run(tool.on_invoke_tool(context, arguments))
+    serialized = ItemHelpers._convert_tool_output(result)
+
+    assert serialized == [
+        {
+            "type": "input_image",
+            "image_url": result.image_url,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "mime_type"),
+    [
+        ("sample.gif", valid_gif(), "image/gif"),
+        ("sample.jpg", valid_jpeg(), "image/jpeg"),
+        ("sample.webp", valid_webp(), "image/webp"),
+        ("sample-lossless.webp", valid_webp_lossless(), "image/webp"),
+        ("sample-extended.webp", valid_webp_extended(), "image/webp"),
+    ],
+)
+def test_read_image_supports_each_non_png_format(
+    tmp_path: Path, filename: str, content: bytes, mime_type: str
+) -> None:
+    (tmp_path / filename).write_bytes(content)
+
+    result = invoke(make_read_image_tool(tmp_path), json.dumps({"path": filename}))
+
+    assert result.type == "image"
+    assert result.image_url is not None
+    assert result.image_url.startswith(f"data:{mime_type};base64,")
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("truncated.png", valid_png()[:-1]),
+        ("truncated.jpg", valid_jpeg()[:-2]),
+        ("truncated.gif", valid_gif()[:-1]),
+        ("truncated.webp", valid_webp()[:-1]),
+        ("corrupt.png", valid_png()[:-5] + b"\x00" + valid_png()[-4:]),
+    ],
+)
+def test_read_image_rejects_truncated_or_corrupt_supported_images(tmp_path: Path, filename: str, content: bytes) -> None:
+    (tmp_path / filename).write_bytes(content)
+
+    result = invoke(make_read_image_tool(tmp_path), json.dumps({"path": filename}))
+
+    assert "invalid or truncated" in result
+    assert "image data" in result
+
+
+def test_read_file_rejects_non_image_binary_without_read_image_guidance(tmp_path: Path) -> None:
+    (tmp_path / "binary.bin").write_bytes(b"\xff\x00\x01")
+
+    result = invoke(make_read_file_tool(tmp_path), '{"path":"binary.bin"}')
+
+    assert "cannot be read as text" in result
+    assert "PNG, JPEG, WebP, and GIF" in result
+    assert "read_image" not in result
+
+
+def test_read_image_rejects_mismatched_types_and_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "not-image.png").write_bytes(b"not a PNG")
+    huge = valid_png(width=9_000, height=1)
+    small = valid_png(width=1, height=1)
+    (tmp_path / "huge.png").write_bytes(huge)
+    (tmp_path / "too-large.png").write_bytes(small)
+    tool = make_read_image_tool(tmp_path)
+
+    assert "matching file signatures" in invoke(tool, '{"path":"not-image.png"}')
+    assert "dimensions exceed limits" in invoke(tool, '{"path":"huge.png"}')
+    monkeypatch.setattr(workspace_module, "_MAX_IMAGE_BYTES", len(small) - 1)
+    assert "image exceeds" in invoke(tool, '{"path":"too-large.png"}')
+
+
+def test_read_image_requires_its_own_exact_external_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-image.png"
+    outside.write_bytes(valid_png(width=1, height=1))
+    authorizer = ExternalPathAuthorizer(tmp_path)
+    tool = make_read_image_tool(tmp_path, authorizer=authorizer)
+    arguments = json.dumps({"path": str(outside)})
+
+    assert "External path requires approval" in invoke(tool, arguments, call_id="external-image")
+    assert authorizer.propose("read_image", "external-image", str(outside)) is not None
+    assert authorizer.approve_exact("read_image", "external-image") is not None
+    assert invoke(tool, arguments, call_id="external-image").type == "image"
 
 
 def test_path_traversal_rejected(tmp_path: Path) -> None:

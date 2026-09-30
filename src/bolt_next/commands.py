@@ -38,14 +38,16 @@ PERMISSION_POLICIES = ("allow", "deny", "ask")
 KEYBOARD_SHORTCUTS = (
     ("Enter", "Send"),
     ("Shift+Enter", "New line"),
-    ("Ctrl-B", "Cycle theme"),
-    ("Ctrl-T", "Toggle TODO view"),
-    ("Ctrl-D", "Send / exit when empty"),
-    ("Ctrl-C", "Cancel"),
-    ("Ctrl-G", "Diff"),
-    ("Ctrl-Z", "Undo"),
-    ("Ctrl-O", "Output"),
-    ("Ctrl-Q", "Quit"),
+    ("Ctrl+B", "Cycle theme"),
+    ("Ctrl+T", "Toggle TODO view"),
+    ("Ctrl+Shift+A", "Allow all permissions / restore previous (idle)"),
+    ("Ctrl+D", "Send / exit when empty"),
+    ("Ctrl+C", "Cancel"),
+    ("Ctrl+Y", "Copy displayed output"),
+    ("Ctrl+G", "Diff"),
+    ("Ctrl+Z", "Undo"),
+    ("Ctrl+O", "Output"),
+    ("Ctrl+Q", "Quit"),
 )
 MAX_SUGGESTIONS = len(COMMANDS)
 

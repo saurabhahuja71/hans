@@ -47,6 +47,7 @@ from bolt_next.tui_screen import (
     Transcript,
     copy_osc52,
     display_bounded,
+    display_tool_output,
     footer_text,
     format_approval_denied,
     format_approval_request,
@@ -56,6 +57,7 @@ from bolt_next.tui_screen import (
     human_tool_name,
     format_model_changed,
     format_model_status,
+    format_permission_status,
     format_reasoning_mode_changed,
     format_reasoning_mode_status,
     handle_local_command,
@@ -184,7 +186,7 @@ class _Display:
 
     @staticmethod
     def _debug_tool_output(output: str) -> str:
-        return display_bounded(output, TOOL_OUTPUT_MAX_CHARS)
+        return display_tool_output(output, TOOL_OUTPUT_MAX_CHARS)
 
     def latest_tool_output(self) -> str | None:
         if self.latest_tool_call_id is None:
@@ -206,7 +208,7 @@ class _Display:
             self.transcript.stage(self.state)
 
     def _tool_stage(self, name: str, purpose: str = "inspect") -> str:
-        if name in {"list_directory", "search_files", "read_file"}:
+        if name in {"list_directory", "search_files", "read_file", "read_image"}:
             return "INVESTIGATING"
         if name in {"replace_in_file", "write_file"}:
             return "CORRECTING" if self._verification_failed else "EDITING"
@@ -394,17 +396,7 @@ class _Display:
                 print(f"\n✗ undo refused: conflicts: {conflicts}", flush=True)
             self._set_state("IDLE", "undo refused")
         elif isinstance(event, RuntimeControlStatus):
-            text = "\n".join(
-                ["Permissions"]
-                + [
-                    f"{name:<10} {policy}"
-                    for name, policy in (
-                        ("read", event.read_policy),
-                        ("write", event.write_policy),
-                        ("execute", event.execute_policy),
-                    )
-                ]
-            )
+            text = format_permission_status(event)
             if self.transcript is not None:
                 self.transcript.change(text, title="LOCAL")
             else:
@@ -504,6 +496,8 @@ async def _run_turn(runtime: HansRuntime, prompt: str, display: _Display | None 
 async def _dispatch_control(runtime: HansRuntime, control: LocalControl, display: _Display) -> None:
     if control.kind == "permissions_status":
         event = runtime.get_control_status()
+    elif control.kind == "toggle_permissions":
+        event = runtime.toggle_permissions()
     elif control.kind == "set_permission":
         event = runtime.set_permission(control.category or "", control.policy or "")
     elif control.kind == "clear_session":
@@ -874,6 +868,9 @@ async def _run_curses(runtime: HansRuntime) -> None:
         if name == "ctrl-t":
             state["todos_visible"] = not state["todos_visible"]
             return False
+        if name == "ctrl-shift-a":
+            await _dispatch_control(runtime, LocalControl("toggle_permissions"), display)
+            return False
         suggestions = state["command_suggestions"]
         if suggestions:
             if name in {"up", "down"}:
@@ -975,6 +972,7 @@ class _InputDecoder:
     _PASTE_START = "\x1b[200~"
     _PASTE_END = "\x1b[201~"
     _SHIFT_ENTER = ("\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r")
+    _QUICK_TOGGLE = "\x1b[97;6u"
 
     def __init__(self) -> None:
         self._pending = ""
@@ -1005,12 +1003,16 @@ class _InputDecoder:
                 self._pending = self._pending[len(self._PASTE_START) :]
                 self._pasting = True
                 continue
+            if self._pending.startswith(self._QUICK_TOGGLE):
+                self._pending = self._pending[len(self._QUICK_TOGGLE) :]
+                events.append("ctrl-shift-a")
+                continue
             shift = next((value for value in self._SHIFT_ENTER if self._pending.startswith(value)), None)
             if shift is not None:
                 self._pending = self._pending[len(shift) :]
                 events.append("shift-enter")
                 continue
-            protocols = (self._PASTE_START, *self._SHIFT_ENTER)
+            protocols = (self._PASTE_START, self._QUICK_TOGGLE, *self._SHIFT_ENTER)
             if any(value.startswith(self._pending) for value in protocols):
                 break
             if self._pending.startswith("\x1b["):
@@ -1037,6 +1039,9 @@ def _set_enhanced_input(enabled: bool) -> None:
 
 
 def _key_name(key) -> str | None:
+    # Some terminals encode Ctrl+Shift+A as Ctrl+A rather than kitty CSI-u.
+    if key in {1, "\x01"}:
+        return "ctrl-shift-a"
     if key in {2, "\x02"}:
         return "ctrl-b"
     if key in {3, "\x03"}:

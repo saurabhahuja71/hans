@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from bolt_next.commands import (
     format_help,
     known_command,
 )
-from bolt_next.events import VerificationEvidence
+from bolt_next.events import RuntimeControlStatus, VerificationEvidence
 
 
 def format_change_summary(summary: str) -> str:
@@ -64,6 +65,19 @@ def task_summary_has_hans_changes(summary: str) -> bool:
             if value.strip().lower() not in {"", "none"}:
                 return True
     return False
+
+
+def format_permission_status(status: RuntimeControlStatus) -> str:
+    return "\n".join(
+        [
+            "Permissions",
+            f"{'read':<10} {status.read_policy}",
+            f"{'write':<10} {status.write_policy}",
+            f"{'execute':<10} {status.execute_policy}",
+            "Ctrl+Shift+A: allow all / restore previous.",
+            "External paths still require approval; Ctrl-A is a terminal fallback.",
+        ]
+    )
 
 
 def footer_text(
@@ -112,6 +126,7 @@ def format_approval_request(
 def human_tool_name(name: str) -> str:
     names = {
         "read_file": "Read file",
+        "read_image": "Read image",
         "write_file": "Write file",
         "replace_in_file": "Replace in file",
         "list_directory": "List directory",
@@ -517,6 +532,8 @@ def _model_details(model: object, *, indent: str = "") -> list[str]:
     if isinstance(context_tokens, int):
         lines.append(f"{indent}Context: {context_tokens:,} tokens")
     lines.append(f"{indent}Reasoning support: {', '.join(modes) if modes else 'not declared'}")
+    supports_image_input = bool(getattr(model, "supports_image_input", False))
+    lines.append(f"{indent}Image input: {'supported' if supports_image_input else 'not supported'}")
     return lines
 
 
@@ -638,6 +655,16 @@ def display_bounded(text: str, limit: int) -> str:
     return f"{text[:limit]}\n… display truncated ({len(text) - limit} characters omitted)"
 
 
+_IMAGE_DATA_URL_PATTERN = re.compile(r"^data:([a-z0-9.+-]+/[a-z0-9.+-]+);base64,", re.IGNORECASE)
+
+
+def display_tool_output(text: str, limit: int) -> str:
+    match = _IMAGE_DATA_URL_PATTERN.match(text)
+    if match is not None:
+        return f"Image loaded for model input ({match.group(1).lower()})."
+    return display_bounded(text, limit)
+
+
 def copy_osc52(
     text: str,
     writer: Callable[[bytes], object] | None = None,
@@ -655,4 +682,4 @@ def copy_osc52(
         writer(f"\x1b]52;c;{encoded}\x07".encode("ascii"))
     except Exception:
         return False, "Clipboard unavailable"
-    return True, "Copied"
+    return True, "Clipboard copy sent to terminal"

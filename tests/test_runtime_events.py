@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agents import Agent, ModelSettings, SQLiteSession, set_tracing_disabled
+from agents import Agent, ModelSettings, SQLiteSession, ToolOutputImage, set_tracing_disabled
 from agents.model_settings import Reasoning
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
 
@@ -175,6 +175,7 @@ def test_native_tool_approval_decision_resumes_the_saved_sdk_state(approved: boo
         ("write_file", {"path": "task.txt", "content": "private"}, (("path", "task.txt"),)),
         ("replace_in_file", {"path": "task.txt", "old": "private"}, (("path", "task.txt"),)),
         ("read_file", {"path": "task.txt", "start_line": 4, "end_line": 8}, (("path", "task.txt"), ("range", "4-8"))),
+        ("read_image", {"path": "chart.png"}, (("path", "chart.png"),)),
         ("list_directory", {"path": "src"}, (("path", "src"),)),
         ("search_files", {"path": "src", "query": "token=private"}, (("path", "src"), ("query", "token=[REDACTED]"))),
         ("run_command", {"command": "API_TOKEN=private pytest -q", "purpose": "other"}, (("command", "API_TOKEN=[REDACTED] pytest -q"), ("purpose", "inspect"))),
@@ -854,6 +855,36 @@ def test_interleaved_tool_outputs_are_correlated_by_call_id_not_order() -> None:
     assert a_verification.evidence.command == "printf A"
 
 
+def test_image_tool_output_is_compacted_without_changing_semantic_success() -> None:
+    runtime = HansRuntime(agent=object(), session=object(), runner=object())
+    call_id = "image-1"
+    called = SimpleNamespace(
+        type="run_item_stream_event",
+        name="tool_called",
+        item=SimpleNamespace(
+            call_id=call_id,
+            tool_name="read_image",
+            raw_item={"call_id": call_id, "arguments": {"path": "chart.png"}},
+        ),
+    )
+    output = SimpleNamespace(
+        type="run_item_stream_event",
+        name="tool_output",
+        item=SimpleNamespace(
+            call_id=call_id,
+            output=ToolOutputImage(image_url="data:image/png;base64,aGVsbG8="),
+        ),
+    )
+
+    assert ToolStarted(call_id, "read_image", "chart.png") in runtime.translate_stream_event(called)
+    events = tuple(runtime.translate_stream_event(output))
+
+    assert ToolOutput(call_id, "Image loaded for model input (image/png).") in events
+    assert ToolCompleted(call_id, "read_image", "chart.png", True) in events
+    assert "data:image" not in repr(events)
+    assert "aGVsbG8=" not in repr(events)
+
+
 def test_tool_failures_have_safe_semantic_reasons_and_redacted_output() -> None:
     runtime = HansRuntime(agent=object(), session=object(), runner=object())
 
@@ -884,6 +915,10 @@ def test_tool_failures_have_safe_semantic_reasons_and_redacted_output() -> None:
 
     missing = failure("read-missing", "read_file", {"path": "missing.py"}, "Error: file does not exist: missing.py")
     assert missing.failure_reason == "File does not exist."
+    invalid_image = failure(
+        "image-invalid", "read_image", {"path": "broken.png"}, "Error reading image: unsupported image format"
+    )
+    assert invalid_image.failure_reason == "Unsupported image format."
 
     read_call_id = "read-1"
     runtime.translate_stream_event(called(read_call_id, "read_file", {"path": "secret.txt"}))
@@ -1015,6 +1050,25 @@ def assert_path_text(path: Path, expected: str | None) -> None:
         assert not path.exists()
     else:
         assert path.read_text(encoding="utf-8") == expected
+
+
+def test_permission_quick_toggle_restores_snapshot_invalidates_stale_state_and_rejects_active() -> None:
+    runtime = HansRuntime(agent=SimpleNamespace(tools=()), session=object(), runner=object())
+
+    assert runtime.set_permission("read", "deny") == PermissionPolicyChanged("read", "deny")
+    assert runtime.set_permission("execute", "ask") == PermissionPolicyChanged("execute", "ask")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("deny", "allow", "ask")
+
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow")
+    assert runtime.set_permission("write", "deny") == PermissionPolicyChanged("write", "deny")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "allow", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "deny", "allow")
+
+    runtime._request_active = True
+    assert runtime.toggle_permissions() == RuntimeControlRejected(
+        "Permission changes are available when HANS is idle."
+    )
 
 
 def test_clear_session_history_removes_sdk_history_and_preserves_runtime_controls_and_journal(tmp_path: Path) -> None:

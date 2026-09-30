@@ -11,7 +11,7 @@ HansRuntime
             |
 OpenAI Agents SDK Runner + SQLiteSession
             |
-OpenAI-compatible Chat Completions provider
+OpenAI-compatible configured model transport
 ```
 
 The SDK owns the agent loop, structured tool calling, tool results, streaming, and conversation
@@ -62,7 +62,7 @@ For a profile ID, replace hyphens with underscores and uppercase it to form the 
 | Suffix | Behavior |
 | --- | --- |
 | `MODEL` | Model name sent by the runtime. |
-| `BASE_URL` | Chat Completions endpoint for that locally configured profile. |
+| `BASE_URL` | Endpoint for the selected transport on that locally configured profile. |
 | `API_KEY` | Credential for that profile; it is never shown in the UI. |
 
 The following suffixes are optional:
@@ -71,6 +71,8 @@ The following suffixes are optional:
 | --- | --- |
 | `DISPLAY_NAME` | Safe human-readable name shown by `/models`; defaults to the profile ID. |
 | `ENDPOINT_PROFILE` | Safe endpoint label shown by `/models`; use this rather than the base URL. |
+| `TRANSPORT` | `chat_completions` (default) or `responses`. Image input requires `responses`. |
+| `SUPPORTS_IMAGE_INPUT` | `true` or `false` (default). Set `true` only for a `responses` profile whose model accepts image input. |
 | `CONTEXT_TOKENS` | Context limit used by HANS's conservative request guard; defaults to `16384` and must be at least `1024`. |
 | `MAX_COMPLETION_TOKENS` | Optional positive completion limit, capped to the available completion reserve. |
 | `REASONING_MODES` | Comma-separated declared reasoning modes. If unset, `/mode` reports support as not declared and does not permit overrides. |
@@ -85,8 +87,8 @@ When `BOLT_MODEL_PROFILES` is unset, HANS retains its legacy single-profile conf
 is optional and defaults to the current directory.
 
 `/models` displays only safe, local catalog metadata: the active profile, display name, endpoint
-profile, context limit, declared reasoning modes, and the active effective reasoning mode. It never
-displays credentials or base URLs. `/models use <id>` is available only while HANS is idle. It starts
+profile, context limit, declared reasoning modes, image-input support, and the active effective
+reasoning mode. It never displays credentials or base URLs. `/models use <id>` is available only while HANS is idle. It starts
 a fresh conversation on the selected local profile and resets reasoning to that profile's configured
 default; HANS does not migrate conversation history. The workspace, permissions, TODOs, theme, and
 other local HANS controls persist.
@@ -185,14 +187,19 @@ The footer shows only controls relevant to the current semantic task state:
 
 - **Idle/composer:** Enter submits, Shift+Enter inserts a newline, and Ctrl-D submits. Ctrl-D on an
   empty composer exits. Ctrl-Q exits immediately. Ctrl-C clears an idle draft. Ctrl-B cycles session
-  themes and Ctrl-T toggles the compact local TODO view; neither submits a request.
+  themes and Ctrl-T toggles the compact local TODO view; neither submits a request. Ctrl+Shift+A
+  temporarily allows read, write, and execute permissions; press it again to restore the previous
+  process-local per-category policy. It is disabled during requests and approvals, and never bypasses
+  external-path approval.
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
   prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
   `CORRECTING` when supported by actual semantic events.
 - **Copying response text (Textual UI):** Drag to select any visible transcript text, then press
   Ctrl-C to copy the selection. Without a selection, Ctrl-C retains its normal cancel behavior.
-  Ctrl-Y copies the most recent assistant response. The `HANS_TUI=curses` fallback supports
-  Ctrl-Y for whole-response copying.
+  Ctrl-Y copies the bounded, displayed representation of the most recent assistant response or open
+  detail view. The `HANS_TUI=curses` fallback sends the same text through terminal OSC 52; HANS
+  reports that the copy was sent to the terminal, rather than claiming a terminal accepted it into the
+  desktop clipboard.
 - **Completed task with HANS-owned changes:** Ctrl-G opens the bounded task diff and Ctrl-Z requests
   safe task undo. Ctrl-G and Ctrl-Z do not run while a request is active.
 - **Textual diff:** Esc returns to the main task view. The curses fallback renders the same bounded
@@ -242,10 +249,18 @@ context budget. Recursive discovery skips common generated and dependency direct
 virtual environments, caches, build output, and `node_modules`), avoids directory symlinks, and
 skips binary or unreadable files. An explicitly requested file remains searchable.
 
-`read_file` returns a complete small file or an explicit bounded line range. For a larger file, use
-`start_line` and `end_line`; `end_line=0` selects the largest range that fits. Returned range data
+`read_file` returns a complete small UTF-8 file or an explicit bounded line range. For a larger file,
+use `start_line` and `end_line`; `end_line=0` selects the largest range that fits. Returned range data
 identifies what remains. An explicitly requested range that does not fit returns an error and a
-smaller fitting end line instead of silently returning partial source.
+smaller fitting end line instead of silently returning partial source. Binary data and supported image
+files return a safe error rather than a UTF-8 decoder exception.
+
+`read_image` is available only to a profile that declares image-input support. It accepts PNG, JPEG,
+WebP, and GIF after matching the filename extension and file signature, limits input to 10 MiB, 8192
+pixels per dimension, and 32 million pixels total, then passes a bounded local data URL to the OpenAI
+Agents SDK as actual image input. It does not OCR or modify the original file. Image token use is
+provider-dependent and is not fabricated by HANS's text context accounting. An external image still
+requires exact external-path approval even if read permission or the allow-all toggle is active.
 
 `replace_in_file` requires exactly one literal occurrence and uses a temporary-file replacement for
 targeted edits. `write_file` creates parent directories inside the workspace and replaces the target
@@ -284,8 +299,9 @@ python -m pip check
 
 The test suite uses scripted models rather than a live provider. It covers configuration validation,
 context-budget and range behavior, workspace containment and tool limits, semantic runtime events,
-streaming and cancellation recovery, task-local change tracking/diff/undo, Textual and curses
-controls, and HTTPS-only upgrade dispatch. Unit tests do not establish live-provider behavior.
+streaming and cancellation recovery, task-local change tracking/diff/undo, text and image workspace
+handling, Textual and curses controls, and HTTPS-only upgrade dispatch. Unit tests do not establish
+live-provider or desktop-clipboard behavior.
 
 ## What is not in this version
 

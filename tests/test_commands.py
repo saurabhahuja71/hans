@@ -58,6 +58,9 @@ def test_registry_generated_help_covers_commands_categories_and_keyboard_shortcu
         assert description in help_text
     assert "/compact" not in help_text
     assert "idle composer" in help_text
+    assert "Ctrl+Shift+A" in help_text
+    assert "Ctrl+Y" in help_text
+    assert "Allow all permissions / restore previous (idle)" in help_text
 
 
 def test_command_suggestions_are_canonical_bounded_and_contextual() -> None:
