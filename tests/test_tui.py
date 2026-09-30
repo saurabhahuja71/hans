@@ -273,8 +273,8 @@ def test_terminal_key_decoder_preserves_controls_and_bracketed_paste() -> None:
     assert decoder.feed("\x02") == ["ctrl-b"]
     assert decoder.feed("\x14") == ["ctrl-t"]
     assert decoder.feed("\x11") == ["ctrl-q"]
-    assert decoder.feed("\x1b[97;6u") == ["ctrl-shift-a"]
-    assert decoder.feed("\x01") == ["ctrl-shift-a"]
+    assert decoder.feed("\x12") == ["ctrl-r"]
+    assert decoder.feed("\x01") == []
     assert decoder.feed("a") == ["char:a"]
     assert decoder.feed("\t") == ["tab"]
 
@@ -731,7 +731,7 @@ def test_runtime_control_commands_are_parsed_rendered_and_dispatched_without_a_m
     assert shown_models == ["Configured Model", "Large Model"]
     assert "model: Large Model" in format_header(shown_models[-1], Path.cwd())
     assert "Permissions" in rendered
-    assert "Ctrl+Shift+A: allow all / restore previous." in rendered
+    assert "Ctrl+R: allow all / restore previous." in rendered
     assert "External paths still require approval" in rendered
     assert "✓ write permission set to deny." in rendered
     assert "✓ Conversation history cleared." in rendered

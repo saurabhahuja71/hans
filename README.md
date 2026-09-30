@@ -20,10 +20,15 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.4**.
+branding are HANS. Current release: **0.7.6**.
 
-## What 0.7.4 provides
+## What 0.7.6 provides
 
+- `Ctrl+R` temporarily allows all read, write, and execute permissions while HANS is idle; press it
+  again to restore the previous process-local per-category policy. It never bypasses external-path
+  approval. `Ctrl+A` retains its normal text-selection behavior.
+- The Textual `/` command-completion panel includes every registered command, stays bounded and
+  scrollable, and follows Up/Down keyboard selection.
 - Runtime-enforced, session-scoped read, write, and execute permissions through the local
   `/permissions` command. Existing workspace and command safety restrictions remain mandatory.
 - Filesystem discovery and inspection use `list_directory`, `search_files`, and `read_file`; a literal
@@ -187,7 +192,7 @@ The footer shows only controls relevant to the current semantic task state:
 
 - **Idle/composer:** Enter submits, Shift+Enter inserts a newline, and Ctrl-D submits. Ctrl-D on an
   empty composer exits. Ctrl-Q exits immediately. Ctrl-C clears an idle draft. Ctrl-B cycles session
-  themes and Ctrl-T toggles the compact local TODO view; neither submits a request. Ctrl+Shift+A
+  themes and Ctrl-T toggles the compact local TODO view; neither submits a request. Ctrl+R
   temporarily allows read, write, and execute permissions; press it again to restore the previous
   process-local per-category policy. It is disabled during requests and approvals, and never bypasses
   external-path approval.

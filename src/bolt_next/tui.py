@@ -868,7 +868,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
         if name == "ctrl-t":
             state["todos_visible"] = not state["todos_visible"]
             return False
-        if name == "ctrl-shift-a":
+        if name == "ctrl-r":
             await _dispatch_control(runtime, LocalControl("toggle_permissions"), display)
             return False
         suggestions = state["command_suggestions"]
@@ -972,7 +972,6 @@ class _InputDecoder:
     _PASTE_START = "\x1b[200~"
     _PASTE_END = "\x1b[201~"
     _SHIFT_ENTER = ("\x1b[13;2u", "\x1b[27;2;13~", "\x1b\r")
-    _QUICK_TOGGLE = "\x1b[97;6u"
 
     def __init__(self) -> None:
         self._pending = ""
@@ -1003,16 +1002,12 @@ class _InputDecoder:
                 self._pending = self._pending[len(self._PASTE_START) :]
                 self._pasting = True
                 continue
-            if self._pending.startswith(self._QUICK_TOGGLE):
-                self._pending = self._pending[len(self._QUICK_TOGGLE) :]
-                events.append("ctrl-shift-a")
-                continue
             shift = next((value for value in self._SHIFT_ENTER if self._pending.startswith(value)), None)
             if shift is not None:
                 self._pending = self._pending[len(shift) :]
                 events.append("shift-enter")
                 continue
-            protocols = (self._PASTE_START, self._QUICK_TOGGLE, *self._SHIFT_ENTER)
+            protocols = (self._PASTE_START, *self._SHIFT_ENTER)
             if any(value.startswith(self._pending) for value in protocols):
                 break
             if self._pending.startswith("\x1b["):
@@ -1039,9 +1034,6 @@ def _set_enhanced_input(enabled: bool) -> None:
 
 
 def _key_name(key) -> str | None:
-    # Some terminals encode Ctrl+Shift+A as Ctrl+A rather than kitty CSI-u.
-    if key in {1, "\x01"}:
-        return "ctrl-shift-a"
     if key in {2, "\x02"}:
         return "ctrl-b"
     if key in {3, "\x03"}:
@@ -1054,6 +1046,8 @@ def _key_name(key) -> str | None:
         return "ctrl-o"
     if key in {17, "\x11"}:
         return "ctrl-q"
+    if key in {18, "\x12"}:
+        return "ctrl-r"
     if key in {20, "\x14"}:
         return "ctrl-t"
     if key in {25, "\x19"}:

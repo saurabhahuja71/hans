@@ -40,7 +40,7 @@ KEYBOARD_SHORTCUTS = (
     ("Shift+Enter", "New line"),
     ("Ctrl+B", "Cycle theme"),
     ("Ctrl+T", "Toggle TODO view"),
-    ("Ctrl+Shift+A", "Allow all permissions / restore previous (idle)"),
+    ("Ctrl+R", "Allow all permissions / restore previous (idle)"),
     ("Ctrl+D", "Send / exit when empty"),
     ("Ctrl+C", "Cancel"),
     ("Ctrl+Y", "Copy displayed output"),

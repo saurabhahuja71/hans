@@ -74,8 +74,8 @@ def format_permission_status(status: RuntimeControlStatus) -> str:
             f"{'read':<10} {status.read_policy}",
             f"{'write':<10} {status.write_policy}",
             f"{'execute':<10} {status.execute_policy}",
-            "Ctrl+Shift+A: allow all / restore previous.",
-            "External paths still require approval; Ctrl-A is a terminal fallback.",
+            "Ctrl+R: allow all / restore previous.",
+            "External paths still require approval.",
         ]
     )
 

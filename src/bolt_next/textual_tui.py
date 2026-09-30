@@ -272,6 +272,7 @@ class HansTextualApp(App[None]):
         border: round $secondary;
         background: $surface;
         color: $text;
+        overflow-y: auto;
     }
 
     #composer {
@@ -329,7 +330,6 @@ class HansTextualApp(App[None]):
     MAX_TOOL_OUTPUT_CHARS = 4_000
     MAX_TASK_DIFF_CHARS = 4_000
     MAX_COMPOSER_ROWS = 6
-    MAX_COMMAND_SUGGESTIONS = 7
 
     BINDINGS = [
         Binding("enter", "submit", "send", show=False, priority=True),
@@ -342,7 +342,7 @@ class HansTextualApp(App[None]):
         Binding("ctrl+y", "copy_visible", "copy", show=False),
         Binding("ctrl+b", "cycle_theme", "theme", show=False),
         Binding("ctrl+t", "toggle_todos", "todos", show=False),
-        Binding("ctrl+shift+a", "toggle_permissions", "permissions", show=False),
+        Binding("ctrl+r", "toggle_permissions", "permissions", show=False, priority=True),
         Binding("ctrl+q", "exit_app", "exit", show=False),
     ]
 
@@ -482,9 +482,7 @@ class HansTextualApp(App[None]):
         if self._request_active or self._approval_pending is not None or self._approval_resolving:
             self._hide_command_suggestions()
             return
-        suggestions = command_suggestions(
-            text, self._completion_context(text), limit=self.MAX_COMMAND_SUGGESTIONS
-        )
+        suggestions = command_suggestions(text, self._completion_context(text))
         self._command_suggestions = suggestions
         self._command_suggestion_index = 0
         if not suggestions:
@@ -501,6 +499,7 @@ class HansTextualApp(App[None]):
             )
         )
         widget.styles.display = "block"
+        widget.scroll_to(y=self._command_suggestion_index, animate=False)
 
     def _hide_command_suggestions(self) -> None:
         self._command_suggestions = ()
@@ -569,7 +568,7 @@ class HansTextualApp(App[None]):
             "ctrl+y": self.action_copy_visible,
             "ctrl+b": self.action_cycle_theme,
             "ctrl+t": self.action_toggle_todos,
-            "ctrl+shift+a": self.action_toggle_permissions,
+            "ctrl+r": self.action_toggle_permissions,
             "ctrl+q": self.action_exit_app,
         }
         action = actions.get(event.key)

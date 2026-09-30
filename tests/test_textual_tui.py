@@ -40,7 +40,7 @@ from bolt_next.events import (
     VerificationPassed,
     VerificationStarted,
 )
-from bolt_next.commands import format_help
+from bolt_next.commands import command_names, format_help
 from bolt_next.model_catalog import ModelInfo
 from bolt_next.textual_tui import DetailScreen, HansTextualApp, TaskDiffScreen, ThemeScreen
 
@@ -229,18 +229,20 @@ def test_textual_permission_quick_toggle_is_idle_only(tmp_path: Path) -> None:
         runtime.set_permission("write", "deny")
         app = HansTextualApp(runtime, "test-model", tmp_path)
         async with app.run_test() as pilot:
-            await pilot.press("ctrl+shift+a")
+            composer = app.query_one("#composer", TextArea)
+            await pilot.press(*"keep this draft", "ctrl+r")
             await pilot.pause()
             await pilot.pause()
+            assert composer.text == "keep this draft"
             assert runtime.control_calls[-1] == ("toggle_permissions",)
             assert runtime.permissions == {"read": "allow", "write": "allow", "execute": "allow"}
             rendered_transcript = transcript_text(app)
-            assert "Ctrl+Shift+A: allow all / restore previous." in rendered_transcript
+            assert "Ctrl+R: allow all / restore previous." in rendered_transcript
             assert "External paths still require approval" in rendered_transcript
 
             calls_before = len(runtime.control_calls)
             app._request_active = True
-            await pilot.press("ctrl+shift+a")
+            await pilot.press("ctrl+r")
             await pilot.pause()
             assert len(runtime.control_calls) == calls_before
 
@@ -899,6 +901,23 @@ def test_textual_command_completion_accepts_selection_without_submitting(tmp_pat
             await pilot.pause()
             assert runtime.prompts == []
             assert runtime.control_calls == [("reasoning_mode_status",)]
+
+    asyncio.run(scenario())
+
+
+def test_textual_command_completion_keeps_all_commands_selectable_beyond_visible_rows(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = HansTextualApp(FakeRuntime(), "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.press("/")
+            await pilot.pause()
+            assert app._command_suggestions == command_names()
+            assert len(app._command_suggestions) > 7
+
+            await pilot.press(*("down" for _ in range(7)), "enter")
+            await pilot.pause()
+            assert app.query_one("#composer", TextArea).text == "/todo"
+            assert app._command_suggestions == ()
 
     asyncio.run(scenario())
 
