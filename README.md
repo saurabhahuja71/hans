@@ -20,12 +20,13 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.7.8**.
+branding are HANS. Current release: **0.8.0**.
 
-## What 0.7.8 provides
+## What 0.8.0 provides
 
-- `Ctrl+R` temporarily allows all read, write, execute, and external-path permissions while HANS is
-  idle; press it again to restore the previous process-local per-category policy. `Ctrl+M` switches
+- `Ctrl+R` during an approval approves the current tool request and temporarily allows all read,
+  write, execute, and external-path permissions. While HANS is idle, it toggles those permissions
+  and restores the previous process-local per-category policy on the next press. `Ctrl+M` switches
   between native terminal selection/copy mode and HANS mouse-wheel scrolling mode. In the Textual
   composer, `Ctrl+A` selects the full draft so it can be replaced.
 - The Textual `/` command-completion panel includes every registered command, stays bounded and
@@ -160,14 +161,16 @@ Quit HANS with Ctrl-Q, then run:
 hans upgrade
 ```
 
-`hans update` is an equivalent alias. The command downloads the canonical installer over HTTPS and
-runs it, so the same installation location and PATH guidance apply. It follows the repository's
-`main` branch; no GitHub release asset is required for an upgrade.
+`hans update` is an equivalent alias. Normal upgrades query the stable [GitHub Releases](https://github.com/saurabhahuja71/hans/releases)
+latest-release API over HTTPS. If the installed distribution already matches or is newer than that
+release, HANS exits successfully without reinstalling or downgrading. Otherwise it downloads the
+installer and source archive pinned to the immutable release tag, then preserves the same installation
+location and PATH guidance.
 
 For a trusted HTTPS mirror or controlled test, set `HANS_INSTALLER_URL` to the installer URL before
-running the command. Non-HTTPS override URLs are rejected. Versions released before `hans upgrade`
-existed do not contain this command; run the installation command above once to acquire it, then
-use subsequent upgrades normally.
+running the command. This direct override must use HTTPS and does not query GitHub Releases.
+Versions released before `hans upgrade` existed do not contain this command; run the installation
+command above once to acquire it, then use subsequent upgrades normally.
 
 The supported command forms are:
 
@@ -178,6 +181,21 @@ hans update
 ```
 
 Other command-line arguments are rejected with usage guidance.
+
+## Maintainer releases
+
+Run the focused tests and choose the release increment:
+
+```bash
+python scripts/release.py patch
+# or: python scripts/release.py minor
+```
+
+The helper updates `pyproject.toml` and the README release version together, then prints the manual
+Git commands. It never commits, tags, or pushes. Review the generated diff, commit the version
+change, create the matching `vX.Y.Z` tag, and push that tag. The tag-triggered GitHub Actions release
+workflow verifies that the tag exactly matches `pyproject.toml`, runs the test suite, builds the
+sdist and wheel, writes SHA-256 checksums, and creates the GitHub Release with those artifacts.
 
 ## Run
 
@@ -199,11 +217,13 @@ The footer shows only controls relevant to the current semantic task state:
   empty composer exits. Ctrl-Q exits immediately. Ctrl-C clears an idle draft. Ctrl-B cycles session
   themes and Ctrl-T toggles the compact local TODO view; neither submits a request. Ctrl+R
   temporarily allows read, write, execute, and external-path permissions; press it again to restore
-  the previous process-local per-category policy, including external paths. It is disabled during
-  requests and approvals.
+  the previous process-local per-category policy, including external paths.
+- **Approval:** Press `y` to allow only the displayed request or `n` to deny it. Press `Ctrl+R` to
+  allow the current request and all permission categories; use Ctrl+R again when idle to restore the
+  prior policies. Type the shortcut or key itself, not a word such as `Approved`.
 - **Active request:** Ctrl-C cancels the active request while leaving HANS usable for the next
-  prompt. Ctrl-Q exits. Current state is shown as `INVESTIGATING`, `EDITING`, `VERIFYING`, or
-  `CORRECTING` when supported by actual semantic events.
+  prompt. Ctrl-Q exits. Ctrl+R is disabled except at an approval. Current state is shown as
+  `INVESTIGATING`, `EDITING`, `VERIFYING`, or `CORRECTING` when supported by actual semantic events.
 - **Copying and scrolling response text (Textual UI):** HANS starts in **selection mode**, which
   disables application mouse reporting so MATE/native drag selection, right-click Copy, and the
   terminal's usual Ctrl+Shift+C can work. Press **Ctrl+M** to enter **scroll mode**, which enables

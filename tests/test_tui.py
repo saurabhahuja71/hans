@@ -146,7 +146,11 @@ def test_curses_display_renders_tool_approval_and_approval_controls() -> None:
     display.event(ToolApprovalResolved("request-1", "call-1", True))
     assert display.approval_pending == ("request-1", "call-2")
     rendered = "\n".join(transcript.render(120))
-    assert "  APPROVAL REQUIRED\n  Approve Write file (write)? y / n\n  path: task.txt" in rendered
+    assert (
+        "  APPROVAL REQUIRED\n"
+        "  Approve Write file (write)? y allow this request · n deny · Ctrl-R allow all permissions\n"
+        "  path: task.txt"
+    ) in rendered
     assert "private write content" not in rendered
     assert (
         footer_text(
@@ -155,7 +159,7 @@ def test_curses_display_renders_tool_approval_and_approval_controls() -> None:
             has_task_changes=display.has_task_changes,
             approval_pending=True,
         )
-        == "? APPROVAL REQUIRED · y approve · n deny · Ctrl-C cancel · Ctrl-Q quit"
+        == "? APPROVAL REQUIRED · y approve · n deny · Ctrl-R approve + allow all · Ctrl-C cancel · Ctrl-Q quit"
     )
 
 

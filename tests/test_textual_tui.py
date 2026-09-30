@@ -105,6 +105,14 @@ class FakeRuntime:
         for event in events:
             yield event
 
+    async def approve_tool_and_allow_all(self, request_id: str, call_id: str) -> AsyncIterator[object]:
+        self.control_calls.append(("approve_tool_and_allow_all", request_id, call_id))
+        if self.permission_snapshot is None:
+            self.permission_snapshot = dict(self.permissions)
+        self.permissions = {category: "allow" for category in self.permissions}
+        async for event in self.resolve_tool_approval(request_id, call_id, True):
+            yield event
+
     def task_diff(self, *, max_chars: int | None = None) -> TaskDiff:
         self.task_diff_calls.append(max_chars)
         return self.diff_event
@@ -478,6 +486,47 @@ def test_textual_resolves_tool_approval_without_leaving_a_stale_prompt(
             assert rendered(app.query_one("#state-line", Static)) == "COMPLETE"
             if not approved:
                 assert "Write file was not approved; it did not run." in transcript_text(app)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("external", (False, True))
+def test_textual_ctrl_r_approves_current_tool_and_allows_future_permissions(
+    tmp_path: Path, external: bool
+) -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime.set_permission("write", "deny")
+        runtime.set_permission("external", "ask")
+        runtime.approval_events = [ToolApprovalResolved("request-1", "call-1", True), RequestCompleted(None)]
+        app = HansTextualApp(runtime, "test-model", tmp_path)
+        async with app.run_test() as pilot:
+            await app._render_event(
+                approval_event(
+                    "request-1",
+                    "call-1",
+                    "read_file" if external else "write_file",
+                    "read" if external else "write",
+                    (("path", "/actual/outside.txt" if external else "task.txt"),),
+                    external=external,
+                    external_path="/actual/outside.txt" if external else None,
+                )
+            )
+
+            await pilot.press("ctrl+r")
+            await asyncio.wait_for(runtime.approval_started.wait(), timeout=1)
+
+            assert runtime.control_calls[-1] == ("approve_tool_and_allow_all", "request-1", "call-1")
+            assert runtime.approval_calls == [("request-1", "call-1", True)]
+            assert runtime.permissions == {"read": "allow", "write": "allow", "execute": "allow", "external": "allow"}
+            assert app._approval_pending is None
+            assert app._approval_resolving is True
+
+            runtime.approval_release.set()
+            await pilot.pause()
+            await pilot.pause()
+            assert app._approval_resolving is False
+            assert app._request_active is False
 
     asyncio.run(scenario())
 

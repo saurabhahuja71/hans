@@ -624,6 +624,24 @@ class HansRuntime:
             self._permission_toggle_snapshot = None
         return self.get_control_status()
 
+    async def approve_tool_and_allow_all(
+        self, request_id: str, call_id: str
+    ) -> AsyncIterator[HansEvent]:
+        if not self._pending_approvals:
+            yield RuntimeControlRejected("The approval request is no longer active.")
+            return
+        pending = self._pending_approvals[0]
+        if not self._approval_is_current(pending, request_id, call_id):
+            yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+            return
+        if self._permission_toggle_snapshot is None:
+            self._permission_toggle_snapshot = dict(self._permissions)
+        self._permissions.update({category: "allow" for category in self._permissions})
+        async for event in self.resolve_tool_approval(
+            request_id, call_id, True, approve_remaining=True
+        ):
+            yield event
+
     def set_permission(self, category: str, policy: str) -> PermissionPolicyChanged | RuntimeControlRejected:
         if category not in self._permissions:
             raise ValueError(f"Unknown permission: {category}")
@@ -908,7 +926,12 @@ class HansRuntime:
                 self._finish_request()
 
     async def resolve_tool_approval(
-        self, request_id: str, call_id: str, approved: bool
+        self,
+        request_id: str,
+        call_id: str,
+        approved: bool,
+        *,
+        approve_remaining: bool = False,
     ) -> AsyncIterator[HansEvent]:
         if not self._pending_approvals:
             yield RuntimeControlRejected("The approval request is no longer active.")
@@ -917,38 +940,44 @@ class HansRuntime:
         if not self._approval_is_current(pending, request_id, call_id):
             yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
             return
+        approvals_to_resolve = len(self._pending_approvals) if approve_remaining else 1
         try:
-            granted = False
-            external_call_id = pending.external_call_id or pending.call_id
-            if approved:
-                if pending.external:
-                    if self._external_path_authorizer.approve_exact(pending.tool_name, external_call_id) is None:
-                        yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
-                        return
-                    granted = True
-                try:
-                    pending.state.approve(pending.item)
-                except Exception:
-                    if granted:
-                        self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
-                    raise
-            else:
-                self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
-                pending.state.reject(pending.item)
-            if not self._approval_is_current(pending, request_id, call_id):
-                if granted:
-                    self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
-                yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
-                return
-            self._pending_approvals.pop(0)
-            yield ToolApprovalResolved(pending.request_id, pending.call_id, approved)
-            if self._pending_approvals:
-                next_pending = self._pending_approvals[0]
-                if not self._approval_context_is_current(next_pending):
+            for _ in range(approvals_to_resolve):
+                pending = self._pending_approvals[0]
+                if not self._approval_context_is_current(pending):
                     yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
                     return
-                yield self._requested_approval_event(next_pending)
-                return
+                granted = False
+                external_call_id = pending.external_call_id or pending.call_id
+                if approved:
+                    if pending.external:
+                        if self._external_path_authorizer.approve_exact(pending.tool_name, external_call_id) is None:
+                            yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                            return
+                        granted = True
+                    try:
+                        pending.state.approve(pending.item)
+                    except Exception:
+                        if granted:
+                            self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
+                        raise
+                else:
+                    self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
+                    pending.state.reject(pending.item)
+                if not self._approval_context_is_current(pending):
+                    if granted:
+                        self._external_path_authorizer.revoke(pending.tool_name, external_call_id)
+                    yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                    return
+                self._pending_approvals.pop(0)
+                yield ToolApprovalResolved(pending.request_id, pending.call_id, approved)
+                if self._pending_approvals and not approve_remaining:
+                    next_pending = self._pending_approvals[0]
+                    if not self._approval_context_is_current(next_pending):
+                        yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
+                        return
+                    yield self._requested_approval_event(next_pending)
+                    return
             if not self._approval_context_is_current(pending):
                 yield RuntimeControlRejected("The approval request is stale or does not match the active request.")
                 return

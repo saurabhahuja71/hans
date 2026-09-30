@@ -86,7 +86,7 @@ def footer_text(
     """Return compact controls for the current semantic task state."""
     stage = state.partition("·")[0].strip() or "IDLE"
     if approval_pending:
-        return "? APPROVAL REQUIRED · y approve · n deny · Ctrl-C cancel · Ctrl-Q quit"
+        return "? APPROVAL REQUIRED · y approve · n deny · Ctrl-R approve + allow all · Ctrl-C cancel · Ctrl-Q quit"
     if request_active:
         return f"◉ {stage} · Ctrl-C cancel · Ctrl-Q quit"
     if stage == "COMPLETE":
@@ -116,10 +116,13 @@ def format_approval_request(
             f"Operation: {human_tool_name(tool_name)}\n"
             f"Path: {path}\n"
             "This path is outside the current workspace.\n"
-            "Y Allow · N Deny · Ctrl-C Cancel"
+            "Y Allow this request · N Deny · Ctrl-R Allow all permissions · Ctrl-C Cancel"
         )
     details = "\n".join(f"{name}: {value}" for name, value in fields)
-    prompt = f"APPROVAL REQUIRED\nApprove {human_tool_name(tool_name)} ({category})? y / n"
+    prompt = (
+        f"APPROVAL REQUIRED\nApprove {human_tool_name(tool_name)} ({category})? "
+        "y allow this request · n deny · Ctrl-R allow all permissions"
+    )
     return f"{prompt}\n{details}" if details else prompt
 
 

@@ -40,7 +40,7 @@ KEYBOARD_SHORTCUTS = (
     ("Shift+Enter", "New line"),
     ("Ctrl+B", "Cycle theme"),
     ("Ctrl+T", "Toggle TODO view"),
-    ("Ctrl+R", "Allow all including external paths / restore previous (idle)"),
+    ("Ctrl+R", "Approve + allow all, or toggle / restore when idle"),
     ("Ctrl+M", "Toggle terminal selection / mouse scrolling (idle)"),
     ("Ctrl+D", "Send / exit when empty"),
     ("Ctrl+C", "Cancel"),

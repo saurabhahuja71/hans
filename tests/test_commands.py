@@ -63,7 +63,7 @@ def test_registry_generated_help_covers_commands_categories_and_keyboard_shortcu
     assert "Ctrl+Y" in help_text
     assert "Ctrl+M" in help_text
     assert "Toggle terminal selection / mouse scrolling (idle)" in help_text
-    assert "Allow all including external paths / restore previous (idle)" in help_text
+    assert "Approve + allow all, or toggle / restore when idle" in help_text
 
 
 def test_command_suggestions_are_canonical_bounded_and_contextual() -> None:

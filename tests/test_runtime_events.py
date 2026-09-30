@@ -79,6 +79,10 @@ async def collect_approval_resolution(
     return [event async for event in runtime.resolve_tool_approval(request_id, call_id, approved)]
 
 
+async def collect_events(events):
+    return [event async for event in events]
+
+
 class _ApprovalState:
     def __init__(self) -> None:
         self.approved: list[object] = []
@@ -169,6 +173,52 @@ def test_native_tool_approval_decision_resumes_the_saved_sdk_state(approved: boo
     assert resolved_events[0] == ToolApprovalResolved(request.request_id, request.call_id, approved)
     assert (state.approved, state.rejected) == (([item], []) if approved else ([], [item]))
     assert runner.calls[1] == (agent, state)
+    assert any(isinstance(event, RequestCompleted) for event in resolved_events)
+    runtime.close()
+
+
+def test_approval_time_allow_all_approves_saved_sdk_state_and_restores_prior_policies(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external.txt"
+    outside.write_text("outside", encoding="utf-8")
+    entered_path = f"../{outside.name}"
+    write_item = SimpleNamespace(
+        tool_name="write_file",
+        call_id="write-call-id",
+        raw_item=SimpleNamespace(arguments={"path": "task.txt", "content": "content"}),
+    )
+    external_item = SimpleNamespace(
+        tool_name="read_file",
+        call_id="external-read-id",
+        raw_item=SimpleNamespace(arguments={"path": entered_path}),
+    )
+    state = _ApprovalState()
+    runner = _ApprovalRunner(_PausedApprovalResult((write_item, external_item), state), _FinishedResult())
+    runtime = HansRuntime(
+        workspace=str(tmp_path),
+        agent=SimpleNamespace(tools=()),
+        session=object(),
+        runner=runner,
+        interactive=lambda: True,
+    )
+    assert runtime.set_permission("write", "deny") == PermissionPolicyChanged("write", "deny")
+    assert runtime.set_permission("external", "ask") == PermissionPolicyChanged("external", "ask")
+    assert runtime._external_path_authorizer.propose("read_file", external_item.call_id, entered_path) is not None
+
+    paused_events = run(collect(runtime, "Change the file."))
+    request = next(event for event in paused_events if isinstance(event, ToolApprovalRequested))
+    resolved_events = run(
+        collect_events(runtime.approve_tool_and_allow_all(request.request_id, request.call_id))
+    )
+
+    assert [event for event in resolved_events if isinstance(event, ToolApprovalResolved)] == [
+        ToolApprovalResolved("request-1", write_item.call_id, True),
+        ToolApprovalResolved("request-1", external_item.call_id, True),
+    ]
+    assert not any(isinstance(event, ToolApprovalRequested) for event in resolved_events)
+    assert state.approved == [write_item, external_item]
+    assert runtime._external_path_authorizer.proposal_for("read_file", external_item.call_id) is None
+    assert runtime.get_control_status() == RuntimeControlStatus("allow", "allow", "allow", "allow")
+    assert runtime.toggle_permissions() == RuntimeControlStatus("allow", "deny", "allow", "ask")
     assert any(isinstance(event, RequestCompleted) for event in resolved_events)
     runtime.close()
 

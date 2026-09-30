@@ -760,8 +760,13 @@ async def _run_curses(runtime: HansRuntime) -> None:
             runtime.cancel_active()
             raise
 
-    async def resolve_approval(request_id: str, call_id: str, approved: bool) -> None:
-        async for event in runtime.resolve_tool_approval(request_id, call_id, approved):
+    async def resolve_approval(request_id: str, call_id: str, approved: bool, *, allow_all: bool = False) -> None:
+        resolver = (
+            runtime.approve_tool_and_allow_all(request_id, call_id)
+            if allow_all
+            else runtime.resolve_tool_approval(request_id, call_id, approved)
+        )
+        async for event in resolver:
             state["display"].event(event)
 
     async def dispatch_local(local) -> None:
@@ -806,7 +811,7 @@ async def _run_curses(runtime: HansRuntime) -> None:
         display = state["display"]
         if display.approval_pending is not None or state["resolving_approval"]:
             if (
-                name in {"char:y", "char:n"}
+                name in {"char:y", "char:n", "ctrl-r"}
                 and display.approval_pending is not None
                 and not state["resolving_approval"]
             ):
@@ -815,7 +820,12 @@ async def _run_curses(runtime: HansRuntime) -> None:
                 display._set_state("RESUMING", "approval resolved")
                 state["resolving_approval"] = True
                 state["task"] = asyncio.create_task(
-                    resolve_approval(request_id, call_id, name == "char:y")
+                    resolve_approval(
+                        request_id,
+                        call_id,
+                        name != "char:n",
+                        allow_all=name == "ctrl-r",
+                    )
                 )
                 return False
             if name == "ctrl-c":

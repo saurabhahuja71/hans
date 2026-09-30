@@ -84,6 +84,8 @@ class Runtime(Protocol):
         self, request_id: str, call_id: str, approved: bool
     ) -> AsyncIterator[HansEvent]: ...
 
+    def approve_tool_and_allow_all(self, request_id: str, call_id: str) -> AsyncIterator[HansEvent]: ...
+
     def task_diff(self, *, max_chars: int | None = None) -> TaskDiff: ...
 
     def undo_task(self) -> TaskUndoSucceeded | TaskUndoRefused: ...
@@ -654,12 +656,17 @@ class HansTextualApp(App[None]):
             return False
         event.stop()
         event.prevent_default()
-        if event.key in {"y", "n"} and self._approval_pending is not None and not self._approval_resolving:
+        if event.key in {"y", "n", "ctrl+r"} and self._approval_pending is not None and not self._approval_resolving:
             request_id, call_id = self._approval_pending
             self._approval_pending = None
             self._approval_resolving = True
             self._set_state("RESUMING", "approval resolved")
-            self._resolve_approval(request_id, call_id, event.key == "y")
+            self._resolve_approval(
+                request_id,
+                call_id,
+                event.key != "n",
+                allow_all=event.key == "ctrl+r",
+            )
         elif event.key == "ctrl+c":
             self.action_cancel_active()
         elif event.key == "ctrl+q":
@@ -1191,7 +1198,14 @@ class HansTextualApp(App[None]):
         self._render_todos()
 
     def action_toggle_permissions(self) -> None:
-        if self._request_active or self._approval_pending is not None or self._approval_resolving:
+        if self._approval_pending is not None and not self._approval_resolving:
+            request_id, call_id = self._approval_pending
+            self._approval_pending = None
+            self._approval_resolving = True
+            self._set_state("RESUMING", "approval resolved")
+            self._resolve_approval(request_id, call_id, True, allow_all=True)
+            return
+        if self._request_active or self._approval_resolving:
             return
         self.run_worker(
             self._dispatch_control(LocalControl("toggle_permissions")),
@@ -1282,9 +1296,16 @@ class HansTextualApp(App[None]):
             self._update_footer()
 
     @work(group="tool-approval", exclusive=True)
-    async def _resolve_approval(self, request_id: str, call_id: str, approved: bool) -> None:
+    async def _resolve_approval(
+        self, request_id: str, call_id: str, approved: bool, *, allow_all: bool = False
+    ) -> None:
         try:
-            async for event in self.runtime.resolve_tool_approval(request_id, call_id, approved):
+            resolver = (
+                self.runtime.approve_tool_and_allow_all(request_id, call_id)
+                if allow_all
+                else self.runtime.resolve_tool_approval(request_id, call_id, approved)
+            )
+            async for event in resolver:
                 await self._render_event(event)
         finally:
             self._approval_resolving = False

@@ -10,6 +10,8 @@ BIN_DIR="${HOME}/.local/bin"
 info() { printf '==> %s\n' "$1"; }
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 
+[[ "$ARCHIVE_URL" =~ ^https://[^/]+(/.*)?$ ]] || die "HANS_ARCHIVE_URL must be an HTTPS URL"
+
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
 
@@ -34,7 +36,7 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-info "Downloading HANS"
+info "Downloading HANS from ${ARCHIVE_URL}"
 curl -fsSL -L "$ARCHIVE_URL" | tar -xz -C "$tmp"
 source_dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 [[ -n "$source_dir" && -f "$source_dir/pyproject.toml" ]] || die "Downloaded archive did not contain HANS"
