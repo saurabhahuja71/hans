@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import inspect
 import zlib
 from pathlib import Path
@@ -432,12 +433,14 @@ def test_external_image_approval_resumes_once_with_model_visible_image_input(
     desktop = home / "Desktop"
     desktop.mkdir(parents=True)
     image_path = desktop / "naturalgassissue.png"
-    image_path.write_bytes(
+    image = (
         b"\x89PNG\r\n\x1a\n"
         + png_chunk(b"IHDR", b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00")
         + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
         + png_chunk(b"IEND", b"")
     )
+    image_path.write_bytes(image)
+    image_url = f"data:image/png;base64,{base64.b64encode(image).decode('ascii')}"
     monkeypatch.setenv("HOME", str(home))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -501,13 +504,20 @@ def test_external_image_approval_resumes_once_with_model_visible_image_input(
 
     def contains_input_image(value: object) -> bool:
         if isinstance(value, dict):
-            return value.get("type") == "input_image" or any(contains_input_image(child) for child in value.values())
+            return (
+                value.get("type") == "input_image" and value.get("image_url") == image_url
+            ) or any(contains_input_image(child) for child in value.values())
         if isinstance(value, (list, tuple)):
             return any(contains_input_image(child) for child in value)
         return False
 
     assert len(model.calls) == 2
     assert contains_input_image(model.calls[1].input)
+    assert contains_input_image(session_items(session))
+    ui_payload = repr(events) + repr(resolved)
+    assert "data:image" not in ui_payload
+    assert image_url not in ui_payload
+    assert base64.b64encode(image).decode("ascii") not in ui_payload
     runtime.close()
     session.close()
 

@@ -209,6 +209,10 @@ def _selected_profile(profile: ConfiguredModelProfile | str | None) -> Configure
     return configured_model_profile(profile)
 
 
+def _model_visible_image_input_available(profile: ConfiguredModelProfile) -> bool:
+    return profile.transport == "responses" and profile.supports_image_input
+
+
 def create_agent(
     workspace: str | Path | None = None,
     *,
@@ -235,6 +239,7 @@ def create_agent(
 
     root = resolve_workspace(workspace or os.environ.get("BOLT_WORKSPACE"))
     context_tokens = selected_profile.info.context_tokens
+    image_input_available = _model_visible_image_input_available(selected_profile)
     return Agent(
         name="Hans",
         instructions=STAGE_4_INSTRUCTIONS,
@@ -247,13 +252,9 @@ def create_agent(
                 root,
                 context_tokens=context_tokens,
                 authorizer=authorizer,
-                read_image_available=selected_profile.supports_image_input,
+                read_image_available=image_input_available,
             ),
-            *(
-                [make_read_image_tool(root, authorizer=authorizer)]
-                if selected_profile.supports_image_input
-                else []
-            ),
+            *([make_read_image_tool(root, authorizer=authorizer)] if image_input_available else []),
             make_replace_in_file_tool(root, journal, authorizer=authorizer),
             make_write_file_tool(root, journal, authorizer=authorizer),
             make_run_command_tool(root, context_tokens=context_tokens),

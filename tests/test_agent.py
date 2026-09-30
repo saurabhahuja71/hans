@@ -221,6 +221,8 @@ def test_create_agent_binds_selected_profile_without_mutating_environment(
     ("transport", "image_support", "expected_model", "has_image_tool"),
     [
         ("chat_completions", "false", "chat", False),
+        ("chat_completions", "true", "chat", False),
+        ("responses", "false", "responses", False),
         ("responses", "true", "responses", True),
     ],
 )
@@ -258,12 +260,9 @@ def test_create_agent_selects_configured_transport_and_image_tool(
     assert ("read_image" in [tool.name for tool in agent["tools"]]) is has_image_tool
 
 
-@pytest.mark.parametrize(
-    ("image_support", "has_image_tool"),
-    [("true", True), ("false", False)],
-)
-def test_create_agent_legacy_image_support_configures_image_tools(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, image_support: str, has_image_tool: bool
+@pytest.mark.parametrize("image_support", ("true", "false"))
+def test_create_agent_legacy_image_capability_remains_metadata_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, image_support: str
 ) -> None:
     monkeypatch.delenv("BOLT_MODEL_PROFILES", raising=False)
     monkeypatch.setenv("BOLT_MODEL_BASE_URL", "https://models.example.test/v1")
@@ -277,11 +276,8 @@ def test_create_agent_legacy_image_support_configures_image_tools(
     tools = {tool.name: tool for tool in agent["tools"]}
 
     assert "read_file" in tools
-    assert ("read_image" in tools) is has_image_tool
-    if has_image_tool:
-        assert "UTF-8 text" in tools["read_file"].description
-        assert "model-visible image data" not in tools["read_file"].description
-        assert "model-visible image data" in tools["read_image"].description
+    assert "read_image" not in tools
+    assert "read_image" not in tools["read_file"].description
 
 
 def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> None:

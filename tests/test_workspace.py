@@ -141,6 +141,14 @@ def test_read_image_uses_sdk_structured_image_output(tmp_path: Path) -> None:
     ]
 
 
+def test_text_tool_output_is_not_converted_to_structured_image_input() -> None:
+    text = "data:image/png;base64,aGVsbG8="
+
+    serialized = ItemHelpers._convert_tool_output(text)
+
+    assert serialized == text
+
+
 @pytest.mark.parametrize(
     ("filename", "content", "mime_type"),
     [

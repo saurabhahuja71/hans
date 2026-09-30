@@ -20,9 +20,9 @@ and the translation of SDK activity into semantic UI events. HANS does not imple
 agent loop, a tool-call parser, or a custom conversation store.
 
 The Python import package remains `bolt_next`. The distribution name, console command, and runtime
-branding are HANS. Current release: **0.8.0**.
+branding are HANS. Current release: **0.9.0**.
 
-## What 0.8.0 provides
+## What 0.9.0 provides
 
 - `Ctrl+R` during an approval approves the current tool request and temporarily allows all read,
   write, execute, and external-path permissions. While HANS is idle, it toggles those permissions
@@ -81,7 +81,7 @@ The following suffixes are optional:
 | `DISPLAY_NAME` | Safe human-readable name shown by `/models`; defaults to the profile ID. |
 | `ENDPOINT_PROFILE` | Safe endpoint label shown by `/models`; use this rather than the base URL. |
 | `TRANSPORT` | `chat_completions` (default) or `responses`. Select the transport required by the configured provider endpoint. |
-| `SUPPORTS_IMAGE_INPUT` | `true` or `false` (default). Set `true` for any configured profile whose selected model and transport accept image input. |
+| `SUPPORTS_IMAGE_INPUT` | `true` or `false` (default). Declares the selected model's image-input capability in `/models`; HANS exposes `read_image` only when this is `true` and `TRANSPORT=responses`. |
 | `CONTEXT_TOKENS` | Context limit used by HANS's conservative request guard; defaults to `16384` and must be at least `1024`. |
 | `MAX_COMPLETION_TOKENS` | Optional positive completion limit, capped to the available completion reserve. |
 | `REASONING_MODES` | Comma-separated declared reasoning modes. If unset, `/mode` reports support as not declared and does not permit overrides. |
@@ -92,10 +92,11 @@ The following suffixes are optional:
 | `MAX_RETRIES` | Non-negative request retry count; defaults to `0`. |
 
 When `BOLT_MODEL_PROFILES` is unset, HANS retains its legacy single-profile configuration using
-`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. Legacy configuration
-enables image input by default; set `BOLT_MODEL_SUPPORTS_IMAGE_INPUT=false` only when the configured
-model or transport cannot accept image input. This generic setting enables the SDK-native `read_image`
-tool without identifying a provider. `BOLT_WORKSPACE` is optional and defaults to the current directory.
+`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. Its fixed
+`chat_completions` transport cannot expose model-visible image tool output, so legacy image capability
+defaults to `false`; an explicit `BOLT_MODEL_SUPPORTS_IMAGE_INPUT=true` remains catalog metadata only.
+Use an explicit profile with `TRANSPORT=responses` and `SUPPORTS_IMAGE_INPUT=true` to enable the
+SDK-native `read_image` tool. `BOLT_WORKSPACE` is optional and defaults to the current directory.
 
 `/models` displays only safe, local catalog metadata: the active profile, display name, endpoint
 profile, context limit, declared reasoning modes, image-input support, and the active effective
@@ -289,12 +290,13 @@ identifies what remains. An explicitly requested range that does not fit returns
 smaller fitting end line instead of silently returning partial source. Binary data and supported image
 files return a safe error rather than a UTF-8 decoder exception.
 
-`read_image` is available only to a profile that declares image-input support. It accepts PNG, JPEG,
-WebP, and GIF after matching the filename extension and file signature, limits input to 10 MiB, 8192
-pixels per dimension, and 32 million pixels total, then passes a bounded local data URL to the OpenAI
-Agents SDK as actual image input. It does not OCR or modify the original file. Image token use is
-provider-dependent and is not fabricated by HANS's text context accounting. An external image follows
-the external-path policy: `ask` requires exact approval, `allow` reads directly, and `deny` blocks it.
+`read_image` is available only when a profile both declares image-input support and uses the
+Responses transport. It accepts PNG, JPEG, WebP, and GIF after matching the filename extension and file
+signature, limits input to 10 MiB, 8192 pixels per dimension, and 32 million pixels total, then passes a
+bounded local data URL to the OpenAI Agents SDK as actual image input. It does not OCR or modify the
+original file. Image token use is provider-dependent and is not fabricated by HANS's text context
+accounting. An external image follows the external-path policy: `ask` requires exact approval, `allow`
+reads directly, and `deny` blocks it.
 
 `replace_in_file` requires exactly one literal occurrence and uses a temporary-file replacement for
 targeted edits. `write_file` creates parent directories inside the workspace and replaces the target

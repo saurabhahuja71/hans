@@ -154,7 +154,7 @@ def _legacy_profile() -> ConfiguredModelProfile:
     model_id = _configured_model_id()
     max_completion = _positive_integer("BOLT_MODEL_MAX_COMPLETION_TOKENS", _optional_value("BOLT_MODEL_MAX_COMPLETION_TOKENS"))
     supports_image_input = _profile_image_support(
-        "BOLT_MODEL_SUPPORTS_IMAGE_INPUT", _optional_value("BOLT_MODEL_SUPPORTS_IMAGE_INPUT"), default=True
+        "BOLT_MODEL_SUPPORTS_IMAGE_INPUT", _optional_value("BOLT_MODEL_SUPPORTS_IMAGE_INPUT"), default=False
     )
     return ConfiguredModelProfile(
         info=ModelInfo(

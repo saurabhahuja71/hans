@@ -9,8 +9,9 @@ import zlib
 from pathlib import Path
 
 import pytest
-from agents import Agent, Runner, SQLiteSession, set_tracing_disabled
+from agents import Agent, OpenAIResponsesModel, Runner, SQLiteSession, set_tracing_disabled
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
+from openai.types.responses import Response, ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 
 from bolt_next.agent import STAGE_4_INSTRUCTIONS
 from bolt_next.workspace import (
@@ -120,6 +121,95 @@ def test_read_image_tool_call_supplies_input_image_to_the_next_model_turn(tmp_pa
     assert result.final_output == "The image was received."
     assert len(model.calls) == 2
     assert contains_input_image(model.calls[1].input)
+    session.close()
+
+
+def test_openai_responses_model_forwards_image_tool_output_to_next_request(tmp_path: Path) -> None:
+    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return len(data).to_bytes(4, "big") + chunk_type + data + zlib.crc32(chunk_type + data).to_bytes(4, "big")
+
+    image = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00")
+        + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+        + png_chunk(b"IEND", b"")
+    )
+    (tmp_path / "sample.png").write_bytes(image)
+    expected_image_url = f"data:image/png;base64,{base64.b64encode(image).decode('ascii')}"
+    responses = [
+        Response(
+            id="response-1",
+            created_at=0,
+            model="test-model",
+            object="response",
+            output=[
+                ResponseFunctionToolCall(
+                    id="provider-call-1",
+                    call_id="image-1",
+                    name="read_image",
+                    arguments='{"path":"sample.png"}',
+                    type="function_call",
+                    status="completed",
+                )
+            ],
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
+            status="completed",
+        ),
+        Response(
+            id="response-2",
+            created_at=0,
+            model="test-model",
+            object="response",
+            output=[
+                ResponseOutputMessage(
+                    id="message-1",
+                    content=[ResponseOutputText(annotations=[], text="The image was received.", type="output_text")],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            ],
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
+            status="completed",
+        ),
+    ]
+    captured: list[dict[str, object]] = []
+
+    class FakeResponses:
+        async def create(self, **kwargs):
+            captured.append(kwargs)
+            return responses.pop(0)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    agent = Agent(
+        name="HANS Responses image test agent",
+        instructions="Use read_image when asked to inspect an image.",
+        model=OpenAIResponsesModel("test-model", openai_client=FakeClient()),
+        tools=[make_read_image_tool(tmp_path)],
+    )
+    session = SQLiteSession("sdk-openai-responses-image-tool-test")
+
+    result = run(Runner.run(agent, "Read sample.png.", session=session))
+
+    def contains_expected_input_image(value: object) -> bool:
+        if isinstance(value, dict):
+            return value == {"type": "input_image", "image_url": expected_image_url} or any(
+                contains_expected_input_image(child) for child in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(contains_expected_input_image(child) for child in value)
+        return False
+
+    assert result.final_output == "The image was received."
+    assert len(captured) == 2
+    assert contains_expected_input_image(captured[1]["input"])
     session.close()
 
 

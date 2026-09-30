@@ -11,9 +11,12 @@ from bolt_next.context_budget import (
     estimate_tokens,
     fit_model_input,
     make_fit_model_input,
+    max_input_tokens,
+    model_input_propagation_summary,
     request_tokens,
     tool_result_token_budget,
 )
+from bolt_next.errors import ConfigurationError
 from bolt_next.tui import turn_error_message
 from bolt_next.workspace import make_read_file_tool, make_run_command_tool, make_write_file_tool
 from tests.test_sdk_runtime import make_agent, run
@@ -91,6 +94,119 @@ def test_filter_keeps_request_inside_budget() -> None:
     assert huge not in json.dumps(fitted.input)
     assert "not a summary" in json.dumps(fitted.input)
     assert items[3]["output"] == huge
+
+
+def test_structured_image_data_url_does_not_consume_base64_text_budget() -> None:
+    image_url = "data:image/png;base64," + ("x" * 100_000)
+    items = [{"type": "input_image", "image_url": image_url}]
+
+    assert request_tokens("", items) < 200
+    assert items[0]["image_url"] == image_url
+    assert request_tokens("", [image_url]) > 30_000
+
+
+def test_context_filter_preserves_current_image_output_and_matching_call() -> None:
+    image_url = "data:image/png;base64," + ("x" * 100_000)
+    call = {
+        "type": "function_call",
+        "call_id": "image-1",
+        "name": "read_image",
+        "arguments": '{"path":"chart.png"}',
+    }
+    output = {
+        "type": "function_call_output",
+        "call_id": "image-1",
+        "output": [{"type": "input_image", "image_url": image_url}],
+    }
+    items = [{"role": "user", "content": "older request " + ("x" * 10_000)}, call, output]
+
+    fitted = make_fit_model_input(1024)(
+        CallModelData(
+            model_data=ModelInputData(input=items, instructions="instructions"),
+            agent=Agent(name="Hans"),
+            context=None,
+        )
+    )
+
+    assert fitted.input == [call, output]
+    assert request_tokens(fitted.instructions, fitted.input) <= max_input_tokens(1024)
+    assert output["output"][0]["image_url"] == image_url
+
+
+def test_text_data_url_is_not_treated_as_structured_image_input() -> None:
+    text_url = "data:image/png;base64," + ("x" * 10_000)
+    items = [{"type": "function_call_output", "call_id": "text-1", "output": text_url}]
+
+    fitted = make_fit_model_input(1024)(
+        CallModelData(
+            model_data=ModelInputData(input=items, instructions="instructions"),
+            agent=Agent(name="Hans"),
+            context=None,
+        )
+    )
+
+    assert model_input_propagation_summary(items) == {
+        "input_image_item_count": 0,
+        "image_mime_types": (),
+        "image_function_call_output_count": 0,
+    }
+    assert not any(
+        isinstance(item.get("output"), list)
+        and any(image.get("type") == "input_image" for image in item["output"])
+        for item in fitted.input
+        if isinstance(item, dict)
+    )
+    assert request_tokens(fitted.instructions, fitted.input) <= max_input_tokens(1024)
+
+
+def test_image_propagation_summary_does_not_render_image_url() -> None:
+    image_url = "data:image/png;base64,secret-image-payload"
+    summary = model_input_propagation_summary(
+        [
+            {
+                "type": "function_call_output",
+                "call_id": "image-1",
+                "output": [{"type": "input_image", "image_url": image_url}],
+            }
+        ]
+    )
+
+    assert summary == {
+        "input_image_item_count": 1,
+        "image_mime_types": ("image/png",),
+        "image_function_call_output_count": 1,
+    }
+    assert image_url not in repr(summary)
+    assert "secret-image-payload" not in repr(summary)
+
+
+def test_context_filter_fails_safely_when_current_image_group_cannot_fit() -> None:
+    image_url = "data:image/png;base64,secret-image-payload"
+    items = [
+        {
+            "type": "function_call",
+            "call_id": "image-1",
+            "name": "read_image",
+            "arguments": "x" * 3_000,
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "image-1",
+            "output": [{"type": "input_image", "image_url": image_url}],
+        },
+    ]
+
+    with pytest.raises(ConfigurationError, match="Current image tool output") as error:
+        make_fit_model_input(1024)(
+            CallModelData(
+                model_data=ModelInputData(input=items, instructions="instructions"),
+                agent=Agent(name="Hans"),
+                context=None,
+            )
+        )
+
+    assert image_url not in str(error.value)
+    assert "secret-image-payload" not in str(error.value)
 
 
 def test_selected_capacity_filter_uses_its_bound_profile_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
