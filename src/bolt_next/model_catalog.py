@@ -153,6 +153,9 @@ def _profile_context_tokens(variable: str, value: str | None) -> int:
 def _legacy_profile() -> ConfiguredModelProfile:
     model_id = _configured_model_id()
     max_completion = _positive_integer("BOLT_MODEL_MAX_COMPLETION_TOKENS", _optional_value("BOLT_MODEL_MAX_COMPLETION_TOKENS"))
+    supports_image_input = _profile_image_support(
+        "BOLT_MODEL_SUPPORTS_IMAGE_INPUT", _optional_value("BOLT_MODEL_SUPPORTS_IMAGE_INPUT")
+    )
     return ConfiguredModelProfile(
         info=ModelInfo(
             id=model_id,
@@ -161,6 +164,7 @@ def _legacy_profile() -> ConfiguredModelProfile:
             context_tokens=context_token_limit(),
             supported_reasoning_modes=_configured_reasoning_modes(),
             none_semantics=_configured_none_semantics(),
+            supports_image_input=supports_image_input,
         ),
         model=model_id,
         base_url=_optional_value("BOLT_MODEL_BASE_URL"),
@@ -175,7 +179,7 @@ def _legacy_profile() -> ConfiguredModelProfile:
         max_completion_tokens=max_completion,
         reasoning_effort=_optional_value("BOLT_MODEL_REASONING_EFFORT"),
         transport="chat_completions",
-        supports_image_input=False,
+        supports_image_input=supports_image_input,
     )
 
 

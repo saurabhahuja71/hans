@@ -183,6 +183,26 @@ def test_configured_image_profile_rejects_invalid_capabilities(
         configured_model_profile()
 
 
+def test_legacy_image_support_flows_to_model_info_and_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BOLT_MODEL_PROFILES", raising=False)
+    monkeypatch.setenv("BOLT_MODEL_SUPPORTS_IMAGE_INPUT", " TRUE ")
+
+    profile = configured_model_profile()
+
+    assert profile.supports_image_input is True
+    assert profile.info.supports_image_input is True
+    assert configured_model_info().supports_image_input is True
+    assert configured_model_catalog() == (profile.info,)
+
+
+def test_legacy_image_support_rejects_invalid_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BOLT_MODEL_PROFILES", raising=False)
+    monkeypatch.setenv("BOLT_MODEL_SUPPORTS_IMAGE_INPUT", "yes")
+
+    with pytest.raises(ConfigurationError, match="BOLT_MODEL_SUPPORTS_IMAGE_INPUT must be 'true' or 'false'"):
+        configured_model_profile()
+
+
 def test_catalog_rejects_unknown_none_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BOLT_MODEL_PROFILES", raising=False)
     monkeypatch.setenv("BOLT_MODEL_REASONING_NONE_SEMANTICS", "disabled")

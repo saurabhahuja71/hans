@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -324,6 +326,95 @@ def test_external_read_permission_policies_require_at_most_one_approval(tmp_path
         assert ToolOutput("external-read", "external contents") in resolved
         assert ToolCompleted("external-read", "read_file", entered_path, True) in resolved
     runtime.close()
+
+
+def test_external_image_approval_resumes_once_with_model_visible_image_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return len(data).to_bytes(4, "big") + chunk_type + data + zlib.crc32(chunk_type + data).to_bytes(4, "big")
+
+    home = tmp_path / "home"
+    desktop = home / "Desktop"
+    desktop.mkdir(parents=True)
+    image_path = desktop / "naturalgassissue.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00")
+        + png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+        + png_chunk(b"IEND", b"")
+    )
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    entered_path = "~/Desktop/naturalgassissue.png"
+    model = ScriptedModel(
+        [
+            ModelStep(output=[function_call("read_image", {"path": entered_path}, call_id="external-image")]),
+            ModelStep(output=[assistant_message("The image was received.")]),
+        ]
+    )
+    invocation_counts = {"read_file": 0, "read_image": 0}
+
+    def record_invocations(tool, name: str) -> None:
+        original_invoke = tool.on_invoke_tool
+
+        async def recorded_invoke(context, arguments):
+            invocation_counts[name] += 1
+            result = original_invoke(context, arguments)
+            return await result if inspect.isawaitable(result) else result
+
+        tool.on_invoke_tool = recorded_invoke
+
+    def factory(workspace: Path, *, journal: object, profile: object, authorizer: object) -> Agent:
+        read_file = make_read_file_tool(workspace, authorizer=authorizer, read_image_available=True)
+        read_image = make_read_image_tool(workspace, authorizer=authorizer)
+        record_invocations(read_file, "read_file")
+        record_invocations(read_image, "read_image")
+        return Agent(
+            name="external image approval test agent",
+            instructions="Use the provided tools.",
+            model=model,
+            tools=[read_file, read_image],
+        )
+
+    session = SQLiteSession("runtime-external-image-approval")
+    runtime = HansRuntime(
+        workspace=str(workspace),
+        agent_factory=factory,
+        session=session,
+        interactive=lambda: True,
+    )
+
+    events = run(collect(runtime, "Inspect the image."))
+    requests = [event for event in events if isinstance(event, ToolApprovalRequested)]
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.tool_name == "read_image"
+    assert request.external is True
+    assert request.external_path == entered_path
+    proposal = runtime._external_path_authorizer.proposal_for("read_image", "external-image")
+    assert proposal is not None
+    assert proposal.path == image_path.resolve()
+    assert ToolStarted("external-image", "read_image", entered_path) in events
+    resolved = run(collect_approval_resolution(runtime, request.request_id, request.call_id, True))
+
+    assert not any(isinstance(event, ToolApprovalRequested) for event in resolved)
+    assert invocation_counts == {"read_file": 0, "read_image": 1}
+    assert ToolCompleted("external-image", "read_image", entered_path, True) in resolved
+
+    def contains_input_image(value: object) -> bool:
+        if isinstance(value, dict):
+            return value.get("type") == "input_image" or any(contains_input_image(child) for child in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_input_image(child) for child in value)
+        return False
+
+    assert len(model.calls) == 2
+    assert contains_input_image(model.calls[1].input)
+    runtime.close()
+    session.close()
 
 
 def test_noninteractive_external_read_fails_closed_without_a_ui_approval(tmp_path: Path) -> None:

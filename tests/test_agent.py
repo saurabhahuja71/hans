@@ -258,6 +258,32 @@ def test_create_agent_selects_configured_transport_and_image_tool(
     assert ("read_image" in [tool.name for tool in agent["tools"]]) is has_image_tool
 
 
+@pytest.mark.parametrize(
+    ("image_support", "has_image_tool"),
+    [("true", True), ("false", False)],
+)
+def test_create_agent_legacy_image_support_configures_image_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, image_support: str, has_image_tool: bool
+) -> None:
+    monkeypatch.delenv("BOLT_MODEL_PROFILES", raising=False)
+    monkeypatch.setenv("BOLT_MODEL_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("BOLT_MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("BOLT_MODEL_SUPPORTS_IMAGE_INPUT", image_support)
+    monkeypatch.setattr(agent_module, "AsyncOpenAI", lambda **_kwargs: object())
+    monkeypatch.setattr(agent_module, "OpenAIChatCompletionsModel", lambda **_kwargs: "chat")
+    monkeypatch.setattr(agent_module, "Agent", lambda **kwargs: kwargs)
+
+    agent = agent_module.create_agent(tmp_path)
+    tools = {tool.name: tool for tool in agent["tools"]}
+
+    assert "read_file" in tools
+    assert ("read_image" in tools) is has_image_tool
+    if has_image_tool:
+        assert "UTF-8 text" in tools["read_file"].description
+        assert "model-visible image data" not in tools["read_file"].description
+        assert "model-visible image data" in tools["read_image"].description
+
+
 def test_stage_4_instructions_require_purpose_and_evidenced_constraints() -> None:
     instructions = agent_module.STAGE_4_INSTRUCTIONS
 

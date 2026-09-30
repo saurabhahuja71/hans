@@ -88,7 +88,9 @@ The following suffixes are optional:
 | `MAX_RETRIES` | Non-negative request retry count; defaults to `0`. |
 
 When `BOLT_MODEL_PROFILES` is unset, HANS retains its legacy single-profile configuration using
-`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. `BOLT_WORKSPACE`
+`BOLT_MODEL`, `BOLT_MODEL_BASE_URL`, and their related legacy `BOLT_MODEL_*` values. Set the generic
+`BOLT_MODEL_SUPPORTS_IMAGE_INPUT=true` only when that legacy model and its configured transport accept
+image input; it enables the SDK-native `read_image` tool without identifying a provider. `BOLT_WORKSPACE`
 is optional and defaults to the current directory.
 
 `/models` displays only safe, local catalog metadata: the active profile, display name, endpoint
